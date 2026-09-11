@@ -18,7 +18,7 @@ use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-const GUEST_MEM_SIZE: usize = 1024 * 1024 * 1024;
+const GUEST_MEM_SIZE: usize = 2048 * 1024 * 1024;
 const RESET_VECTOR_CS: u64 = 0xF000;
 const RESET_VECTOR_RIP: u64 = 0xFFF0;
 /// Máximo de reboots provocados por crashes del guest (triple fault o
