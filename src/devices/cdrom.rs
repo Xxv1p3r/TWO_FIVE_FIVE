@@ -8,6 +8,7 @@
 use super::IoDevice;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 // ─── Puertos canal secundario ATA (CD-ROM) ─────────────────────────
 const SEC_DATA: u16 = 0x170;
@@ -139,12 +140,41 @@ pub struct CdRom {
 
 impl CdRom {
     pub fn new(iso_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let iso_file = File::open(iso_path)?;
+        let mut resolved_path = PathBuf::from(iso_path);
+        if !resolved_path.is_file() {
+            for ext in &[".iso", "-current.iso"] {
+                let test = PathBuf::from(format!("{}{}", iso_path, ext));
+                if test.is_file() {
+                    resolved_path = test;
+                    break;
+                }
+            }
+            if !resolved_path.is_file() {
+                if let Ok(entries) = std::fs::read_dir(".") {
+                    let req_lower = iso_path.to_lowercase();
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Some(ext) = path.extension() {
+                                if ext.eq_ignore_ascii_case("iso") {
+                                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                                    if name.contains(&req_lower) {
+                                        resolved_path = path;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let iso_file = File::open(&resolved_path)?;
         let iso_size = iso_file.metadata()?.len();
 
         eprintln!(
             "[CDROM] ISO cargado: {} ({:.1} MB)",
-            iso_path,
+            resolved_path.display(),
             iso_size as f64 / (1024.0 * 1024.0)
         );
 

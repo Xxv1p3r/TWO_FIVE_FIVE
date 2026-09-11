@@ -13,6 +13,7 @@ use kvm_ioctls::{Kvm, VcpuExit};
 use std::fs::File;
 use std::io::Read;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,8 +52,115 @@ fn bios_load_addr(bios_len: usize) -> u64 {
 }
 
 fn usage() -> ! {
-    eprintln!("Uso: mi-vmm <bios.bin> [imagen.iso]");
+    eprintln!("Uso: mi-vmm [bios.bin] [imagen.iso] [disco.img]");
+    eprintln!("O simplemente: mi-vmm <imagen.iso>");
+    eprintln!("Ejemplos:");
+    eprintln!("  mi-vmm CorePlus-current.iso");
+    eprintln!("  mi-vmm /usr/share/seabios/bios-256k.bin CorePlus-current.iso");
     exit(1);
+}
+
+fn find_default_bios() -> Option<PathBuf> {
+    let candidates = [
+        "/usr/share/seabios/bios-256k.bin",
+        "/usr/share/seabios/bios-128k.bin",
+        "/usr/share/qemu/bios-256k.bin",
+        "/usr/share/qemu/bios-128k.bin",
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+    ];
+    for c in &candidates {
+        let p = Path::new(c);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    None
+}
+
+fn resolve_iso_file(requested: &str) -> Option<PathBuf> {
+    let p = Path::new(requested);
+    if p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    for ext in &[".iso", "-current.iso"] {
+        let test = format!("{}{}", requested, ext);
+        let tp = Path::new(&test);
+        if tp.is_file() {
+            return Some(tp.to_path_buf());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let root = exe_dir.join("../..");
+            for dir in &[exe_dir, root.as_path()] {
+                let test = dir.join(requested);
+                if test.is_file() {
+                    return Some(test);
+                }
+                for ext in &[".iso", "-current.iso"] {
+                    let test = dir.join(format!("{}{}", requested, ext));
+                    if test.is_file() {
+                        return Some(test);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(".") {
+        let req_lower = requested.to_lowercase();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext.eq_ignore_ascii_case("iso") {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                        if name.contains(&req_lower) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn auto_detect_iso() -> Option<PathBuf> {
+    let known = [
+        "CorePlus-current.iso",
+        "TinyCore-current.iso",
+        "Core-current.iso",
+    ];
+    for name in &known {
+        let p = Path::new(name);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let root = exe_dir.join("../..");
+            for name in &known {
+                let p = root.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext.eq_ignore_ascii_case("iso") {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Set by SIGTERM/SIGINT handler; checked in the vCPU loop to dump state and exit.
@@ -470,11 +578,62 @@ fn main() {
     // pueda despertarlo con tgkill al cerrarse la ventana (tarea 17).
     BSP_TID.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, Ordering::Relaxed);
 
-        let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 { usage(); }
-    let bios_path = &args[1];
-    let iso_path = args.get(2).map(|s| s.as_str());
-    let disk_path = args.get(3).map(|s| s.as_str());
+    let args: Vec<String> = std::env::args().collect();
+    let (bios_path_buf, mut iso_path_buf, disk_path_buf) = if args.len() < 2 {
+        let bios = find_default_bios().unwrap_or_else(|| {
+            eprintln!("[VMM] ERROR: No se especificó BIOS ni se encontró SeaBIOS en rutas estándar.");
+            usage();
+        });
+        let iso = auto_detect_iso();
+        (bios, iso, None)
+    } else {
+        let arg1 = &args[1];
+        let arg1_is_iso = arg1.to_lowercase().ends_with(".iso")
+            || (!arg1.to_lowercase().ends_with(".bin")
+                && !arg1.to_lowercase().ends_with(".fd")
+                && !arg1.to_lowercase().ends_with(".rom")
+                && resolve_iso_file(arg1).is_some());
+
+        if arg1_is_iso {
+            let bios = find_default_bios().unwrap_or_else(|| {
+                eprintln!("[VMM] ERROR: No se encontró SeaBIOS para arrancar la ISO.");
+                usage();
+            });
+            let iso = resolve_iso_file(arg1).or_else(|| Some(PathBuf::from(arg1)));
+            let disk = args.get(2).map(PathBuf::from);
+            (bios, iso, disk)
+        } else {
+            let bios = PathBuf::from(arg1);
+            let iso = if let Some(arg2) = args.get(2) {
+                resolve_iso_file(arg2).or_else(|| Some(PathBuf::from(arg2)))
+            } else {
+                auto_detect_iso()
+            };
+            let disk = args.get(3).map(PathBuf::from);
+            (bios, iso, disk)
+        }
+    };
+
+    if args.iter().any(|a| a == "--no-iso" || a == "--no-cdrom") {
+        iso_path_buf = None;
+    }
+
+    let bios_path_str = bios_path_buf.to_string_lossy().to_string();
+    let bios_path = &bios_path_str;
+    let iso_path_str = iso_path_buf.as_ref().map(|p| p.to_string_lossy().to_string());
+    let iso_path = iso_path_str.as_deref();
+    let disk_path_str = disk_path_buf.as_ref().map(|p| p.to_string_lossy().to_string());
+    let disk_path = disk_path_str.as_deref();
+
+    eprintln!("[VMM] BIOS: {}", bios_path);
+    if let Some(iso) = iso_path {
+        eprintln!("[VMM] ISO:  {}", iso);
+    } else {
+        eprintln!("[VMM] ISO:  (ninguna)");
+    }
+    if let Some(disk) = disk_path {
+        eprintln!("[VMM] DISK: {}", disk);
+    }
     let verbose = std::env::var("MI_VMM_VERBOSE").is_ok();
     // (tarea 6) Número de vCPUs: 1 BSP + N-1 APs. El default es 2 (SMP
     // mínimo que ejercita el sondeo SIPI de SeaBIOS/Linux); MI_VMM_CPUS=n

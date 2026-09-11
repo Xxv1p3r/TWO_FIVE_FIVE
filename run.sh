@@ -78,6 +78,63 @@ find_bios() {
     error "No se encontró BIOS. Instala SeaBIOS:\n  Debian/Ubuntu: sudo apt install seabios\n  Fedora:        sudo dnf install seabios\n  Arch:          sudo pacman -S seabios\n\nO especifica la ruta: ./run.sh /ruta/a/bios.bin"
 }
 
+# ─── Find ISO ─────────────────────────────────────────────────────
+find_iso() {
+    local target="${1:-}"
+
+    if [ -n "$target" ]; then
+        if [ -f "$target" ]; then
+            echo "$target"
+            return
+        fi
+        if [ -f "$SCRIPT_DIR/$target" ]; then
+            echo "$SCRIPT_DIR/$target"
+            return
+        fi
+        for ext in ".iso" "-current.iso"; do
+            if [ -f "$target$ext" ]; then
+                echo "$target$ext"
+                return
+            fi
+            if [ -f "$SCRIPT_DIR/$target$ext" ]; then
+                echo "$SCRIPT_DIR/$target$ext"
+                return
+            fi
+        done
+        local match
+        match=$(find "$SCRIPT_DIR" "." -maxdepth 1 -iname "*$target*.iso" 2>/dev/null | head -n 1)
+        if [ -n "$match" ] && [ -f "$match" ]; then
+            echo "$match"
+            return
+        fi
+        error "ISO no encontrado para '$target'"
+    fi
+
+    local candidates=(
+        "$SCRIPT_DIR/CorePlus-current.iso"
+        "$SCRIPT_DIR/TinyCore-current.iso"
+        "$SCRIPT_DIR/Core-current.iso"
+        "CorePlus-current.iso"
+        "TinyCore-current.iso"
+        "Core-current.iso"
+    )
+    for c in "${candidates[@]}"; do
+        if [ -f "$c" ]; then
+            echo "$c"
+            return
+        fi
+    done
+
+    local any_iso
+    any_iso=$(find "$SCRIPT_DIR" -maxdepth 1 -name "*.iso" 2>/dev/null | head -n 1)
+    if [ -n "$any_iso" ]; then
+        echo "$any_iso"
+        return
+    fi
+
+    echo ""
+}
+
 # ─── Main ─────────────────────────────────────────────────────────
 echo ""
 info "═══════════════════════════════════════════════"
@@ -88,27 +145,35 @@ echo ""
 check_kvm
 check_binary
 
-BIOS=$(find_bios "${1:-}")
-ISO="${2:-}"
-DISK="${3:-}"
+ARG1="${1:-}"
+ARG2="${2:-}"
+ARG3="${3:-}"
 
-# Tolerancia: si el primer argumento es una ISO, el usuario la puso en la
-# posicion del BIOS por accidente. Tómalo como ISO y deja que se autodetecte.
-case "${1:-}" in
-    *.iso|*.ISO)
-        warn "El 1er argumento parece una ISO; lo redirijo a 'ISO' y busco el BIOS."
-        ISO="${1}"
+BIOS=""
+ISO=""
+DISK=""
+
+if [ -n "$ARG1" ]; then
+    if [[ "$ARG1" == *.bin ]] || [[ "$ARG1" == *.fd ]] || [[ "$ARG1" == *seabios* ]] || [[ "$ARG1" == *ovmf* ]]; then
+        BIOS=$(find_bios "$ARG1")
+        ISO=$(find_iso "$ARG2")
+        DISK="$ARG3"
+    else
         BIOS=$(find_bios "")
-        ;;
-esac
+        ISO=$(find_iso "$ARG1")
+        DISK="$ARG2"
+    fi
+else
+    BIOS=$(find_bios "")
+    ISO=$(find_iso "")
+fi
 
 echo ""
 info "BIOS: $BIOS"
 if [ -n "$ISO" ]; then
-    [ -f "$ISO" ] || error "ISO no encontrado: $ISO"
     info "ISO:  $ISO"
 else
-    warn "Sin ISO — solo BIOS"
+    warn "Sin ISO — VM arrancará sin medio booteable"
 fi
 if [ -n "$DISK" ]; then
     [ -f "$DISK" ] || error "Disco no encontrado: $DISK"
