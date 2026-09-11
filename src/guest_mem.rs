@@ -72,6 +72,47 @@ impl GuestMemory {
         true
     }
 
+    /// Lee un byte con bounds-check (0 si fuera de límites).
+    #[inline]
+    #[allow(dead_code)]
+    pub fn read_u8(&self, offset: usize) -> u8 {
+        self.read(offset).unwrap_or(0)
+    }
+
+    /// Lee un u16 little-endian con bounds-check (0 si fuera de límites).
+    #[inline]
+    pub fn read_u16(&self, offset: usize) -> u16 {
+        if offset + 2 <= self.size {
+            unsafe {
+                let low = *self.ptr.add(offset) as u16;
+                let high = *self.ptr.add(offset + 1) as u16;
+                low | (high << 8)
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Escribe un byte con bounds-check. Devuelve false si fuera de límites.
+    #[inline]
+    pub fn write_u8(&self, offset: usize, val: u8) -> bool {
+        self.write(offset, val)
+    }
+
+    /// Escribe un u16 little-endian con bounds-check. Devuelve false si fuera de límites.
+    #[inline]
+    pub fn write_u16(&self, offset: usize, val: u16) -> bool {
+        if offset + 2 <= self.size {
+            unsafe {
+                *self.ptr.add(offset) = val as u8;
+                *self.ptr.add(offset + 1) = (val >> 8) as u8;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Escribe u32 little-endian con `write_volatile` y bounds-check: el
     /// guest u otro hilo pueden leerlo sin sincronización (p. ej. el tick
     /// del BDA en 0x46C).

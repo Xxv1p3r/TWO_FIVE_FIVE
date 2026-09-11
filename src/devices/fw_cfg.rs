@@ -37,7 +37,14 @@ pub struct FwCfg {
 impl FwCfg {
     /// `acpi`: tablas ACPI (tables + rsdp + loader) para exponerlas con el
     /// interface estándar de QEMU; SeaBIOS las carga vía romfile-loader.
-    pub fn new(ram_size: u64, num_cpus: u32, acpi: Option<super::acpi::AcpiFiles>) -> Self {
+    /// `vga_rom`: opcionalmente el binario de VGA Option ROM (vgaroms/vgabios.bin)
+    /// para que SeaBIOS lo cargue y ejecute directamente.
+    pub fn new(
+        ram_size: u64,
+        num_cpus: u32,
+        acpi: Option<super::acpi::AcpiFiles>,
+        vga_rom: Option<Vec<u8>>,
+    ) -> Self {
         let mut items: HashMap<u16, Vec<u8>> = HashMap::new();
         items.insert(FW_CFG_SIGNATURE, b"QEMU".to_vec());
         // id: sin DMA (SeaBIOS usará lecturas PIO byte a byte).
@@ -60,6 +67,9 @@ impl FwCfg {
         //   u32 count BE + entries { size: u32 BE, select: u16 BE,
         //                            reserved: u16, name: [u8;56] } = 64 bytes
         let mut files: Vec<(&str, Vec<u8>)> = vec![("etc/ram-size", ram_size.to_le_bytes().to_vec())];
+        if let Some(rom) = &vga_rom {
+            files.push(("vgaroms/vgabios.bin", rom.clone()));
+        }
         if let Some(a) = &acpi {
             // Tablas ACPI: los tres ficheros que SeaBIOS busca (acpi.c:
             // loadQemuAcpiTables) para instalar RSDP/RSDT/FADT/DSDT/MADT.
@@ -121,7 +131,7 @@ mod tests {
     #[test]
     fn acpi_files_present_in_directory() {
         let acpi = super::super::acpi::build_acpi_files(2);
-        let cfg = FwCfg::new(256 * 1024 * 1024, 2, Some(acpi));
+        let cfg = FwCfg::new(256 * 1024 * 1024, 2, Some(acpi), None);
         let dir = cfg.items.get(&FW_CFG_FILE_DIR).unwrap();
         // count BE + 4 entradas de 64 bytes (QemuCfgFile)
         assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 4);
@@ -146,6 +156,21 @@ mod tests {
             // El contenido registrado bajo el selector coincide en tamaño.
             assert_eq!(cfg.items.get(&sel).unwrap().len(), size as usize);
         }
+    }
+
+    #[test]
+    fn vga_rom_present_in_directory() {
+        let mock_rom = vec![0x55, 0xAA, 0x01, 0x02];
+        let cfg = FwCfg::new(256 * 1024 * 1024, 1, None, Some(mock_rom.clone()));
+        let dir = cfg.items.get(&FW_CFG_FILE_DIR).unwrap();
+        assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 2);
+        let off = 4 + 1 * 64;
+        let entry = &dir[off..off + 64];
+        let entry_name =
+            String::from_utf8_lossy(&entry[8..64]).trim_end_matches('\0').to_string();
+        assert_eq!(entry_name, "vgaroms/vgabios.bin");
+        let sel = u16::from_be_bytes(entry[4..6].try_into().unwrap());
+        assert_eq!(cfg.items.get(&sel).unwrap(), &mock_rom);
     }
 }
 

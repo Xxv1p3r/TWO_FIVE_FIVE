@@ -153,7 +153,34 @@ fn init_bios_data_area(guest_mem: &mut [u8]) {
         // para que un Double Fault (#DF) disponga de un stack limpio.
         devices::legacy::init_guest_tss(guest_mem, 0x1000, 0x7000);
 
-        eprintln!("[VMM] BDA inicializado: mem=640KB, kb_buf=head=tail=0x1E, EBDA=0x9FC0, TSS=0x1000");
+        // ─── BDA Video Display Area (phys 0x449 - 0x48A) ─────────────
+        // Parámetros de modo texto estándar (80x25 modo 3): esenciales para
+        // que cargadores como ISOLINUX/menu.c32 detecten columnas > 0.
+        guest_mem[0x449] = 0x03; // Modo de vídeo actual: 80x25 texto color
+        guest_mem[0x44A] = 80;   // Columnas de texto (LE u16): 80
+        guest_mem[0x44B] = 0;
+        guest_mem[0x44C] = 0x00; // Tamaño del buffer de regeneración: 4096 bytes
+        guest_mem[0x44D] = 0x10;
+        guest_mem[0x44E] = 0x00; // Offset de página activa: 0x0000
+        guest_mem[0x44F] = 0x00;
+        for p in 0..8 {
+            guest_mem[0x450 + p * 2] = 0;     // Cursor col = 0
+            guest_mem[0x450 + p * 2 + 1] = 0; // Cursor row = 0
+        }
+        guest_mem[0x460] = 0x06; // Línea de escaneo inicial cursor
+        guest_mem[0x461] = 0x07; // Línea de escaneo final cursor
+        guest_mem[0x462] = 0x00; // Página de visualización activa: 0
+        guest_mem[0x463] = 0xD4; // Puerto base I/O CRTC: 0x03D4 (color)
+        guest_mem[0x464] = 0x03;
+        guest_mem[0x465] = 0x09; // Registro de selección de modo
+        guest_mem[0x466] = 0x00; // Registro de paleta
+        guest_mem[0x484] = 24;   // Filas de texto menos 1: 24 (25 filas)
+        guest_mem[0x485] = 16;   // Altura del carácter en escaneos (fuente 8x16)
+        guest_mem[0x486] = 0x00;
+        guest_mem[0x487] = 0x60; // Combinación pantalla VGA
+        guest_mem[0x488] = 0x09; // Interruptores EGA/VGA
+
+        eprintln!("[VMM] BDA inicializado: mem=640KB, kb_buf=head=tail=0x1E, EBDA=0x9FC0, TSS=0x1000, VGA=80x25");
     }
 }
 
@@ -278,6 +305,15 @@ fn pit_timer_thread(
             // Escritura acotada y volatile (GuestMemory): el BSP/guest lo lee
             // sin sincronización (tick del BDA 0x46C).
             guest_mem.write_u32_volatile(BDA_TICK_ADDR, ticks);
+        }
+
+        // Mantener geometría de pantalla BDA (evita que syslinux/menu.c32 lea cols=0
+        // si SeaBIOS limpió la BDA o no inicializó la consola VGA antes del bootloader).
+        if guest_mem.read_u16(0x44A) == 0 {
+            guest_mem.write_u8(0x449, 0x03);
+            guest_mem.write_u16(0x44A, 80);
+            guest_mem.write_u8(0x484, 24);
+            guest_mem.write_u16(0x463, 0x03D4);
         }
 
         // ── Input del host → dispositivos ─────────────────────────
@@ -505,6 +541,26 @@ fn main() {
     const VRAM_SIZE: usize = 16 * 1024 * 1024;
     let vram_ptr = unsafe { high_mem.as_mut_ptr().add(128 * 1024 * 1024) };
 
+    // ─── Buscar VGA Option ROM para fw_cfg y C0000 ─────────────
+    let vga_candidates = [
+        "/usr/share/seabios/vgabios-stdvga.bin",
+        "/usr/share/seabios/vgabios-bochs-display.bin",
+        "/usr/share/qemu/vgabios-stdvga.bin",
+        "/usr/share/seabios/vgabios.bin",
+        "/usr/share/qemu/vgabios.bin",
+    ];
+    let mut vga_rom_data: Option<Vec<u8>> = None;
+    for vga_path in &vga_candidates {
+        if let Ok(mut f) = File::open(vga_path) {
+            let mut vga_rom = Vec::new();
+            if f.read_to_end(&mut vga_rom).is_ok() {
+                eprintln!("[VMM] VGA Option ROM encontrado en {} ({} bytes)", vga_path, vga_rom.len());
+                vga_rom_data = Some(vga_rom);
+                break;
+            }
+        }
+    }
+
     let (mut bus, vga_state) = match DeviceBus::new(
         iso_path,
         disk_path,
@@ -515,6 +571,7 @@ fn main() {
         high_mem.as_mut_ptr(),
         HIGH_MEM_ADDR,
         HIGH_MEM_SIZE,
+        vga_rom_data.clone(),
     ) {
         Ok(res) => res,
         Err(e) => {
@@ -627,30 +684,14 @@ fn main() {
         eprintln!("[VMM] Flash BIOS en {:#x}", 0xFFFC_0000u64);
     }
 
-    // ─── Cargar VGA Option ROM (0xC0000) ─────────────────────────
-    let vga_candidates = [
-        "/usr/share/seabios/vgabios-stdvga.bin",
-        "/usr/share/seabios/vgabios-bochs-display.bin",
-        "/usr/share/qemu/vgabios-stdvga.bin",
-        "/usr/share/seabios/vgabios.bin",
-        "/usr/share/qemu/vgabios.bin",
-    ];
-    let mut vga_loaded = false;
-    for vga_path in &vga_candidates {
-        if let Ok(mut f) = File::open(vga_path) {
-            let mut vga_rom = Vec::new();
-            if f.read_to_end(&mut vga_rom).is_ok() {
-                let vga_load_off = 0xC0000usize;
-                if vga_load_off + vga_rom.len() <= guest_mem.len() {
-                    guest_mem[vga_load_off..vga_load_off + vga_rom.len()].copy_from_slice(&vga_rom);
-                    eprintln!("[VMM] VGA Option ROM cargado en 0xC0000 ({} bytes) desde {}", vga_rom.len(), vga_path);
-                    vga_loaded = true;
-                    break;
-                }
-            }
+    // ─── Copiar VGA Option ROM en memoria física (0xC0000) ─────────
+    if let Some(ref vga_rom) = vga_rom_data {
+        let vga_load_off = 0xC0000usize;
+        if vga_load_off + vga_rom.len() <= guest_mem.len() {
+            guest_mem[vga_load_off..vga_load_off + vga_rom.len()].copy_from_slice(vga_rom);
+            eprintln!("[VMM] VGA Option ROM copiado en 0xC0000 ({} bytes)", vga_rom.len());
         }
-    }
-    if !vga_loaded {
+    } else {
         eprintln!("[VMM] Info: No se encontró archivo VGA ROM externo. Usando emulación gráfica integrada.");
     }
 
@@ -743,15 +784,18 @@ fn main() {
     // Cola del ratón host: (dx, dy, botones PS/2) desde la ventana minifb.
     let mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>> = Arc::new(Mutex::new(VecDeque::new()));
     
-    // Inyección de ENTER (tarea 3): acelera el arranque de ISOLINUX a los 3s
+    // Inyección de ENTER (tarea 3): acelera el arranque de ISOLINUX/menu.c32 a los 3s, 5s y 7s
     // para tests y modo headless; desactivable con MI_VMM_AUTO_ENTER=0.
     if std::env::var("MI_VMM_AUTO_ENTER").map(|v| v != "0").unwrap_or(true) {
         let auto_enter_kbd = Arc::clone(&kbd_queue);
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            let mut q = auto_enter_kbd.lock().unwrap();
-            q.push_back(0x1C);
-            q.push_back(0x9C);
+            for wait_secs in [3, 2, 2] {
+                std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+                if let Ok(mut q) = auto_enter_kbd.lock() {
+                    q.push_back(0x1C);
+                    q.push_back(0x9C);
+                }
+            }
         });
     }
 

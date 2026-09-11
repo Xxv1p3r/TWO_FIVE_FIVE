@@ -119,6 +119,9 @@ impl PciDevice {
                     self.config_regs[offset as usize]
                 }
             }
+            // Expansion ROM Base Address (0x30..0x33): devolvemos 0 para indicar
+            // al BIOS que el dispositivo no expone ROM vía PCI BAR (se carga vía fw_cfg o C0000).
+            0x30..=0x33 => 0x00,
             _ => self.config_regs[offset as usize],
         }
     }
@@ -129,6 +132,8 @@ impl PciDevice {
             0x05 => self.command = (self.command & 0x00FF) | ((value as u16) << 8),
             0x06 => self.status = (self.status & 0xFF00) | value as u16,
             0x07 => self.status = (self.status & 0x00FF) | ((value as u16) << 8),
+            // Expansion ROM BAR (0x30..0x33): inmutable a 0 (sin ROM PCI)
+            0x30..=0x33 => {}
             // Allow writing to config registers 0x00-0xFF
             _ => {
                 self.config_regs[offset as usize] = value;

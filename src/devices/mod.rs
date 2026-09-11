@@ -136,6 +136,7 @@ impl DeviceBus {
         high_mem_ptr: *mut u8,
         high_mem_gpa: u64,
         high_mem_size: usize,
+        vga_rom: Option<Vec<u8>>,
     ) -> Result<(Self, std::sync::Arc<std::sync::Mutex<vga::VgaState>>), Box<dyn std::error::Error>> {
         // `num_cpus` (tarea 6): se anuncia al guest por fw_cfg
         // (FW_CFG_NB_CPUS/FW_CFG_MAX_CPUS) para que SeaBIOS acote su
@@ -167,7 +168,7 @@ impl DeviceBus {
                 debugcon: DebugCon::new(),
                 post: PostCode::new(),
                 cmos: CmosRtc::with_ram_size(ram_size),
-                fw_cfg: FwCfg::new(ram_size, num_cpus, Some(acpi_files)),
+                fw_cfg: FwCfg::new(ram_size, num_cpus, Some(acpi_files), vga_rom),
                 legacy_irq: LegacyInterrupts::new(),
                 a20: A20Gate::new(),
                 acpi_pm: AcpiPm::new(),
