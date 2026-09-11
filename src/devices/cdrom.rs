@@ -6,7 +6,7 @@
 //! envía un CDB de 12 bytes por el registro de datos.
 
 use super::IoDevice;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 // ─── Puertos canal secundario ATA (CD-ROM) ─────────────────────────
@@ -164,6 +164,12 @@ impl CdRom {
             sector_bytes: CD_SECTOR_SIZE,
             state: CdromState::default(),
         }
+    }
+
+    /// Reset del dispositivo (reset hardware del canal ATAPI): vuelve a la
+    /// fase Idle sin transferencias pendientes. El medio (ISO) se conserva.
+    pub fn reset(&mut self) {
+        self.state = CdromState::default();
     }
 
     /// Calcula el byte de status para devolver al guest.
@@ -483,14 +489,21 @@ impl PrimaryIde {
         }
         }
 
-    /// Carga un disco duro raw (.img) para el canal primario
+    /// Carga un disco duro raw (.img) para el canal primario.
+    ///
+    /// Se abre en modo lectura+escritura: un guest (p. ej. Linux) escribe
+    /// sectores durante el arranque (journal, etc.). Antes se abría con
+    /// `File::open` (solo lectura) y las escrituras fallaban en silencio.
     pub fn with_disk(disk_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(disk_path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(disk_path)?;
         let metadata = file.metadata()?;
         let size = metadata.len();
 
         eprintln!(
-            "[ATA] Disco duro cargado: {} ({:.1} MB)",
+            "[ATA] Disco duro cargado: {} ({:.1} MB, rw)",
             disk_path,
             size as f64 / (1024.0 * 1024.0)
         );
@@ -511,6 +524,17 @@ impl PrimaryIde {
     /// Indica si hay un disco conectado
     pub fn has_disk(&self) -> bool {
         self.disk_file.is_some()
+    }
+
+    /// Reset del dispositivo ATA: borra el estado de la transferencia actual.
+    pub fn reset(&mut self) {
+        self.status = ST_DRDY;
+        self.lba = 0;
+        self.sector_count = 1;
+        self.data_buf.clear();
+        self.data_offset = 0;
+        self.drive_select = 0;
+        self.last_cmd = 0;
     }
 
     /// Construye un IDENTIFY DEVICE response (512 bytes) para un disco duro ATA
@@ -577,13 +601,30 @@ impl PrimaryIde {
         buf
     }
 
-    /// Escribe n sectores al disco
-    fn write_sectors(&mut self, lba: u64, count: u16, data: &[u8]) {
-        if let Some(ref mut f) = self.disk_file {
-            if let Ok(_) = f.seek(SeekFrom::Start(lba * 512)) {
-                let _ = f.write_all(&data[..((count as u64 * 512) as usize).min(data.len())]);
-            }
+    /// Escribe n sectores al disco y hace fsync (sync_data) para que los
+    /// datos queden persistidos en el archivo antes de devolver status OK.
+    /// Devuelve false si el archivo no está abierto, los datos no cubren
+    /// `count*512` bytes o la escritura/fsync falla (el guest verá ST_ERR).
+    fn write_sectors(&mut self, lba: u64, count: u16, data: &[u8]) -> bool {
+        let Some(file) = self.disk_file.as_mut() else {
+            eprintln!("[ATA] WRITE sin archivo de disco (LBA={:#x})", lba);
+            return false;
+        };
+        let len = (count as usize) * 512;
+        if data.len() < len {
+            eprintln!("[ATA] WRITE corto: pidió {} bytes, recibió {}", len, data.len());
+            return false;
         }
+        let result = (|| -> std::io::Result<()> {
+            file.seek(SeekFrom::Start(lba * 512))?;
+            file.write_all(&data[..len])?;
+            file.sync_data()
+        })();
+        if let Err(e) = result {
+            eprintln!("[ATA] ERROR escribiendo LBA={:#x} count={}: {}", lba, count, e);
+            return false;
+        }
+        true
     }
 }
 
@@ -599,30 +640,46 @@ impl IoDevice for PrimaryIde {
 
         match port {
             PRI_DATA => {
-                if !self.data_buf.is_empty() && self.data_offset < self.data_buf.len() {
-                    self.data_buf[self.data_offset] = val;
-                    self.data_offset += 1;
-                    // When all bytes written, persist to disk
-                    if self.data_offset >= self.data_buf.len() {
-                        let count = (self.data_buf.len() / 512) as u16;
-                        self.write_sectors(self.lba, count, &self.data_buf.clone());
-                        self.data_buf.clear();
-                        self.data_offset = 0;
+                // PIO rápido multisector: KVM coalesce un REP OUTSW/OUTSB en
+                // UN solo IoOut con todos los bytes. Antes solo se consumía
+                // data[0] y una transferencia WRITE SECTORS de N sectores
+                // nunca se completaba (el guest se quedaba esperando DRQ).
+                let total = self.data_buf.len();
+                if total == 0 {
+                    return; // escritura fuera de transferencia: ignorar
+                }
+                for &b in data.iter() {
+                    if self.data_offset < total {
+                        self.data_buf[self.data_offset] = b;
+                        self.data_offset += 1;
+                    }
+                }
+                if self.data_offset >= total {
+                    let count = (total / 512) as u16;
+                    let buf = std::mem::take(&mut self.data_buf);
+                    self.data_offset = 0;
+                    if self.write_sectors(self.lba, count, &buf) {
                         self.status = ST_DRDY;
-                        eprintln!("[ATA] WRITE SECTORS LBA={:#x} count={}", self.lba, count);
+                        eprintln!("[ATA] WRITE SECTORS LBA={:#x} count={} (fsync ok)", self.lba, count);
+                    } else {
+                        self.status = ST_DRDY | ST_ERR;
                     }
                 }
             }
             PRI_ERROR => {}
             PRI_SECTORS => { self.sector_count = val as u16; }
+            // Cada registro LBAx reemplaza SOLO su byte (LBA28, bits 0-27):
+            // las máscaras conservan el resto. Antes PRI_LBA1/PRI_LBA2
+            // borraban los bytes bajos ya escritos y cualquier LBA > 0xFF
+            // quedaba truncado (p. ej. LBA 1 se leía como 0).
             PRI_LBA0 => {
-                self.lba = (self.lba & 0xFFFFFFFFFFFF00FF) | (val as u64);
+                self.lba = (self.lba & 0xFFFF_FFFF_FFFF_FF00) | (val as u64);
             }
             PRI_LBA1 => {
-                self.lba = (self.lba & 0xFFFFFFFFFFFF0000) | ((val as u64) << 8);
+                self.lba = (self.lba & 0xFFFF_FFFF_FFFF_00FF) | ((val as u64) << 8);
             }
             PRI_LBA2 => {
-                self.lba = (self.lba & 0xFFFFFFFFFF000000) | ((val as u64) << 16);
+                self.lba = (self.lba & 0xFFFF_FFFF_FF00_FFFF) | ((val as u64) << 16);
             }
             PRI_DRIVE => {
                 self.drive_select = val;
@@ -693,11 +750,14 @@ impl IoDevice for PrimaryIde {
         }
     }
 
-    fn read(&mut self, port: u16, _count: usize) -> Vec<u8> {
+    fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
         match port {
             PRI_DATA => {
-                let mut result = Vec::new();
-                for _ in 0..2 {
+                // PIO rápido multisector: KVM entrega un REP INSW coalescido
+                // como un solo IoIn de `count` bytes. Antes se devolvían
+                // SIEMPRE 2 bytes y las lecturas de >1 sector truncaban.
+                let mut result = Vec::with_capacity(count);
+                for _ in 0..count {
                     if self.data_offset < self.data_buf.len() {
                         result.push(self.data_buf[self.data_offset]);
                         self.data_offset += 1;
@@ -933,5 +993,112 @@ mod tests {
         assert_eq!(&all[..8], b"SECTOR-0");
         // Verify sector 1 content (starts at offset 2048)
         assert_eq!(&all[2048..2048+8], b"SECTOR-1");
+    }
+
+    #[test]
+    fn reset_returns_to_idle_phase() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+        // Dejar el dispositivo a mitad de una transferencia INQUIRY
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let _ = cd.read(SEC_CMD, 1); // BSY
+        let _ = cd.read(SEC_CMD, 1); // DRQ → CdbIn
+        let cdb: [u8; 12] = [SCSI_INQUIRY, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0];
+        cd.write(SEC_DATA, &cdb);
+        assert_ne!(cd.read(SEC_CMD, 1)[0] & ST_DRQ, 0, "DRQ set after INQUIRY");
+
+        cd.reset();
+
+        // Reset → fase Idle: sin BSY, sin DRQ, solo DRDY
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_eq!(st & (ST_BSY | ST_DRQ), 0, "no BSY/DRQ after reset");
+        assert_ne!(st & ST_DRDY, 0, "DRDY after reset");
+        // Y el medio sigue presente: IDENTIFY PACKET vuelve a funcionar
+        cd.write(SEC_CMD, &[CMD_IDENTIFY_PACKET]);
+        let st1 = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st1 & ST_BSY, 0, "BSY on fresh IDENTIFY after reset");
+    }
+
+    // ─── Canal primario (disco ATA) ───────────────────────────────
+    fn make_test_disk(size: usize) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mi-vmm-test-disk-{}.img",
+            std::process::id() as u64 + std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos() as u64
+        ));
+        let mut f = File::create(&path).unwrap();
+        let mut sector = 0u32;
+        while (sector as usize + 1) * 512 <= size {
+            let mut buf = vec![0u8; 512];
+            let tag = format!("DISK-SECTOR-{}", sector);
+            buf[..tag.len()].copy_from_slice(tag.as_bytes());
+            buf[100] = sector as u8;
+            f.write_all(&buf).unwrap();
+            sector += 1;
+        }
+        path
+    }
+
+    #[test]
+    fn primary_ide_multisector_pio_read() {
+        let path = make_test_disk(2048);
+        let mut ide = PrimaryIde::with_disk(path.to_str().unwrap()).unwrap();
+
+        // READ SECTORS (0x20): LBA 0, 2 sectores
+        ide.write(PRI_SECTORS, &[2]);
+        ide.write(PRI_LBA0, &[0x00]);
+        ide.write(PRI_LBA1, &[0x00]);
+        ide.write(PRI_LBA2, &[0x00]);
+        ide.write(PRI_DRIVE, &[0xE0]); // LBA, master
+        ide.write(PRI_CMD, &[0x20]);
+
+        let st = ide.read(PRI_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set after READ SECTORS");
+
+        // REP INSW coalescido: una sola lectura de 1024 bytes (PIO multisector)
+        let data = ide.read(PRI_DATA, 1024);
+        assert_eq!(data.len(), 1024);
+        assert_eq!(&data[..13], b"DISK-SECTOR-0");
+        assert_eq!(&data[512..512 + 13], b"DISK-SECTOR-1");
+        // Tras consumir los datos, DRQ baja
+        let st = ide.read(PRI_CMD, 1)[0];
+        assert_eq!(st & ST_DRQ, 0, "DRQ cleared after data consumed");
+    }
+
+    #[test]
+    fn primary_ide_write_persists_and_fsyncs() {
+        let path = make_test_disk(2048);
+        let mut ide = PrimaryIde::with_disk(path.to_str().unwrap()).unwrap();
+
+        // WRITE SECTORS (0x30): LBA 1, 1 sector
+        ide.write(PRI_SECTORS, &[1]);
+        ide.write(PRI_LBA0, &[0x01]);
+        ide.write(PRI_LBA1, &[0x00]);
+        ide.write(PRI_LBA2, &[0x00]);
+        ide.write(PRI_DRIVE, &[0xE0]);
+        ide.write(PRI_CMD, &[0x30]);
+        let st = ide.read(PRI_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set waiting for write data");
+
+        // REP OUTSW coalescido: 512 bytes de una sola vez
+        let mut payload = vec![0u8; 512];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        ide.write(PRI_DATA, &payload);
+
+        // Completado: DRQ baja y status OK
+        let st = ide.read(PRI_CMD, 1)[0];
+        assert_eq!(st & ST_DRQ, 0, "DRQ cleared after write completes");
+        assert_eq!(st & ST_ERR, 0, "no error after write");
+
+        // Verificar el contenido persistido en el archivo (fsync ya hecho)
+        let mut f = File::open(&path).unwrap();
+        let mut buf = vec![0u8; 512];
+        f.seek(SeekFrom::Start(512)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, payload, "sector escrito en el archivo");
     }
 }

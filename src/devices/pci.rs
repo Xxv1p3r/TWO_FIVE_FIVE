@@ -148,6 +148,11 @@ pub struct PciBus {
     pub last_acpi_config_write: Option<(u8, u32)>,
     /// USB UHCI state compartido (para notificar I/O base asignado)
     usb_uhci: Option<Arc<Mutex<super::usb_uhci::UhciState>>>,
+    /// (tarea 1) Última asignación detectada de los BARs VGA (dev 2:0):
+    /// Some(base_gpa) cuando el guest escribe una dirección real de memoria.
+    /// La consume el hook de `DeviceBus::out()` (devices/mod.rs).
+    pub last_vga_lfb_bar_write: Option<u32>,
+    pub last_vga_mmio_bar_write: Option<u32>,
 }
 
 impl PciBus {
@@ -158,6 +163,8 @@ impl PciBus {
             devices: vec![vec![None; 8]; 32],
             last_acpi_config_write: None,
             usb_uhci: None,
+            last_vga_lfb_bar_write: None,
+            last_vga_mmio_bar_write: None,
         }
     }
 
@@ -168,6 +175,8 @@ impl PciBus {
     }
 
     /// Obtiene el I/O base asignado al USB UHCI (si disponible)
+    /// (helper de diagnóstico; el I/O base lo asigna write_bytes vía BAR4)
+    #[allow(dead_code)]
     pub fn usb_iobase(&self) -> Option<u16> {
         self.usb_uhci.as_ref().map(|s| {
             let state = s.lock().unwrap();
@@ -232,10 +241,34 @@ impl PciBus {
         // Collect side-effects while dev is borrowed, then apply after drop
         let mut acpi_write: Option<(u8, u32)> = None;
         let mut usb_new_iobase: Option<u16> = None;
+        let mut vga_bar_write: Option<(u8, u32)> = None; // (tarea 1: reg_off, base)
 
         if let Some(dev) = self.device_at_mut(addr) {
             for (i, &b) in data.iter().enumerate() {
                 dev.set_byte(byte_off.wrapping_add(i as u8), b);
+            }
+            // (tarea 1) Detectar asignaciones de los BARs VGA (dev 2:0):
+            // BAR0 (0x10) = framebuffer lineal 16 MiB, BAR2 (0x18) = MMIO 4 KiB.
+            // Igual que con el USB: ignoramos las escrituras de sizing
+            // (0xFFFFFFFF) y solo registramos direcciones reales de memoria.
+            if dev_num == 2 && fn_num == 0 {
+                for reg_off in [0x10u8, 0x18u8] {
+                    if byte_off >= reg_off && byte_off < reg_off + 4 {
+                        let raw = (dev.config_regs[reg_off as usize] as u32)
+                            | ((dev.config_regs[reg_off as usize + 1] as u32) << 8)
+                            | ((dev.config_regs[reg_off as usize + 2] as u32) << 16)
+                            | ((dev.config_regs[reg_off as usize + 3] as u32) << 24);
+                        if raw != 0xFFFFFFFF && raw & 1 == 0 {
+                            let base = raw & 0xFFFF_FFF0;
+                            vga_bar_write = Some((reg_off, base));
+                            eprintln!(
+                                "[PCI] VGA BAR{} asignado: GPA {:#x}",
+                                if reg_off == 0x10 { 0 } else { 2 },
+                                base
+                            );
+                        }
+                    }
+                }
             }
             // Detect writes to PIIX3 ACPI PM config registers (device 1, function 3)
             if dev_num == 1 && fn_num == 3 {
@@ -264,6 +297,13 @@ impl PciBus {
             }
         }
         // Apply side-effects after mutable borrow on dev is released
+        if let Some((reg_off, base)) = vga_bar_write {
+            if reg_off == 0x10 {
+                self.last_vga_lfb_bar_write = Some(base);
+            } else {
+                self.last_vga_mmio_bar_write = Some(base);
+            }
+        }
         if let Some(aw) = acpi_write {
             self.last_acpi_config_write = Some(aw);
         }
@@ -357,6 +397,27 @@ impl PciBus {
     /// Crea un bus PCI preconfigurado con QEMU-compatible i440FX + PIIX3.
     pub fn with_legacy_ide() -> Self {
         let mut bus = Self::new();
+        bus.populate_legacy_devices();
+        bus
+    }
+
+    /// Reset del bus PCI (reset del chipset): reconstruye el árbol de
+    /// dispositivos con su estado inicial (command/status a 0, BARs sin
+    /// asignar, PAM en ROM). Conserva el estado compartido del USB UHCI
+    /// (el Arc, que `connect_usb` ya enlazó); el UHCI se resetea aparte.
+    pub fn reset(&mut self) {
+        self.addr_reg = 0;
+        self.last_acpi_config_write = None;
+        self.last_vga_lfb_bar_write = None;
+        self.last_vga_mmio_bar_write = None;
+        self.devices = vec![vec![None; 8]; 32];
+        self.populate_legacy_devices();
+    }
+
+    /// Puebla el bus con el layout QEMU-compatible i440FX + PIIX3.
+    /// Reutilizado por `with_legacy_ide()` y por `reset()` para reconstruir
+    /// el árbol de dispositivos desde cero tras un reset del guest.
+    fn populate_legacy_devices(&mut self) {
 
         // ── Device 0: i440FX Host Bridge (8086:1237) ──
         let mut host = PciDevice::new(0x8086, 0x1237, 0x06, 0x00, 0x00);
@@ -372,7 +433,7 @@ impl PciBus {
         host.config_regs[0x2D] = 0x1A; // subsystem vendor high
         host.config_regs[0x2E] = 0x00; // subsystem device 0x1100 (QEMU VM) low
         host.config_regs[0x2F] = 0x11; // subsystem device high
-        bus.add_device(0, 0, host);
+        self.add_device(0, 0, host);
 
         // ── Device 1: PIIX3 multifunction ──
         // QEMU PIIX3 = 82371AB/EB/MB, device IDs:
@@ -385,7 +446,7 @@ impl PciBus {
         let mut isa = PciDevice::new(0x8086, 0x7000, 0x06, 0x01, 0x00);
         isa.header_type = HEADER_TYPE_MULTIFUNCTION; // bit 7 = multifunction
         isa.revision = 0x00;
-        bus.add_device(1, 0, isa);
+        self.add_device(1, 0, isa);
 
         // Function 1: IDE Controller (PIIX3)
         let mut ide = PciDevice::new(0x8086, 0x7010, 0x01, 0x01, 0x80);
@@ -401,20 +462,20 @@ impl PciBus {
         ide.set_bar_mask(0x1C, 0xFFFFFFFC);
         // BAR4 (reg 0x20): Bus master I/O, 16 bytes → mask 0xFFFFFFF0
         ide.set_bar_mask(0x20, 0xFFFFFFF0);
-        bus.add_device(1, 1, ide);
+        self.add_device(1, 1, ide);
 
         // Function 2: USB UHCI
         let mut usb = PciDevice::new(0x8086, 0x7020, 0x0C, 0x03, 0x00);
         usb.revision = 0x00;
         // BAR4 (reg 0x20): I/O, 32 bytes → mask 0xFFFFFFE1
         usb.set_bar_mask(0x20, 0xFFFFFFE1);
-        bus.add_device(1, 2, usb);
+        self.add_device(1, 2, usb);
 
         // Function 3: ACPI/PM
         let mut acpi = PciDevice::new(0x8086, 0x7113, 0x06, 0x80, 0x00);
         acpi.revision = 0x00;
         // No BARs - PM I/O base configured via PCI config regs 0x40/0x80
-        bus.add_device(1, 3, acpi);
+        self.add_device(1, 3, acpi);
 
         // ── Device 2: Bochs VBE Display Adapter (1234:1111) ──
         let mut vga = PciDevice::new(0x1234, 0x1111, 0x03, 0x00, 0x00);
@@ -423,9 +484,7 @@ impl PciBus {
         vga.set_bar_mask(0x10, 0xFF00_0008);
         // BAR2 (reg 0x18): 4 KiB MMIO
         vga.set_bar_mask(0x18, 0xFFFF_F000);
-        bus.add_device(2, 0, vga);
-
-        bus
+        self.add_device(2, 0, vga);
     }
 }
 

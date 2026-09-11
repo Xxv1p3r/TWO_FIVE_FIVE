@@ -1,20 +1,36 @@
 //! Administrador de la ventana gráfica en el Host (Frontend GUI con minifb).
 //!
-//! Soporta renderizado de modo texto VGA clásico (80x25 @ 0xB8000 con fuente 8x16)
-//! y modos gráficos VBE lineales (resoluciones dinámicas hasta 1920x1080).
-//! Además, captura eventos de teclado del host y los inyecta al controlador PS/2
-//! con la distribución ESPAÑOLA: los caracteres llegan por `InputCallback`
-//! (AltGr/acentos ya compuestos por el host) y las teclas de control con
-//! make/break completos (ver sección de entrada más abajo).
+//! Soporta:
+//!   - Modo texto VGA clásico (80x25 @ 0xB8000 con fuente 8x16) vía GuestMemory.
+//!   - (tarea 2) Modos gráficos VGA estándar: 13h (packed 320x200x8),
+//!     12h/10h/0Eh (planar 4bpp con even/odd host) y CGA 4/5 (planar
+//!     intercalado), decodificados desde seq_regs/grc_regs/attr_regs +
+//!     DAC palette.
+//!   - Modos gráficos VBE lineales (resoluciones dinámicas hasta 1920x1080),
+//!     con (tarea 15) VIRT_WIDTH para double-buffering, X_OFFSET/Y_OFFSET
+//!     (panning) y bpp 4/8/15/16/24/32.
+//!   - (tarea 15) La ventana escala el framebuffer al tamaño actual
+//!     (nearest-neighbor) al hacer resize.
+//!   - Captura de ratón PS/2 (tarea 9) con deltas y botones.
+//!   - (tarea 19) Entrada de teclado host con distribución ESPAÑOLA (CharInput,
+//!     dead keys, AltGr, CapsLock XOR Shift).
+//!   - (tarea 17) Cierre limpio de la VM al cerrar la ventana o pulsar Escape.
 
 use crate::devices::font::{FONT_8X16, VGA_PALETTE};
-use crate::devices::vga::VgaState;
-use minifb::{Key, KeyRepeat, Window, WindowOptions};
+use crate::devices::vga::{
+    VBE_DISPI_INDEX_ENABLE, VBE_DISPI_INDEX_VIRT_WIDTH, VBE_DISPI_INDEX_X_OFFSET,
+    VBE_DISPI_INDEX_Y_OFFSET, VBE_DISPI_8BIT_DAC, VgaState,
+};
+use crate::guest_mem::GuestMemory;
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+
+/// (tarea 2) Tope de seguridad para offsets planares: el estándar VGA
+/// direcciona 256 KiB de VRAM (4 planos × 64 KiB).
+const VGA_ADDRABLE: usize = 256 * 1024;
 
 pub struct DisplayManager {
     running: Arc<AtomicBool>,
@@ -23,8 +39,9 @@ pub struct DisplayManager {
 impl DisplayManager {
     pub fn start(
         vga_state: Arc<Mutex<VgaState>>,
-        guest_mem_ptr: *const u8,
+        guest_mem: Arc<GuestMemory>,
         kbd_queue: Arc<Mutex<VecDeque<u8>>>,
+        mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>>,
     ) -> Option<Self> {
         if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
             eprintln!("[DISPLAY] No se detectó servidor gráfico (DISPLAY/WAYLAND). Ejecutando en modo headless.");
@@ -34,13 +51,14 @@ impl DisplayManager {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
-        // Convert raw pointer to usize for safe transfer across thread boundary
-        let mem_addr = guest_mem_ptr as usize;
-
         thread::spawn(move || {
             let initial_width = 640;
             let initial_height = 400;
-            let mut buffer: Vec<u32> = vec![0; initial_width * initial_height];
+            // (tarea 15) El buffer LÓGICO guarda el frame renderizado al
+            // tamaño nativo del modo; el buffer de ventana lo re-escala al
+            // tamaño actual de la ventana (resize sin distorsión).
+            let mut render_buf: Vec<u32> = vec![0; initial_width * initial_height];
+            let mut window_buf: Vec<u32> = vec![0; initial_width * initial_height];
 
             let mut window = match Window::new(
                 "mi-vmm — VGA Display",
@@ -62,10 +80,11 @@ impl DisplayManager {
 
             window.set_target_fps(60);
 
+            let mem = guest_mem; // manija Arc<GuestMemory> movida al hilo
+            let mut last_mouse: Option<(f32, f32)> = None;
+            let mut last_buttons: u8 = 0;
+
             // ── Entrada de teclado (tarea 19) ─────────────────────────
-            // Estado compartido entre la vía de caracteres (callback) y la
-            // vía de teclas (bucle): CapsLock/NumLock como toggles y el
-            // estado de Ctrl/Alt (para atajos posicionales tipo Ctrl+C).
             let caps_on = Arc::new(AtomicBool::new(false));
             let numpad_on = Arc::new(AtomicBool::new(false));
             let ctrl_held = Arc::new(AtomicBool::new(false));
@@ -81,51 +100,85 @@ impl DisplayManager {
             // Teclas de control actualmente pulsadas → break al soltar.
             let mut held: HashMap<Key, Vec<u8>> = HashMap::new();
 
-            let mem_ptr = mem_addr as *const u8;
-
-            while running_clone.load(Ordering::Relaxed) && window.is_open() && !window.is_key_down(Key::Escape) {
-                let (is_vbe, width, height, bpp) = {
+            while running_clone.load(Ordering::Relaxed)
+                && window.is_open()
+                && !window.is_key_down(Key::Escape)
+            {
+                // ── Snapshot del modo actual ────────────────────────
+                let (is_vbe, is_std_gfx, lw, lh, bpp, virt_w, x_off, y_off, dac8) = {
                     let st = vga_state.lock().unwrap();
                     let (w, h, b) = st.get_resolution();
-                    (st.is_vbe_enabled(), w, h, b)
+                    let is_vbe = st.is_vbe_enabled();
+                    let is_std_gfx = !is_vbe && st.is_standard_vga_graphics();
+                    let (lw, lh) = if is_vbe {
+                        (w, h)
+                    } else if is_std_gfx {
+                        let (gw, gh) = st.standard_vga_geometry();
+                        (gw, gh)
+                    } else {
+                        (640, 400)
+                    };
+                    (
+                        is_vbe,
+                        is_std_gfx,
+                        lw,
+                        lh,
+                        b,
+                        st.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] as usize,
+                        st.dispi_regs[VBE_DISPI_INDEX_X_OFFSET as usize] as usize,
+                        st.dispi_regs[VBE_DISPI_INDEX_Y_OFFSET as usize] as usize,
+                        st.dispi_regs[VBE_DISPI_INDEX_ENABLE as usize] & VBE_DISPI_8BIT_DAC != 0,
+                    )
                 };
 
-                let target_w = if is_vbe { width } else { 640 };
-                let target_h = if is_vbe { height } else { 400 };
-
-                if buffer.len() != target_w * target_h {
-                    buffer.resize(target_w * target_h, 0);
+                if render_buf.len() != lw * lh {
+                    render_buf.resize(lw * lh, 0);
                 }
 
                 if is_vbe {
                     // Modo gráfico VBE: leer directamente de VRAM
                     let st = vga_state.lock().unwrap();
-                    if !st.vram_ptr.is_null() && st.vram_size >= target_w * target_h * (bpp / 8) {
-                        render_vbe_framebuffer(&mut buffer, st.vram_ptr, target_w, target_h, bpp);
+                    if !st.vram_ptr.is_null() {
+                        render_vbe_framebuffer(
+                            &mut render_buf,
+                            st.vram_ptr,
+                            st.vram_size,
+                            lw,
+                            lh,
+                            bpp,
+                            virt_w,
+                            x_off,
+                            y_off,
+                            &st.dac_palette,
+                            dac8,
+                        );
+                    }
+                } else if is_std_gfx {
+                    // (tarea 2) Modo gráfico VGA estándar
+                    let st = vga_state.lock().unwrap();
+                    if !st.vram_ptr.is_null() {
+                        render_vga_graphics(&mut render_buf, &st, lw, lh);
                     }
                 } else {
                     // Modo texto VGA: renderizar buffer 80x25 desde 0xB8000
-                    if !mem_ptr.is_null() {
-                        render_vga_text_mode(&mut buffer, mem_ptr);
-                    }
+                    render_vga_text_mode(&mut render_buf, &mem);
                 }
 
-                if let Err(e) = window.update_with_buffer(&buffer, target_w, target_h) {
+                // ── (tarea 15) Escalar al tamaño actual de la ventana ──
+                let (ww, wh) = window.get_size();
+                let (ww, wh) = (ww.max(1), wh.max(1));
+                if window_buf.len() != ww * wh {
+                    window_buf.resize(ww * wh, 0);
+                }
+                scale_nearest(&mut window_buf, ww, wh, &render_buf, lw, lh);
+
+                if let Err(e) = window.update_with_buffer(&window_buf, ww, wh) {
                     eprintln!("[DISPLAY] Error de actualización de ventana: {}", e);
                     break;
                 }
 
                 // ── Entrada del host: make/break de teclas de control ──
-                // Los caracteres imprimibles llegan por el InputCallback
-                // (con AltGr/acentos ya compuestos por el host); aquí solo
-                // se manejan teclas NO imprimibles con make/break completos.
-                // KeyRepeat::Yes + makes repetidos = typematic estilo 8042
-                // (el guest recibe makes sin break mientras se mantiene la
-                // tecla; el tope de la cola evita el desbordamiento).
                 for key in window.get_keys_pressed(KeyRepeat::Yes) {
-                    // Imprimible: con Ctrl/Alt pulsado se reenvía
-                    // posicionalmente (atajo tipo Ctrl+C); si no, ya lo
-                    // entregó add_char y aquí se ignora para no duplicar.
                     if is_printable_key(key) {
                         if ctrl_held.load(Ordering::Relaxed) || lalt_held.load(Ordering::Relaxed) {
                             let makes = key_to_ps2_scancodes(key);
@@ -138,14 +191,10 @@ impl DisplayManager {
                         continue;
                     }
                     if key == Key::Pause {
-                        // Secuencia especial: make+break en un solo evento.
                         let mut q = kbd_queue.lock().unwrap();
                         push_bytes(&mut q, &[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]);
                         continue;
                     }
-                    // Numpad dígitos/punto: con NumLock ON los entrega
-                    // add_char; con NumLock OFF son navegación y se
-                    // reenvían aquí (add_char se queda en silencio).
                     if matches!(
                         key,
                         Key::NumPad0 | Key::NumPad1 | Key::NumPad2 | Key::NumPad3 | Key::NumPad4
@@ -155,8 +204,6 @@ impl DisplayManager {
                     {
                         continue;
                     }
-                    // Operadores del numpad: add_char los entrega siempre
-                    // ('/', '*', '-', '+'), así que no se duplican aquí.
                     if matches!(
                         key,
                         Key::NumPadSlash | Key::NumPadAsterisk | Key::NumPadMinus | Key::NumPadPlus
@@ -212,11 +259,41 @@ impl DisplayManager {
                     }
                 }
 
-                thread::sleep(Duration::from_millis(16)); // ~60 FPS
+                // ── (tarea 9) Capturar el ratón del host ─────────────
+                match window.get_mouse_pos(MouseMode::Discard) {
+                    Some((mx, my)) => {
+                        let buttons = (window.get_mouse_down(MouseButton::Left) as u8)
+                            | ((window.get_mouse_down(MouseButton::Right) as u8) << 1)
+                            | ((window.get_mouse_down(MouseButton::Middle) as u8) << 2);
+                        let mut dx: i16 = 0;
+                        let mut dy: i16 = 0;
+                        if let Some((lx, ly)) = last_mouse {
+                            dx = (mx - lx) as i16;
+                            dy = (my - ly) as i16;
+                        }
+                        last_mouse = Some((mx, my));
+                        if dx != 0 || dy != 0 || buttons != last_buttons {
+                            let mut q = mouse_queue.lock().unwrap();
+                            q.push_back((dx, dy, buttons));
+                            last_buttons = buttons;
+                        }
+                    }
+                    None => {
+                        last_mouse = None;
+                    }
+                }
             }
 
+            // ── Cierre de ventana (tarea 17) ──────────────────────
+            crate::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+            let bsp_tid = crate::BSP_TID.load(Ordering::Relaxed);
+            if bsp_tid > 0 {
+                unsafe {
+                    libc::syscall(libc::SYS_tgkill, libc::getpid(), bsp_tid, libc::SIGTERM);
+                }
+            }
             running_clone.store(false, Ordering::Relaxed);
-            eprintln!("[DISPLAY] Ventana de visualización cerrada.");
+            eprintln!("[DISPLAY] Ventana de visualización cerrada — apagando la VM...");
         });
 
         Some(Self { running })
@@ -229,19 +306,29 @@ impl DisplayManager {
 }
 
 /// Renderiza la memoria de texto VGA en 0xB8000 a un buffer RGB de 640x400.
-fn render_vga_text_mode(buffer: &mut [u32], mem_ptr: *const u8) {
+fn render_vga_text_mode(buffer: &mut [u32], mem: &GuestMemory) {
     const COLS: usize = 80;
     const ROWS: usize = 25;
     const CHAR_W: usize = 8;
     const CHAR_H: usize = 16;
     const WIDTH: usize = COLS * CHAR_W; // 640
     const TEXT_OFFSET: usize = 0xB8000;
+    const TEXT_SIZE: usize = COLS * ROWS * 2;
+
+    if mem.size() < TEXT_OFFSET + TEXT_SIZE {
+        buffer.fill(0);
+        return;
+    }
+
+    // Copia acotada de la pantalla de texto (el guest la escribe en paralelo).
+    let mut text = [0u8; TEXT_SIZE];
+    let _ = mem.copy_from(TEXT_OFFSET, &mut text);
 
     for row in 0..ROWS {
         for col in 0..COLS {
-            let cell_idx = TEXT_OFFSET + (row * COLS + col) * 2;
-            let ch = unsafe { *mem_ptr.add(cell_idx) } as usize;
-            let attr = unsafe { *mem_ptr.add(cell_idx + 1) } as usize;
+            let cell_idx = (row * COLS + col) * 2;
+            let ch = text[cell_idx] as usize;
+            let attr = text[cell_idx + 1] as usize;
 
             let fg_color = VGA_PALETTE[attr & 0x0F];
             let bg_color = VGA_PALETTE[(attr >> 4) & 0x0F];
@@ -266,48 +353,272 @@ fn render_vga_text_mode(buffer: &mut [u32], mem_ptr: *const u8) {
     }
 }
 
-/// Renderiza la VRAM lineal VBE hacia el buffer RGB de minifb.
-fn render_vbe_framebuffer(buffer: &mut [u32], vram_ptr: *const u8, width: usize, height: usize, bpp: usize) {
+// ─── (tarea 2) Renderizado de modos gráficos VGA estándar ──────────
+
+/// Lee un byte de VRAM con el addressing planar clásico: el offset de 16 bits
+/// del modo se interpreta dentro del plano indicado (cada plano empieza en
+/// su propio bloque de 64 KiB). Con bounds-check para no leer fuera de VRAM.
+#[inline]
+fn vga_plane_read(vram: *const u8, addr: usize, plane: usize, vram_size: usize) -> u8 {
+    let off = (addr & 0xFFFF) + 0x10000 * plane;
+    if off < vram_size.min(VGA_ADDRABLE) {
+        unsafe { *vram.add(off) }
+    } else {
+        0xFF
+    }
+}
+
+/// Construye la LUT de 256 colores del DAC (0x00RRGGBB) para los modos
+/// palette-index (4/8 bpp). Con 6 bits por canal (por defecto) se escalan
+/// a 8 bits; con VBE_DISPI_8BIT_DAC el DAC ya entrega 8 bits por canal.
+fn build_dac_lut(dac: &[u8; 768], eight_bit: bool) -> [u32; 256] {
+    let mut lut = [0u32; 256];
+    let conv = |v: u8| -> u32 {
+        if eight_bit {
+            v as u32
+        } else {
+            ((v & 0x3F) as u32) * 255 / 63
+        }
+    };
+    for i in 0..256 {
+        let r = conv(dac[i * 3]);
+        let g = conv(dac[i * 3 + 1]);
+        let b = conv(dac[i * 3 + 2]);
+        lut[i] = (r << 16) | (g << 8) | b;
+    }
+    lut
+}
+
+/// Renderiza un modo gráfico VGA estándar decodificando los registros
+/// reales del hardware emulado (Sequencer, Graphics Controller, Attribute
+/// Controller y DAC).
+fn render_vga_graphics(buffer: &mut [u32], st: &VgaState, width: usize, height: usize) {
+    let chain4 = st.seq_regs[0x04] & 0x08 != 0;
+    let oe_seq = st.seq_regs[0x01] & 0x08 != 0;
+    let g_mode = st.grc_regs[0x05] & 0x20 != 0;
+    let shift_2 = st.grc_regs[0x05] & 0x02 != 0;
+    let attr_8bit = st.attr_regs[0x10] & 0x80 != 0;
+    let dac8 = st.dispi_regs[VBE_DISPI_INDEX_ENABLE as usize] & VBE_DISPI_8BIT_DAC != 0;
+    let lut = build_dac_lut(&st.dac_palette, dac8);
+
+    let palette_idx = |raw: u8| -> usize {
+        (if attr_8bit { raw } else { raw & 0x0F }) as usize & 0xFF
+    };
+
+    let row_bytes = ((st.crtc_regs[0x13] as usize) | (((st.crtc_regs[0x14] as usize) & 0x3F) << 8)) * 2;
+
+    #[derive(PartialEq, Clone, Copy)]
+    enum AddrMode {
+        Packed,
+        Planar4,
+        Cga2,
+    }
+    let addr_mode: AddrMode = if chain4 {
+        AddrMode::Packed
+    } else if oe_seq && shift_2 && g_mode {
+        AddrMode::Cga2
+    } else if g_mode {
+        AddrMode::Planar4
+    } else {
+        buffer.fill(0x000000);
+        return;
+    };
+
+    let vram = st.vram_ptr;
+    let vram_size = st.vram_size;
+
+    for row in 0..height.min(1024) {
+        for col in 0..width.min(2048) {
+            let buf_idx = row * width + col;
+            if buf_idx >= buffer.len() {
+                continue;
+            }
+            let color: u32 = match addr_mode {
+                AddrMode::Packed => {
+                    let a = (row * width + col) & 0xFFFF;
+                    let b = (row * width + col) >> 16;
+                    let off = (((a & !3) << 2) + (b << 14) + (a & 3)) & 0xFFFF;
+                    lut[vga_plane_read(vram, off, 0, vram_size) as usize]
+                }
+                AddrMode::Planar4 => {
+                    let row_bytes = if row_bytes >= width / 8 { row_bytes } else { width / 8 };
+                    let off = row * row_bytes + (col >> 3);
+                    let bit = 7 - (col & 7);
+                    let mut pal = 0u8;
+                    for plane in 0..4usize {
+                        let b = vga_plane_read(vram, off, plane, vram_size);
+                        pal |= ((b >> bit) & 1) << plane;
+                    }
+                    lut[palette_idx(st.attr_regs[pal as usize])]
+                }
+                AddrMode::Cga2 => {
+                    let row_bytes = if row_bytes >= width / 8 { row_bytes } else { width / 8 };
+                    let off = (row >> 1) * row_bytes + (col >> 3) + ((row & 1) << 13);
+                    let b0 = vga_plane_read(vram, off, 0, vram_size);
+                    let b1 = vga_plane_read(vram, off, 1, vram_size);
+                    let bit = 7 - (col & 7);
+                    let pal = (((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1)) as usize;
+                    lut[palette_idx(st.attr_regs[pal])]
+                }
+            };
+            buffer[buf_idx] = color;
+        }
+    }
+}
+
+// ─── (tarea 15) VBE con VIRT_WIDTH / X_OFFSET / Y_OFFSET ───────────
+
+#[allow(clippy::too_many_arguments)]
+fn render_vbe_framebuffer(
+    buffer: &mut [u32],
+    vram_ptr: *const u8,
+    vram_size: usize,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    virt_width: usize,
+    x_offset: usize,
+    y_offset: usize,
+    dac: &[u8; 768],
+    dac8: bool,
+) {
+    if width == 0 || height == 0 || vram_size == 0 {
+        return;
+    }
+    let vw = if virt_width >= width { virt_width } else { width };
+    let bytes_pp = match bpp {
+        32 => 4usize,
+        24 => 3,
+        16 | 15 => 2,
+        8 | 4 => 1,
+        _ => {
+            buffer.fill(0);
+            return;
+        }
+    };
+    let row_bytes = vw * bytes_pp;
+    let row_bytes = if y_offset + height > 0 && (y_offset + height - 1) * row_bytes + row_bytes > vram_size {
+        width * bytes_pp
+    } else {
+        row_bytes
+    };
+    let (xo, yo) = if x_offset + width <= vw { (x_offset, y_offset) } else { (0, y_offset) };
+
     match bpp {
         32 => {
-            let total_pixels = width * height;
-            let src_slice = unsafe { std::slice::from_raw_parts(vram_ptr as *const u32, total_pixels) };
-            for (dst, &src) in buffer.iter_mut().zip(src_slice.iter()) {
-                // Minifb expects 0x00RRGGBB. Standard VBE 32bpp is BGRA/BGRX or RGBA.
-                // Convert BGR to RGB:
-                let b = src & 0xFF;
-                let g = (src >> 8) & 0xFF;
-                let r = (src >> 16) & 0xFF;
-                *dst = (r << 16) | (g << 8) | b;
+            for y in 0..height {
+                let src_row = (yo + y) * row_bytes + xo * 4;
+                if src_row + width * 4 > vram_size {
+                    continue;
+                }
+                let src_slice =
+                    unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u32, width) };
+                for (x, &src) in src_slice.iter().enumerate() {
+                    let b = src & 0xFF;
+                    let g = (src >> 8) & 0xFF;
+                    let r = (src >> 16) & 0xFF;
+                    buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                }
             }
         }
         24 => {
-            let total_pixels = width * height;
-            let src = unsafe { std::slice::from_raw_parts(vram_ptr, total_pixels * 3) };
-            for i in 0..total_pixels {
-                let b = src[i * 3] as u32;
-                let g = src[i * 3 + 1] as u32;
-                let r = src[i * 3 + 2] as u32;
-                if i < buffer.len() {
-                    buffer[i] = (r << 16) | (g << 8) | b;
+            for y in 0..height {
+                let src_row = (yo + y) * row_bytes + xo * 3;
+                if src_row + width * 3 > vram_size {
+                    continue;
+                }
+                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width * 3) };
+                for x in 0..width {
+                    let b = src[x * 3] as u32;
+                    let g = src[x * 3 + 1] as u32;
+                    let r = src[x * 3 + 2] as u32;
+                    buffer[y * width + x] = (r << 16) | (g << 8) | b;
                 }
             }
         }
         16 => {
-            let total_pixels = width * height;
-            let src = unsafe { std::slice::from_raw_parts(vram_ptr as *const u16, total_pixels) };
-            for i in 0..total_pixels {
-                let p = src[i];
-                let r = (((p >> 11) & 0x1F) * 255 / 31) as u32;
-                let g = (((p >> 5) & 0x3F) * 255 / 63) as u32;
-                let b = ((p & 0x1F) * 255 / 31) as u32;
-                if i < buffer.len() {
-                    buffer[i] = (r << 16) | (g << 8) | b;
+            for y in 0..height {
+                let src_row = (yo + y) * row_bytes + xo * 2;
+                if src_row + width * 2 > vram_size {
+                    continue;
+                }
+                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u16, width) };
+                for (x, &p) in src.iter().enumerate() {
+                    let r = (((p >> 11) & 0x1F) * 255 / 31) as u32;
+                    let g = (((p >> 5) & 0x3F) * 255 / 63) as u32;
+                    let b = ((p & 0x1F) * 255 / 31) as u32;
+                    buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+        15 => {
+            for y in 0..height {
+                let src_row = (yo + y) * row_bytes + xo * 2;
+                if src_row + width * 2 > vram_size {
+                    continue;
+                }
+                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u16, width) };
+                for (x, &p) in src.iter().enumerate() {
+                    let r = (((p >> 10) & 0x1F) * 255 / 31) as u32;
+                    let g = (((p >> 5) & 0x1F) * 255 / 31) as u32;
+                    let b = ((p & 0x1F) * 255 / 31) as u32;
+                    buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+        8 => {
+            let lut = build_dac_lut(dac, dac8);
+            for y in 0..height {
+                let src_row = (yo + y) * row_bytes + xo;
+                if src_row + width > vram_size {
+                    continue;
+                }
+                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width) };
+                for (x, &idx) in src.iter().enumerate() {
+                    buffer[y * width + x] = lut[idx as usize];
+                }
+            }
+        }
+        4 => {
+            let lut = build_dac_lut(dac, dac8);
+            for y in 0..height {
+                let src_row = (yo + y) * row_bytes + xo / 2;
+                if src_row + (width + 1) / 2 > vram_size {
+                    continue;
+                }
+                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), (width + 1) / 2) };
+                for (x, &byte) in src.iter().enumerate() {
+                    let px = y * width + x * 2;
+                    buffer[px] = lut[(byte >> 4) as usize];
+                    if x * 2 + 1 < width {
+                        buffer[px + 1] = lut[(byte & 0x0F) as usize];
+                    }
                 }
             }
         }
         _ => {
             buffer.fill(0);
+        }
+    }
+}
+
+/// (tarea 15) Escalado nearest-neighbor del framebuffer lógico al tamaño
+/// actual de la ventana. `dst` debe ser exactamente dw*dh píxeles.
+fn scale_nearest(dst: &mut [u32], dw: usize, dh: usize, src: &[u32], sw: usize, sh: usize) {
+    if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+        dst.fill(0);
+        return;
+    }
+    if dw == sw && dh == sh && dst.len() == src.len() {
+        dst.copy_from_slice(src);
+        return;
+    }
+    for y in 0..dh {
+        let sy = y * sh / dh;
+        let src_row = &src[sy * sw..(sy + 1) * sw];
+        let dst_row = &mut dst[y * dw..(y + 1) * dw];
+        for (x, px) in dst_row.iter_mut().enumerate() {
+            *px = src_row[x * sw / dw];
         }
     }
 }

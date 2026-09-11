@@ -3,7 +3,9 @@
 //! - CMOS/RTC (0x70/0x71): mapa de memoria del sistema, hora, estado de boot.
 
 use super::IoDevice;
+use crate::guest_mem::GuestMemory;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 // ─── DebugCon: puerto de salida de caracteres del BIOS ─────────────
@@ -14,8 +16,14 @@ pub struct DebugCon {
     vga_row: usize,
     /// Cursor column in VGA text buffer (0-79)
     vga_col: usize,
-    /// Pointer to guest physical memory (set after mmap)
-    guest_mem: Option<usize>, // stored as usize for Send+Sync
+    /// Memoria del guest con bounds-check (tarea 18): sustituye al puntero
+    /// crudo que antes se guardaba como usize para cruzar hilos.
+    guest_mem: Option<Arc<GuestMemory>>,
+    /// (tarea 13) Mirror de la salida del BIOS al buffer de texto VGA
+    /// (0xB8000). Por defecto OFF: el guest ya pinta su propia pantalla vía
+    /// INT 10h y el espejo duplicaba/pisaba caracteres. Se activa con
+    /// MI_VMM_MIRROR_BIOS=1 para depurar arranques que no llegan a pintar.
+    mirror_vga: bool,
 }
 
 impl DebugCon {
@@ -29,20 +37,32 @@ impl DebugCon {
             vga_row: 0,
             vga_col: 0,
             guest_mem: None,
+            mirror_vga: std::env::var("MI_VMM_MIRROR_BIOS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
-    /// Set the guest memory pointer for VGA mirroring.
-    pub fn set_guest_mem(&mut self, ptr: *const u8) {
-        self.guest_mem = Some(ptr as usize);
+    /// (tarea 13) ¿Está activo el espejo VGA de la salida del BIOS?
+    pub fn mirror_enabled(&self) -> bool {
+        self.mirror_vga
+    }
+
+    /// Set the guest memory handle for VGA mirroring.
+    pub fn set_guest_mem(&mut self, mem: Arc<GuestMemory>) {
+        self.guest_mem = Some(mem);
+    }
+
+    /// Reset del DebugCon: vuelve el cursor del espejo VGA al inicio.
+    pub fn reset(&mut self) {
+        self.vga_row = 0;
+        self.vga_col = 0;
     }
 
     /// Write a character to the VGA text buffer at current cursor position.
+    /// Todas las escrituras van por `GuestMemory` con bounds-check (tarea 18).
     fn vga_putchar(&mut self, ch: u8) {
-        let Some(mem) = self.guest_mem else { return };
-        let ptr = mem as *mut u8;
-        let total = Self::VGA_BASE + Self::VGA_COLS * Self::VGA_ROWS * 2;
-        if total > 256 * 1024 * 1024 { return; }
+        let Some(mem) = self.guest_mem.as_ref() else { return };
 
         match ch {
             b'\n' => {
@@ -57,30 +77,30 @@ impl DebugCon {
             }
             _ => {
                 let off = Self::VGA_BASE + (self.vga_row * Self::VGA_COLS + self.vga_col) * 2;
-                if off + 1 < 256 * 1024 * 1024 {
-                    unsafe {
-                        *ptr.add(off) = ch;
-                        *ptr.add(off + 1) = 0x07; // light gray on black
-                    }
-                }
+                // Fuera de rango → write() devuelve false y no toca memoria.
+                mem.write(off, ch);
+                mem.write(off + 1, 0x07); // light gray on black
                 self.vga_col += 1;
             }
         }
         // Scroll up if past bottom
         if self.vga_row >= Self::VGA_ROWS {
-            // Copy rows 1-24 to rows 0-23
+            // Copy rows 1-24 to rows 0-23. Los rangos se solapan, así que se
+            // hace con un buffer intermedio y copias acotadas (sin memmove
+            // crudo).
             let row_bytes = Self::VGA_COLS * 2;
             let dst = Self::VGA_BASE;
             let src = Self::VGA_BASE + row_bytes;
             let count = (Self::VGA_ROWS - 1) * row_bytes;
-            unsafe {
-                std::ptr::copy(ptr.add(src), ptr.add(dst), count);
-                // Clear last row
-                for i in 0..Self::VGA_COLS {
-                    let off = Self::VGA_BASE + (Self::VGA_ROWS - 1) * Self::VGA_COLS * 2 + i * 2;
-                    *ptr.add(off) = b' ';
-                    *ptr.add(off + 1) = 0x07;
-                }
+            let mut scratch = [0u8; (Self::VGA_ROWS - 1) * Self::VGA_COLS * 2];
+            if mem.copy_from(src, &mut scratch) == count {
+                mem.copy_to(dst, &scratch[..count]);
+            }
+            // Clear last row
+            for i in 0..Self::VGA_COLS {
+                let off = Self::VGA_BASE + (Self::VGA_ROWS - 1) * Self::VGA_COLS * 2 + i * 2;
+                mem.write(off, b' ');
+                mem.write(off + 1, 0x07);
             }
             self.vga_row = Self::VGA_ROWS - 1;
         }
@@ -99,9 +119,11 @@ impl IoDevice for DebugCon {
     }
 
     fn write(&mut self, _port: u16, data: &[u8]) {
-        // Mirror to VGA text buffer
-        for &b in data {
-            self.vga_putchar(b);
+        // (tarea 13) Mirror to VGA text buffer: solo opt-in vía MI_VMM_MIRROR_BIOS=1
+        if self.mirror_vga {
+            for &b in data {
+                self.vga_putchar(b);
+            }
         }
         // Also write to stderr
         use std::io::Write;
@@ -134,6 +156,10 @@ impl PostCode {
     pub const PORT: u16 = 0x80;
     pub fn new() -> Self {
         Self { last: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        self.last = 0;
     }
 }
 
@@ -177,20 +203,41 @@ impl CmosRtc {
     pub const PORT_DATA: u16 = 0x71;
 
     pub fn new() -> Self {
+        Self::with_ram_size(512 * 1024 * 1024)
+    }
+
+    pub fn with_ram_size(ram_size: u64) -> Self {
         let mut ram = [0u8; 128];
-        // Pre-fill CMOS RAM with default values that SeaBIOS expects
         ram[0x0F] = 0x00; // Shutdown status: normal boot
-        ram[0x10] = 0x40; // Equipment byte: 80x25 color display
-        // Extended memory (SeaBIOS qemu_preinit fallback when no etc/e820):
-        //   rs = (ram[0x34] << 16) | (ram[0x35] << 24)  → units of 64 KB
-        // With 256 MB RAM: 240 MB above 16 MB = 245760 KB / 64 = 3840 = 0x0F00
-        // → ram[0x34] = 0x00, ram[0x35] = 0x0F  → RamSize = 16MB + 240MB = 256MB
-        ram[0x34] = 0x00; // Extended memory >16MB low byte
-        ram[0x35] = 0x0F; // Extended memory >16MB high byte
-        // Extended memory 1MB-16MB (units: low=1KB, high=256KB per SeaBIOS):
-        // 15 MB above 1 MB → low=0x00, high=60=0x3C
-        ram[0x30] = 0x00; // Extended memory <16MB low
-        ram[0x31] = 0x3C; // Extended memory <16MB high
+        ram[0x10] = 0x00; // Equipment byte: 0 floppies
+        ram[0x14] = 0x23; // Equipment: 80x25 color, keyboard installed
+
+        // Base memory: 640 KB (0x0280)
+        ram[0x15] = 0x80;
+        ram[0x16] = 0x02;
+
+        // Extended memory 1MB-16MB in KB (max 15MB = 15360 KB = 0x3C00)
+        let ext_16m = if ram_size > 16 * 1024 * 1024 {
+            15 * 1024 // 15360 KB = 0x3C00
+        } else if ram_size > 1024 * 1024 {
+            ((ram_size - 1024 * 1024) / 1024) as u16
+        } else {
+            0
+        };
+        ram[0x17] = ext_16m as u8;
+        ram[0x18] = (ext_16m >> 8) as u8;
+        ram[0x30] = ext_16m as u8;
+        ram[0x31] = (ext_16m >> 8) as u8;
+
+        // Extended memory >16MB in 64KB chunks
+        let ext_above_16m = if ram_size > 16 * 1024 * 1024 {
+            ((ram_size - 16 * 1024 * 1024) / 65536) as u16
+        } else {
+            0
+        };
+        ram[0x34] = ext_above_16m as u8;
+        ram[0x35] = (ext_above_16m >> 8) as u8;
+
         Self {
             index: 0,
             rtc_start: std::time::Instant::now(),
@@ -198,6 +245,18 @@ impl CmosRtc {
             last_second: 0,
             ram,
         }
+    }
+
+    /// Reset del RTC/CMOS: limpia el estado volátil (registro índice,
+    /// Status C, byte de shutdown) pero conserva la hora y la RAM CMOS
+    /// respaldada por batería (persisten entre resets en hardware real).
+    pub fn reset(&mut self) {
+        self.index = 0;
+        self.status_c = 0;
+        self.last_second = self.current_second();
+        // Shutdown status: boot normal (evita que SeaBIOS entre en la
+        // rutina de shutdown tras un reset).
+        self.ram[0x0F] = 0x00;
     }
 
     /// Convert a binary value to BCD (Binary Coded Decimal).
@@ -262,21 +321,8 @@ impl CmosRtc {
             }
             0x0D => 0x80, // Status D: batería OK
             0x0F => 0,    // Shutdown status: boot normal (soft reset)
-            0x14 => 0x23, // Equipment: 80x25 color, keyboard installed
-            // Base memory: 640 KB (0x0280, little-endian)
-            0x15 => 0x80,
-            0x16 => 0x02,
-            // Extended memory: 255 MB (256 MiB RAM - 1 MiB) = 0xFE00 KB
-            0x17 => 0x00,
-            0x18 => 0xFE,
-            0x30 => 0x00,
-            0x31 => 0xFE,
-            // Extended >16 MB: 240 MB = 0xF000 KB
-            0x34 => 0x00,
-            0x35 => 0xF0,
             0x3D..=0x3F => 0, // sin option ROMs
-            // For writable registers (shutdown status, EBDA ptr, etc.),
-            // read from CMOS RAM so SeaBIOS can write-then-read
+            // Para registros de memoria (0x14-0x18, 0x30-0x35) y registros escribibles:
             _ => self.ram[reg as usize],
         }
     }
@@ -362,6 +408,12 @@ impl A20Gate {
     pub fn is_enabled(&self) -> bool {
         self.state & 0x01 != 0
     }
+
+    /// Reset del A20: vuelve al estado inicial (A20 deshabilitado, como
+    /// un reset del chipset).
+    pub fn reset(&mut self) {
+        self.state = 0x02;
+    }
 }
 
 impl Default for A20Gate {
@@ -442,6 +494,9 @@ pub struct AcpiPm {
     legacy_regs: [u8; 8],
     /// Contador de reads para debug
     read_count: u32,
+    /// SLP_EN visto en PM1a_CNT (bit 13): el guest evaluó _S5 y pidió
+    /// apagado limpio. El VMM lo consulta para terminar la VM.
+    sleep_requested: bool,
 }
 
 impl AcpiPm {
@@ -460,7 +515,13 @@ impl AcpiPm {
             smb_enabled: false,
             legacy_regs: [0u8; 8],
             read_count: 0,
+            sleep_requested: false,
         }
+    }
+
+    /// True si el guest escribió SLP_EN en PM1a_CNT (apagado limpio vía _S5).
+    pub fn sleep_requested(&self) -> bool {
+        self.sleep_requested
     }
 
     /// Llamado por DeviceBus cuando SeaBIOS escribe al PCI config del PIIX3 ACPI.
@@ -497,6 +558,13 @@ impl AcpiPm {
             }
             _ => {}
         }
+    }
+
+    /// Reset del bloque ACPI/PM: vuelve a los valores iniciales (el PM I/O
+    /// base vuelve al legacy 0xB0 y queda deshabilitado hasta que SeaBIOS lo
+    /// reprograme por PCI config).
+    pub fn reset(&mut self) {
+        *self = Self::new();
     }
 
     /// Retorna el PM Timer actual (24-bit counter).
@@ -590,14 +658,26 @@ impl IoDevice for AcpiPm {
                     }
                 }
                 0x04..=0x05 => {
-                    // PM1a Control: writes are processed and register is read-only
-                    if off == 0x04 {
-                        self.pm1a_cnt = (self.pm1a_cnt & 0xFF00) | (val as u16);
-                    } else {
-                        self.pm1a_cnt = (self.pm1a_cnt & 0x00FF) | ((val as u16) << 8);
+                    // PM1a Control: accepts writes, register is read-only.
+                    // El guest puede escribir 1 o 2 bytes en un solo OUT
+                    // (outw/outl a 0x604): aplicar cada byte a su offset.
+                    for (i, &b) in data.iter().enumerate() {
+                        match off + i as u16 {
+                            0x04 => self.pm1a_cnt = (self.pm1a_cnt & 0xFF00) | (b as u16),
+                            0x05 => self.pm1a_cnt = (self.pm1a_cnt & 0x00FF) | ((b as u16) << 8),
+                            _ => {}
+                        }
                     }
-                    // SLP_TYP bits (12:10) and SLP_EN (bit 13)
-                    // For now, ignore sleep requests
+                    // SLP_TYP (bits 12:10) + SLP_EN (bit 13): el guest
+                    // evaluó _S5 y escribe SLP_EN para apagar la máquina.
+                    // Se detecta aquí para que el VMM salga limpiamente.
+                    if self.pm1a_cnt & (1 << 13) != 0 {
+                        eprintln!(
+                            "[ACPI] SLP_EN detectado (PM1a_CNT=0x{:04X}) — apagado limpio solicitado",
+                            self.pm1a_cnt
+                        );
+                        self.sleep_requested = true;
+                    }
                 }
                 _ => {} // Other PM registers: ignore
             }
@@ -676,10 +756,59 @@ impl FloppyStub {
     pub fn new() -> Self {
         Self { dor: 0x0C } // valor reset típico: motor off, DMA+reset ready
     }
+
+    pub fn reset(&mut self) {
+        self.dor = 0x0C;
+    }
 }
 
 impl Default for FloppyStub {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured_pm() -> AcpiPm {
+        let mut pm = AcpiPm::new();
+        // SeaBIOS programa el PIIX por PCI config (reg 0x40 base, 0x80 enable).
+        pm.update_pci_config(0x40, 0x600 | 1);
+        pm.update_pci_config(0x80, 0x01);
+        pm
+    }
+
+    /// Linux escribe SLP_EN en PM1a_CNT (0x604) tras evaluar _S5 → apagado.
+    #[test]
+    fn slp_en_detects_clean_shutdown_request() {
+        let mut pm = configured_pm();
+        assert!(!pm.sleep_requested());
+        // outw(SLP_TYP=0 | SLP_EN=0x2000, 0x604) como un único OUT de 2 bytes.
+        pm.write(0x604, &[0x00, 0x20]);
+        assert!(pm.sleep_requested(), "SLP_EN debe marcar el apagado");
+        assert_eq!(pm.pm1a_cnt, 0x2000);
+        // Reset del bloque PM (reboot/arranque limpio) borra el flag.
+        pm.reset();
+        assert!(!pm.sleep_requested());
+    }
+
+    /// Un outw también puede llegar dividido en dos OUT de 1 byte.
+    #[test]
+    fn pm1a_cnt_accepts_split_byte_writes() {
+        let mut pm = configured_pm();
+        pm.write(0x604, &[0x00]);
+        pm.write(0x605, &[0x20]);
+        assert_eq!(pm.pm1a_cnt, 0x2000);
+        assert!(pm.sleep_requested());
+    }
+
+    /// Escrituras sin SLP_EN (p. ej. SCI enable) no marcan el apagado.
+    #[test]
+    fn pm1a_cnt_without_slp_en_ignored() {
+        let mut pm = configured_pm();
+        pm.write(0x604, &[0x01, 0x00]);
+        assert!(!pm.sleep_requested());
+    }
 }
 
 impl IoDevice for FloppyStub {
@@ -720,6 +849,11 @@ pub struct PlatformStubs {
 impl PlatformStubs {
     pub fn new() -> Self {
         Self { lpt1_data: 0, lpt2_data: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        self.lpt1_data = 0;
+        self.lpt2_data = 0;
     }
 }
 
@@ -764,4 +898,92 @@ impl IoDevice for PlatformStubs {
             _ => vec![0x00; count],
         }
     }
+}
+
+// ─── APM / SMI Device (0xB2/0xB3) — Item 23 (SMM) ────────────────
+/// Emulación del puerto de control APM (0xB2) y datos (0xB3).
+/// Usado por el firmware/SO para disparar System Management Interrupts (SMI)
+/// y habilitar/deshabilitar ACPI según el valor de SMI_CMD en la FADT.
+pub struct ApmSmiDevice {
+    pub cmd: u8,
+    pub data: u8,
+    pub smi_requested: bool,
+}
+
+impl ApmSmiDevice {
+    pub const PORT_CMD: u16 = 0xB2;
+    pub const PORT_DATA: u16 = 0xB3;
+
+    pub fn new() -> Self {
+        Self {
+            cmd: 0,
+            data: 0,
+            smi_requested: false,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.cmd = 0;
+        self.data = 0;
+        self.smi_requested = false;
+    }
+
+    pub fn take_smi(&mut self) -> bool {
+        let r = self.smi_requested;
+        self.smi_requested = false;
+        r
+    }
+}
+
+impl Default for ApmSmiDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IoDevice for ApmSmiDevice {
+    fn matches_port(&self, port: u16) -> bool {
+        port == Self::PORT_CMD || port == Self::PORT_DATA
+    }
+
+    fn write(&mut self, port: u16, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        if port == Self::PORT_CMD {
+            self.cmd = data[0];
+            self.smi_requested = true;
+        } else if port == Self::PORT_DATA {
+            self.data = data[0];
+        }
+    }
+
+    fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        let val = if port == Self::PORT_CMD { self.cmd } else { self.data };
+        vec![val; count]
+    }
+}
+
+// ─── TSS Real para prevención de Triple Fault (Item 23) ────────────
+/// Configura una estructura Task State Segment (TSS) de 32 bits real en memoria del guest.
+///
+/// Provee una pila limpia aislada (`ESP0`) y descriptores adecuados para que un Double
+/// Fault (#DF, Vector 8) no se convierta instantáneamente en un Triple Fault (#TF)
+/// si ocurre corrupción o desbordamiento de pila en el guest.
+pub fn init_guest_tss(guest_mem: &mut [u8], tss_addr: usize, stack_addr: usize) -> bool {
+    let tss_size = 104usize;
+    if tss_addr + tss_size > guest_mem.len() || stack_addr > guest_mem.len() {
+        return false;
+    }
+    guest_mem[tss_addr..tss_addr + tss_size].fill(0);
+    // ESP0 en offset 4 (u32 LE)
+    let sp0 = (stack_addr as u32).to_le_bytes();
+    guest_mem[tss_addr + 4..tss_addr + 8].copy_from_slice(&sp0);
+    // SS0 en offset 8 (selector de datos de kernel 0x10)
+    let ss0 = 0x10u16.to_le_bytes();
+    guest_mem[tss_addr + 8..tss_addr + 10].copy_from_slice(&ss0);
+    // I/O Map Base Address en offset 102 = 104 (fin de TSS, sin mapa I/O bitmap)
+    let iomap_base = 104u16.to_le_bytes();
+    guest_mem[tss_addr + 102..tss_addr + 104].copy_from_slice(&iomap_base);
+    true
 }

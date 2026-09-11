@@ -90,12 +90,23 @@ impl UsbUhci {
     }
 
     /// Notificado por PciBus cuando SeaBIOS escribe al BAR4 del dispositivo USB.
+    /// (Solo lo usan los tests: en el binario el iobase lo asigna pci.rs
+    /// directamente sobre el estado compartido.)
+    #[allow(dead_code)]
     pub fn set_iobase(&self, base: u16) {
         let mut s = self.state.lock().unwrap();
         s.iobase = base;
     }
 
+    /// Reset del controlador (reset del chipset): vuelve al estado inicial
+    /// (apagado, HCHalted, sin I/O base asignado — SeaBIOS lo reconfigura).
+    pub fn reset(&self) {
+        let mut s = self.state.lock().unwrap();
+        *s = UhciState::default();
+    }
+
     /// Devuelve el I/O base actual (0 = no asignado)
+    #[allow(dead_code)]
     pub fn iobase(&self) -> u16 {
         self.state.lock().unwrap().iobase
     }

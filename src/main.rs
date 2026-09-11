@@ -2,18 +2,22 @@
 
 mod devices;
 mod display;
+mod guest_mem;
+mod metrics;
+mod snapshot;
 
 use devices::DeviceBus;
-use kvm_bindings::{kvm_mp_state, kvm_regs, kvm_sregs};
+use guest_mem::GuestMemory;
+use kvm_bindings::{kvm_mp_state, kvm_regs, kvm_sregs, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit};
 use std::fs::File;
 use std::io::Read;
 use std::collections::VecDeque;
 use std::process::exit;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-const GUEST_MEM_SIZE: usize = 256 * 1024 * 1024;
+const GUEST_MEM_SIZE: usize = 1024 * 1024 * 1024;
 const RESET_VECTOR_CS: u64 = 0xF000;
 const RESET_VECTOR_RIP: u64 = 0xFFF0;
 /// Máximo de reboots provocados por crashes del guest (triple fault o
@@ -21,17 +25,29 @@ const RESET_VECTOR_RIP: u64 = 0xFFF0;
 /// reinicios cuando el guest siempre crashea en el mismo punto.
 const MAX_CRASH_REBOOTS: u32 = 5;
 
-/// Resetea el vCPU al POST (equivalente a un reset por hardware tras
+static IS_UEFI: AtomicBool = AtomicBool::new(false);
+
+/// Resetea la VM entera al POST (equivalente a un reset por hardware tras
 /// un crash del guest) e incrementa el contador de reboots.
-fn crash_reboot(vcpu: &kvm_ioctls::VcpuFd, total_reboots: &mut u32) {
+fn crash_reboot(
+    vcpu: &kvm_ioctls::VcpuFd,
+    vm: &kvm_ioctls::VmFd,
+    bus: &mut DeviceBus,
+    guest_mem: &mut [u8],
+    total_reboots: &mut u32,
+) {
     *total_reboots += 1;
     eprintln!("[VMM] Crash del guest — reseteando VM (reboot {} de {})...",
         total_reboots, MAX_CRASH_REBOOTS);
-    reset_vcpu_to_post(vcpu);
+    reset_vcpu_to_post(vcpu, vm, bus, guest_mem);
 }
 
 fn bios_load_addr(bios_len: usize) -> u64 {
-    (0x0010_0000u64).saturating_sub(bios_len as u64)
+    if IS_UEFI.load(Ordering::Relaxed) {
+        (0x1_0000_0000u64).saturating_sub(bios_len as u64)
+    } else {
+        (0x0010_0000u64).saturating_sub(bios_len as u64)
+    }
 }
 
 fn usage() -> ! {
@@ -39,13 +55,13 @@ fn usage() -> ! {
     exit(1);
 }
 
-/// Counter incremented by SIGALRM handler every 1ms.
-/// Using AtomicU32 instead of AtomicBool so we don't lose ticks
-/// when multiple alarms fire between loop iterations.
-static ALARM_TICKS: AtomicU32 = AtomicU32::new(0);
-
 /// Set by SIGTERM/SIGINT handler; checked in the vCPU loop to dump state and exit.
 static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// TID del hilo BSP (el principal). Lo usa el hilo de display para despertar
+/// al BSP con tgkill cuando se cierra la ventana (tarea 17): una señal de
+/// proceso podría caer en un hilo AP y nadie procesaría el cierre.
+static BSP_TID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -68,293 +84,12 @@ fn dump_vga_text_screen(guest_mem: &[u8]) {
     eprintln!("[VMM] ──────────────────────────────");
 }
 
-/// BDA tick counter physical address (BIOS Data Area, offset 0x400 base + 0x6C).
-const BDA_TICK_ADDR: usize = 0x46C;
-
-extern "C" fn alarm_handler(_sig: libc::c_int) {
-    // Async-signal-safe: solo incrementa un contador atómico.
-    // El BDA tick (0x46C) se escribe desde el bucle vCPU (no aquí):
-    // IRQ0 se inyecta al kernel PIC desde el loop y el handler INT 08h
-    // de SeaBIOS incrementa 0x46C él mismo (evita avanzar al doble).
-    ALARM_TICKS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Arrange for SIGALRM to fire every `ms` milliseconds.
-fn start_periodic_timer(ms: u32) {
-    unsafe {
-        // Set interval timer: 0 = first fire, interval = ms
-        let mut itv = libc::itimerval {
-            it_interval: libc::timeval { tv_sec: 0, tv_usec: (ms as i64) * 1000 },
-            it_value: libc::timeval { tv_sec: 0, tv_usec: (ms as i64) * 1000 },
-        };
-        libc::setitimer(libc::ITIMER_REAL, &mut itv, std::ptr::null_mut());
-    }
-    install_signal_handler(libc::SIGALRM, alarm_handler);
-}
-
-
-/// Reset the vCPU to the power-on state (like a hardware reset via port 0xCF9).
-fn reset_vcpu_to_post(vcpu: &kvm_ioctls::VcpuFd) {
-    let mut sregs: kvm_sregs = vcpu.get_sregs().unwrap_or_default();
-    sregs.cs.base = (RESET_VECTOR_CS as u16 as u32 as u64) << 4;
-    sregs.cs.selector = RESET_VECTOR_CS as u16;
-    sregs.cs.limit = 0xFFFF;
-    sregs.cs.avl = 0;
-    sregs.cs.db = 0;
-    sregs.cs.l = 0;
-    sregs.cs.g = 0;
-    sregs.ds.base = 0; sregs.ds.selector = 0; sregs.ds.limit = 0xFFFF;
-    sregs.es.base = 0; sregs.es.selector = 0; sregs.es.limit = 0xFFFF;
-    sregs.fs.base = 0; sregs.fs.selector = 0; sregs.fs.limit = 0xFFFF;
-    sregs.gs.base = 0; sregs.gs.selector = 0; sregs.gs.limit = 0xFFFF;
-    sregs.ss.base = 0; sregs.ss.selector = 0; sregs.ss.limit = 0xFFFF;
-    sregs.cr0 = 0x60000010;
-    sregs.idt.base = 0; sregs.idt.limit = 0xFFFF;
-    sregs.gdt.base = 0; sregs.gdt.limit = 0xFFFF;
-    vcpu.set_sregs(&sregs).ok();
-    let mut regs = kvm_regs::default();
-    regs.rip = RESET_VECTOR_RIP;
-    regs.rflags = 0x2;
-    vcpu.set_regs(&regs).ok();
-}
-
-/// Reserva una región de memoria anónima alineada a página y la pone a cero.
-///
-/// # Safety (invariante de por vida)
-/// La región se filta deliberadamente (`'static mut`): KVM la mantiene registrada
-/// como `userspace_addr` de un memory-region durante toda la vida del proceso, y
-/// el hilo de display guarda un puntero crudo a ella. No debe existir ningún
-/// `&mut` exclusivo que invalide esos usos compartidos.
-fn mmap_zeroed_region(size: usize) -> &'static mut [u8] {
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        eprintln!("[VMM] mmap de {} bytes falló", size);
-        exit(1);
-    }
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
-    for chunk in slice.chunks_mut(4096) {
-        chunk.fill(0);
-    }
-    slice
-}
-
-/// Instala un handler para las señales indicadas (wrapper de libc::signal).
-fn install_signal_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
-    unsafe {
-        libc::signal(sig, handler as *const () as libc::sighandler_t);
-    }
-}
-
-/// (tarea 7) Ventanas de MMIO que pertenecen al irqchip del kernel y NO
-/// deben quedar cubiertas por ningún memslot de RAM.
-///
-/// Con `KVM_CREATE_IRQCHIP` el LAPIC (base 0xFEE00000) y el IOAPIC
-/// (0xFEC00000) viven DENTRO de KVM. Si un memslot de RAM respalda esas
-/// páginas, la EPT resuelve los accesos como memoria normal y el irqchip
-/// del kernel jamás ve un registro: el guest no puede sondear CPUs
-/// (ICR→INIT-SIPI) ni enrutar INTx (IOREDTBL). Estas ventanas se recortan
-/// al registrar high_mem, y los antiguos "stubs falsos" se eliminaron:
-/// eran exactamente lo que pisaba al irqchip real.
-const KERNEL_IRQCHIP_HOLES: [(u64, u64); 2] = [
-    (0xFEC0_0000, 0x1000), // IOAPIC: página de 4 KiB
-    (0xFEE0_0000, 0x1000), // LAPIC: página de 4 KiB (APIC base por defecto)
-];
-
-/// Resta `holes` del rango `[base, base+size)` y devuelve los sub-rangos
-/// libres resultantes. Función pura para poder testear el layout de
-/// memslots sin KVM.
-fn carve_reserved_holes(base: u64, size: u64, holes: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let end = base.saturating_add(size);
-    let mut regions: Vec<(u64, u64)> = vec![(base, end)];
-    for &(hstart, hlen) in holes {
-        if hlen == 0 {
-            continue; // hueco degenerado
-        }
-        let hend = hstart.saturating_add(hlen);
-        let mut next: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 2);
-        for (s, e) in regions {
-            if hend <= s || hstart >= e {
-                next.push((s, e)); // sin intersección
-            } else {
-                if s < hstart {
-                    next.push((s, hstart));
-                }
-                if hend < e {
-                    next.push((hend, e));
-                }
-            }
-        }
-        regions = next;
-    }
-    regions
-}
-
-fn main() {
-    env_logger::init();
-
-        let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 { usage(); }
-    let bios_path = &args[1];
-    let iso_path = args.get(2).map(|s| s.as_str());
-    let disk_path = args.get(3).map(|s| s.as_str());
-    let verbose = std::env::var("MI_VMM_VERBOSE").is_ok();
-    // (tarea 6) Número de vCPUs: 1 BSP + N-1 APs. El default es 2 (SMP
-    // mínimo que ejercita el sondeo SIPI de SeaBIOS/Linux); MI_VMM_CPUS=n
-    // lo cambia (MI_VMM_CPUS=1 recupera el comportamiento uniprocesador).
-    let num_cpus: u32 = std::env::var("MI_VMM_CPUS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(2)
-        .clamp(1, 8);
-
-    let kvm = Kvm::new().expect("No se pudo abrir /dev/kvm");
-    let vm = kvm.create_vm().expect("create_vm falló");
-    // (tarea 7) Irqchip EN EL KERNEL: LAPIC por vCPU + IOAPIC + PIC 8259
-    // viven dentro de KVM. Verificado: se crea aquí, ANTES de cualquier
-    // create_vcpu (orden que KVM exige) y sus páginas de MMIO quedan
-    // SIN memslot de RAM encima (ver high_mem más abajo).
-    vm.create_irq_chip().expect("create_irq_chip falló");
-
-    // ─── RAM principal: 256 MiB ────────────────────────────────
-    let guest_mem = mmap_zeroed_region(GUEST_MEM_SIZE);
-    unsafe {
-        vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
-            slot: 0, guest_phys_addr: 0,
-            memory_size: guest_mem.len() as u64,
-            userspace_addr: guest_mem.as_ptr() as u64, flags: 0,
-        }).expect("set_user_memory_region falló");
-    }
-
-    // ─── High memory: 512 MiB desde 0xE0000000 ─────────────────
-    // (tarea 7) La ventana se registra TROCEADA: las páginas de MMIO del
-    // LAPIC (0xFEE00000) y del IOAPIC (0xFEC00000) quedan SIN memslot para
-    // que las atienda el irqchip del kernel (create_irq_chip). Con un
-    // memslot de RAM encima, la EPT resolvía el acceso como memoria y los
-    // accesos del guest (ICR, IOREDTBL…) caían en RAM tonta.
-    const HIGH_MEM_SIZE: usize = 512 * 1024 * 1024;
-    const HIGH_MEM_ADDR: u64 = 0xE000_0000u64;
-    let high_mem = mmap_zeroed_region(HIGH_MEM_SIZE);
-    for (i, (start, end)) in
-        carve_reserved_holes(HIGH_MEM_ADDR, HIGH_MEM_SIZE as u64, &KERNEL_IRQCHIP_HOLES)
-            .into_iter()
-            .enumerate()
-    {
-        let off = (start - HIGH_MEM_ADDR) as usize;
-        unsafe {
-            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
-                slot: 2 + i as u32,
-                guest_phys_addr: start,
-                memory_size: end - start,
-                userspace_addr: high_mem.as_ptr() as u64 + off as u64,
-                flags: 0,
-            })
-            .expect("set_user_memory_region (high mem) falló");
-        }
-    }
-    eprintln!(
-        "[VMM] irqchip en kernel: LAPIC@0xFEE00000 e IOAPIC@0xFEC00000 reservados al kernel (sin memslot de RAM)"
-    );
-
-    // ─── VRAM: 16 MiB en GPA 0xE8000000 (offset 128MB de high_mem) ───
-    const VRAM_SIZE: usize = 16 * 1024 * 1024;
-    let vram_ptr = unsafe { high_mem.as_mut_ptr().add(128 * 1024 * 1024) };
-
-        let (mut bus, vga_state) =
-            match DeviceBus::new(iso_path, disk_path, vram_ptr, VRAM_SIZE, num_cpus) {
-        Ok(res) => res,
-        Err(e) => { eprintln!("[VMM] Error: {}", e); exit(1); }
-    };
-    // Connect DebugCon to guest memory for VGA text mirroring
-    bus.debugcon.set_guest_mem(guest_mem.as_ptr());
-
-    // ─── (tarea 6) Compartir el bus entre todos los vCPUs ──────
-    // Los APs manejan sus propios exits de E/S contra los mismos
-    // dispositivos; el Mutex serializa el acceso. (La condición Send de
-    // DeviceBus se justifica en devices/mod.rs.)
-    let bus = Arc::new(Mutex::new(bus));
-
-    // ─── Cargar firmware ────────────────────────────────────────
-    let mut bios = Vec::new();
-    let bios_io = File::open(bios_path)
-        .and_then(|mut f| f.read_to_end(&mut bios));
-    if let Err(e) = bios_io {
-        eprintln!("[VMM] No se pudo leer '{}': {}", bios_path, e);
-        exit(1);
-    }
-    // Seguridad: el firmware se mapea en el tope de la ventana 0-1M (BIOS de 128/256 KB).
-    // Si el archivo es más grande (p.ej. pasaron la ISO por accidente como primer
-    // argumento), fallamos con un error claro en lugar de paniquear.
-    const BIOS_MAX: usize = 512 * 1024;
-    if bios.len() > BIOS_MAX {
-        eprintln!(
-            "[VMM] ERROR: '{}' tiene {} bytes (>{} KB).\n\
-            \x20 Eso no es un firmware bios válido.\n\
-            \x20 ¿Pasaste la ISO como primer argumento? Uso correcto:\n\
-            \x20   ./run.sh [bios.bin] [imagen.iso]\n\
-            \x20   ./target/release/mi-vmm /usr/share/seabios/bios-256k.bin /ruta/linuxmint.iso",
-            bios_path, bios.len(), BIOS_MAX / 1024
-        );
-        exit(1);
-    }
-    let load_addr = bios_load_addr(bios.len());
-    let load_off = load_addr as usize;
-    guest_mem[load_off..load_off + bios.len()].copy_from_slice(&bios);
-    eprintln!("[VMM] BIOS cargado en {:#x} ({} bytes)", load_addr, bios.len());
-
-    let rv_off = 0xFFFF0usize;
-    eprintln!("[VMM] Reset vector @0xFFFF0: {:02x?}", &guest_mem[rv_off..rv_off + 16]);
-    let ep_phys = 0xFE05B_usize;
-    if ep_phys + 16 <= guest_mem.len() {
-        eprintln!("[VMM] BIOS entry @phys {:#x}: {:02x?}", ep_phys, &guest_mem[ep_phys..ep_phys + 16]);
-    }
-
-    let flash_offset_in_high = (0xFFFC_0000u64 - HIGH_MEM_ADDR) as usize;
-    high_mem[flash_offset_in_high..flash_offset_in_high + bios.len()].copy_from_slice(&bios);
-    eprintln!("[VMM] Flash BIOS en {:#x}", 0xFFFC_0000u64);
-
-    // ─── Cargar VGA Option ROM (0xC0000) ─────────────────────────
-    let vga_candidates = [
-        "/usr/share/seabios/vgabios-stdvga.bin",
-        "/usr/share/seabios/vgabios-bochs-display.bin",
-        "/usr/share/qemu/vgabios-stdvga.bin",
-        "/usr/share/seabios/vgabios.bin",
-        "/usr/share/qemu/vgabios.bin",
-    ];
-    let mut vga_loaded = false;
-    for vga_path in &vga_candidates {
-        if let Ok(mut f) = File::open(vga_path) {
-            let mut vga_rom = Vec::new();
-            if f.read_to_end(&mut vga_rom).is_ok() {
-                let vga_load_off = 0xC0000usize;
-                if vga_load_off + vga_rom.len() <= guest_mem.len() {
-                    guest_mem[vga_load_off..vga_load_off + vga_rom.len()].copy_from_slice(&vga_rom);
-                    eprintln!("[VMM] VGA Option ROM cargado en 0xC0000 ({} bytes) desde {}", vga_rom.len(), vga_path);
-                    vga_loaded = true;
-                    break;
-                }
-            }
-        }
-    }
-    if !vga_loaded {
-        eprintln!("[VMM] Info: No se encontró archivo VGA ROM externo. Usando emulación gráfica integrada.");
-    }
-
-    // ─── LAPIC/IOAPIC (0xFEE00000 / 0xFEC00000) — tarea 7 ──────
-    // Sin stubs: esas páginas quedaron sin memslot y el irqchip del kernel
-    // responde con los registros REALES — APIC ID distinto por vCPU,
-    // versión 0x11 con 24 IOREDENTRIES, ICR para INIT-SIPI (SMP), EOI,
-    // LVT, IRR/ISR… Los bytes falsos que antes se preescribían en RAM
-    // solo lograban tapar al irqchip real de KVM.
-
+/// Inicializa la BIOS Data Area (0x400-0x4FF), la EBDA en 0x9FC00 y el
+/// buffer de texto VGA (0xB8000) con el banner de arranque. Se ejecuta
+/// tanto al encender la VM como en cada reset (0xCF9 / crash / triple fault):
+/// tras un reboot el guest debe ver el hardware de memoria en el mismo
+/// estado que al arrancar (el EBDA y el banner quedan pisados por el boot).
+fn init_bios_data_area(guest_mem: &mut [u8]) {
     // ─── VGA text buffer init (0xB8000) ─────────────────────────
     // Clear the VGA text buffer so SeaBIOS messages appear cleanly.
     {
@@ -413,14 +148,526 @@ fn main() {
             guest_mem[ebda_off + 0x31] = 0x9F;
         }
 
-        eprintln!("[VMM] BDA inicializado: mem=640KB, kb_buf=head=tail=0x1E, EBDA=0x9FC0");
+        // ─── TSS Real para prevención de Triple Fault (Item 23) ─────
+        // Configura una estructura TSS válida en 0x1000 con pila en 0x7000
+        // para que un Double Fault (#DF) disponga de un stack limpio.
+        devices::legacy::init_guest_tss(guest_mem, 0x1000, 0x7000);
+
+        eprintln!("[VMM] BDA inicializado: mem=640KB, kb_buf=head=tail=0x1E, EBDA=0x9FC0, TSS=0x1000");
     }
+}
+
+/// Con `KVM_CREATE_IRQCHIP` el LAPIC (base 0xFEE00000) y el IOAPIC
+/// (0xFEC00000) viven DENTRO de KVM. Si un memslot de RAM respalda esas
+/// páginas, la EPT resuelve los accesos como memoria normal y el irqchip
+/// del kernel jamás ve un registro: el guest no puede sondear CPUs
+/// (ICR→INIT-SIPI) ni enrutar INTx (IOREDTBL). Estas ventanas se recortan
+/// al registrar high_mem, y los antiguos "stubs falsos" se eliminaron:
+/// eran exactamente lo que pisaba al irqchip real.
+const KERNEL_IRQCHIP_HOLES: [(u64, u64); 2] = [
+    (0xFEC0_0000, 0x1000), // IOAPIC: página de 4 KiB
+    (0xFEE0_0000, 0x1000), // LAPIC: página de 4 KiB (APIC base por defecto)
+];
+
+/// Resta `holes` del rango `[base, base+size)` y devuelve los sub-rangos
+/// libres resultantes. Función pura para poder testear el layout de
+/// memslots sin KVM.
+fn carve_reserved_holes(base: u64, size: u64, holes: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let end = base.saturating_add(size);
+    let mut regions: Vec<(u64, u64)> = vec![(base, end)];
+    for &(hstart, hlen) in holes {
+        if hlen == 0 {
+            continue; // hueco degenerado
+        }
+        let hend = hstart.saturating_add(hlen);
+        let mut next: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 2);
+        for (s, e) in regions {
+            if hend <= s || hstart >= e {
+                next.push((s, e)); // sin intersección
+            } else {
+                if s < hstart {
+                    next.push((s, hstart));
+                }
+                if hend < e {
+                    next.push((hend, e));
+                }
+            }
+        }
+        regions = next;
+    }
+    regions
+}
+
+/// BDA tick counter physical address (BIOS Data Area, offset 0x400 base + 0x6C).
+const BDA_TICK_ADDR: usize = 0x46C;
+
+// ─── Temporización del PIT (tarea 16) ──────────────────────────────
+// Antes el PIT dependía de un setitimer(1ms)+SIGALRM: la señal es global
+// (podía caer en cualquier hilo, no solo el BSP), obligaba a interrumpir
+// vcpu.run() con EINTR cada milisegundo y era el único reloj del sistema.
+// Ahora un hilo dedicado duerme con clock_nanosleep ABSOLUTO sobre
+// CLOCK_MONOTONIC (sin deriva acumulada) y cada 1 ms:
+//   - avanza el PIT emulado por el tiempo real transcurrido y pulsa IRQ0
+//     en el PIC del kernel (el irqchip despierta al vCPU aunque esté en HLT),
+//   - mantiene el tick del BDA (0x46C) a 18.2 Hz para los wait_ms() de SeaBIOS,
+//   - inyecta el input del host (teclado/ratón/UART) aunque el BSP esté
+//     bloqueado dentro de vcpu.run().
+
+/// Tiempo monotónico actual (CLOCK_MONOTONIC).
+fn mono_now() -> libc::timespec {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+    ts
+}
+
+/// Suma `ms` milisegundos a un timespec (para deadlines absolutos).
+fn ts_add_ms(ts: libc::timespec, ms: i64) -> libc::timespec {
+    let mut r = ts;
+    r.tv_nsec += ms * 1_000_000;
+    if r.tv_nsec >= 1_000_000_000 {
+        r.tv_sec += r.tv_nsec / 1_000_000_000;
+        r.tv_nsec %= 1_000_000_000;
+    }
+    r
+}
+
+/// Milisegundos transcurridos entre `a` y `b` (a >= b, reloj monotónico).
+fn ts_elapsed_ms(a: libc::timespec, b: libc::timespec) -> u32 {
+    let ms = (a.tv_sec - b.tv_sec) * 1000 + (a.tv_nsec - b.tv_nsec) / 1_000_000;
+    if ms < 0 { 0 } else { ms as u32 }
+}
+
+/// Hilo de temporización del VMM (sustituye al setitimer de 1 ms).
+fn pit_timer_thread(
+    vm: Arc<kvm_ioctls::VmFd>,
+    bus: Arc<Mutex<DeviceBus>>,
+    guest_mem: Arc<GuestMemory>,
+    kbd_queue: Arc<Mutex<VecDeque<u8>>>,
+    mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>>,
+    irq0_raised: Arc<AtomicBool>,
+    bda_tick_count: Arc<AtomicU32>,
+) {
+    let mut ms_since_bda_tick: u32 = 0;
+    let mut last = mono_now();
+    loop {
+        let now = mono_now();
+        let elapsed_ms = ts_elapsed_ms(now, last).max(1);
+        last = now;
+
+        // Avanzar el PIT por el tiempo REAL transcurrido (1.193182 MHz).
+        let underflow = bus
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .legacy_irq
+            .pit_advance_ticks(elapsed_ms * 1193);
+        if underflow {
+            // Flanco fresco bajo→alto en IRQ0 (PIC edge-triggered). No se
+            // baja después: un tick pendiente sin entregar no debe perderse.
+            // El irqchip del kernel despierta al vCPU aunque esté en HLT.
+            vm.set_irq_line(0, false).ok();
+            vm.set_irq_line(0, true).ok();
+            irq0_raised.store(true, Ordering::Relaxed);
+        }
+
+        // Tick del BDA (0x46C) a 18.2 Hz (~55 ms): SeaBIOS lo sondea en
+        // wait_ms(). Se escribe aquí (hilo de tiempo real), no en el BSP.
+        ms_since_bda_tick += elapsed_ms;
+        while ms_since_bda_tick >= 55 {
+            ms_since_bda_tick -= 55;
+            let ticks = bda_tick_count.fetch_add(1, Ordering::Relaxed) + 1;
+            // Escritura acotada y volatile (GuestMemory): el BSP/guest lo lee
+            // sin sincronización (tick del BDA 0x46C).
+            guest_mem.write_u32_volatile(BDA_TICK_ADDR, ticks);
+        }
+
+        // ── Input del host → dispositivos ─────────────────────────
+        // Latencia ≤1 ms aunque el guest esté parado en HLT: el BSP no
+        // puede inyectar mientras run() está bloqueado, así que esto lo
+        // hace el hilo de tiempo real (misma política de flanco que el BSP;
+        // los latches one-shot evitan doble inyección).
+        if let Ok(mut q) = kbd_queue.try_lock() {
+            if !q.is_empty() {
+                let pulse = {
+                    let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                    while let Some(sc) = q.pop_front() {
+                        b.legacy_irq.inject_scancode(sc);
+                    }
+                    b.take_ps2_irq()
+                };
+                if pulse {
+                    vm.set_irq_line(1, false).ok();
+                    vm.set_irq_line(1, true).ok();
+                }
+            }
+        }
+        if let Ok(mut q) = mouse_queue.try_lock() {
+            if !q.is_empty() {
+                let pulse = {
+                    let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                    while let Some((dx, dy, buttons)) = q.pop_front() {
+                        b.legacy_irq.inject_mouse_delta(dx, dy, buttons);
+                    }
+                    b.take_mouse_irq()
+                };
+                if pulse {
+                    vm.set_irq_line(12, false).ok();
+                    vm.set_irq_line(12, true).ok();
+                }
+            }
+        }
+        // UART 16550 (IRQ4): RX/THRE pendientes también con el guest parado.
+        if bus.lock().unwrap_or_else(|p| p.into_inner()).take_uart_irq() {
+            vm.set_irq_line(4, false).ok();
+            vm.set_irq_line(4, true).ok();
+        }
+
+        // Dormir hasta ahora + 1 ms. clock_nanosleep absoluto: si una señal
+        // lo interrumpe (EINTR) se reintenta con el mismo deadline (ya
+        // pasado → retorna al momento) y el bucle no acumula deriva.
+        let deadline = ts_add_ms(mono_now(), 1);
+        let rc = unsafe {
+            libc::clock_nanosleep(
+                libc::CLOCK_MONOTONIC,
+                libc::TIMER_ABSTIME,
+                &deadline,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 && rc != libc::EINTR {
+            eprintln!("[VMM] clock_nanosleep falló: rc={}", rc);
+            return;
+        }
+    }
+}
+
+/// Reset the vCPU to the power-on state (like a hardware reset via port 0xCF9).
+///
+/// Además de restaurar el estado del procesador, resetea los dispositivos
+/// emulados (`bus.reset()`), reinicializa BDA/EBDA/banner VGA en la RAM del
+/// guest y baja las líneas de IRQ del kernel: tras un reboot el guest debe
+/// ver el mismo hardware limpio que al encender (tarea 5 del TODO).
+fn reset_vcpu_to_post(
+    vcpu: &kvm_ioctls::VcpuFd,
+    vm: &kvm_ioctls::VmFd,
+    bus: &mut DeviceBus,
+    guest_mem: &mut [u8],
+) {
+    let mut sregs: kvm_sregs = vcpu.get_sregs().unwrap_or_default();
+    if IS_UEFI.load(Ordering::Relaxed) {
+        sregs.cs.base = 0xFFFF_0000;
+        sregs.cs.selector = 0xF000;
+    } else {
+        sregs.cs.base = (RESET_VECTOR_CS as u16 as u32 as u64) << 4;
+        sregs.cs.selector = RESET_VECTOR_CS as u16;
+    }
+    sregs.cs.limit = 0xFFFF;
+    sregs.cs.avl = 0;
+    sregs.cs.db = 0;
+    sregs.cs.l = 0;
+    sregs.cs.g = 0;
+    sregs.ds.base = 0; sregs.ds.selector = 0; sregs.ds.limit = 0xFFFF;
+    sregs.es.base = 0; sregs.es.selector = 0; sregs.es.limit = 0xFFFF;
+    sregs.fs.base = 0; sregs.fs.selector = 0; sregs.fs.limit = 0xFFFF;
+    sregs.gs.base = 0; sregs.gs.selector = 0; sregs.gs.limit = 0xFFFF;
+    sregs.ss.base = 0; sregs.ss.selector = 0; sregs.ss.limit = 0xFFFF;
+    sregs.cr0 = 0x60000010;
+    sregs.idt.base = 0; sregs.idt.limit = 0xFFFF;
+    sregs.gdt.base = 0; sregs.gdt.limit = 0xFFFF;
+    vcpu.set_sregs(&sregs).ok();
+    let mut regs = kvm_regs::default();
+    regs.rip = RESET_VECTOR_RIP;
+    regs.rflags = 0x2;
+    vcpu.set_regs(&regs).ok();
+
+    // Reset de dispositivos (CD-ROM/ATAPI, PIT/PIC/PS2, PCI, VGA, CMOS...)
+    // y de las áreas de memoria que el BIOS espera limpias.
+    bus.reset();
+    init_bios_data_area(guest_mem);
+    // Bajar las líneas de IRQ del kernel para no arrastrar flancos del ciclo
+    // anterior (SeaBIOS reprograma el PIC en el POST de todas formas).
+    vm.set_irq_line(0, false).ok();
+    vm.set_irq_line(1, false).ok();
+    // IRQ4 del UART 16550 (COM1) también limpia en cada reset.
+    vm.set_irq_line(4, false).ok();
+}
+
+/// Reserva una región de memoria anónima alineada a página y la pone a cero.
+///
+/// # Safety (invariante de por vida)
+/// La región se filta deliberadamente (`'static mut`): KVM la mantiene registrada
+/// como `userspace_addr` de un memory-region durante toda la vida del proceso, y
+/// el hilo de display guarda un puntero crudo a ella. No debe existir ningún
+/// `&mut` exclusivo que invalide esos usos compartidos.
+fn mmap_zeroed_region(size: usize) -> &'static mut [u8] {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        eprintln!("[VMM] mmap de {} bytes falló", size);
+        exit(1);
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
+    for chunk in slice.chunks_mut(4096) {
+        chunk.fill(0);
+    }
+    slice
+}
+
+/// Instala un handler para las señales indicadas (wrapper de libc::signal).
+fn install_signal_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    unsafe {
+        libc::signal(sig, handler as *const () as libc::sighandler_t);
+    }
+}
+
+fn main() {
+    env_logger::init();
+
+    // El hilo principal ES el BSP: guardar su TID para que el hilo de display
+    // pueda despertarlo con tgkill al cerrarse la ventana (tarea 17).
+    BSP_TID.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, Ordering::Relaxed);
+
+        let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 { usage(); }
+    let bios_path = &args[1];
+    let iso_path = args.get(2).map(|s| s.as_str());
+    let disk_path = args.get(3).map(|s| s.as_str());
+    let verbose = std::env::var("MI_VMM_VERBOSE").is_ok();
+    // (tarea 6) Número de vCPUs: 1 BSP + N-1 APs. El default es 2 (SMP
+    // mínimo que ejercita el sondeo SIPI de SeaBIOS/Linux); MI_VMM_CPUS=n
+    // lo cambia (MI_VMM_CPUS=1 recupera el comportamiento uniprocesador).
+    let num_cpus: u32 = std::env::var("MI_VMM_CPUS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8);
+
+    let kvm = Kvm::new().expect("No se pudo abrir /dev/kvm");
+    // vm se comparte con el hilo pit-timer (tarea 16): kvm-ioctls 0.14 no
+    // implementa Clone para VmFd, así que se envuelve en Arc (VmFd es
+    // Send+Sync: contiene un File y un usize). Todos los métodos usan
+    // &self, así que las llamadas funcionan por auto-deref.
+    let vm = Arc::new(kvm.create_vm().expect("create_vm falló"));
+    vm.create_irq_chip().expect("create_irq_chip falló");
+
+    // ─── RAM principal: 256 MiB ────────────────────────────────
+    let guest_mem = mmap_zeroed_region(GUEST_MEM_SIZE);
+    // Manija compartida con bounds-check (tarea 18): display, DebugCon y el
+    // hilo de temporización la reciben en vez de punteros `*const u8` crudos.
+    let guest_mem_handle: Arc<GuestMemory> =
+        GuestMemory::arc(guest_mem.as_mut_ptr(), guest_mem.len());
+    unsafe {
+        vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+            slot: 0, guest_phys_addr: 0,
+            memory_size: guest_mem.len() as u64,
+            userspace_addr: guest_mem_handle.as_mut_ptr() as u64, flags: 0,
+        }).expect("set_user_memory_region falló");
+    }
+
+    // ─── High memory: 512 MiB desde 0xE0000000 ─────────────────
+    // (tarea 7) La ventana se registra TROCEADA: las páginas de MMIO del
+    // LAPIC (0xFEE00000) y del IOAPIC (0xFEC00000) quedan SIN memslot para
+    // que las atienda el irqchip del kernel (create_irq_chip). Con un
+    // memslot de RAM encima, la EPT resolvía el acceso como memoria y los
+    // accesos del guest (ICR, IOREDTBL…) caían en RAM tonta.
+    const HIGH_MEM_SIZE: usize = 512 * 1024 * 1024;
+    const HIGH_MEM_ADDR: u64 = 0xE000_0000u64;
+    let high_mem = mmap_zeroed_region(HIGH_MEM_SIZE);
+    for (i, (start, end)) in
+        carve_reserved_holes(HIGH_MEM_ADDR, HIGH_MEM_SIZE as u64, &KERNEL_IRQCHIP_HOLES)
+            .into_iter()
+            .enumerate()
+    {
+        let off = (start - HIGH_MEM_ADDR) as usize;
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 2 + i as u32,
+                guest_phys_addr: start,
+                memory_size: end - start,
+                userspace_addr: high_mem.as_ptr() as u64 + off as u64,
+                flags: 0,
+            })
+            .expect("set_user_memory_region (high mem) falló");
+        }
+    }
+    eprintln!(
+        "[VMM] irqchip en kernel: LAPIC@0xFEE00000 e IOAPIC@0xFEC00000 reservados al kernel (sin memslot de RAM)"
+    );
+
+    // ─── VRAM: 16 MiB en GPA 0xE8000000 (offset 128MB de high_mem) ───
+    const VRAM_SIZE: usize = 16 * 1024 * 1024;
+    let vram_ptr = unsafe { high_mem.as_mut_ptr().add(128 * 1024 * 1024) };
+
+    let (mut bus, vga_state) = match DeviceBus::new(
+        iso_path,
+        disk_path,
+        vram_ptr,
+        VRAM_SIZE,
+        GUEST_MEM_SIZE as u64,
+        num_cpus,
+        high_mem.as_mut_ptr(),
+        HIGH_MEM_ADDR,
+        HIGH_MEM_SIZE,
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("[VMM] Error: {}", e);
+            exit(1);
+        }
+    };
+    // Connect DebugCon to guest memory for VGA text mirroring
+    bus.debugcon.set_guest_mem(guest_mem_handle.clone());
+    if !bus.debugcon.mirror_enabled() {
+        eprintln!("[VMM] Espejo BIOS→0xB8000 desactivado (MI_VMM_MIRROR_BIOS=1 para activarlo)");
+    }
+
+    // ─── (tarea 6) Compartir el bus entre todos los vCPUs ──────
+    // Los APs manejan sus propios exits de E/S contra los mismos
+    // dispositivos; el Mutex serializa el acceso. (La condición Send de
+    // DeviceBus se justifica en devices/mod.rs.)
+    let bus = Arc::new(Mutex::new(bus));
+
+    // ─── Serial-in: stdin del host → COM1 (RX) ──────────────────
+    // Opcional (MI_VMM_SERIAL_IN=1): un hilo reenvía lo que se teclea en la
+    // terminal a la cola RX del UART, de modo que console=ttyS0 sirva también
+    // para escribir en el guest (GRUB menu, shell de Linux, etc.).
+    if std::env::var("MI_VMM_SERIAL_IN").is_ok() {
+        let bus_serial = Arc::clone(&bus);
+        std::thread::Builder::new()
+            .name("serial-in".to_string())
+            .spawn(move || {
+                use std::io::Read;
+                let mut stdin = std::io::stdin().lock();
+                let mut buf = [0u8; 64];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break, // EOF: terminal cerrada
+                        Ok(n) => {
+                            let mut b = bus_serial.lock().unwrap_or_else(|p| p.into_inner());
+                            for &byte in &buf[..n] {
+                                b.uart.push_rx(byte);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .expect("spawn del hilo serial-in falló");
+        eprintln!("[VMM] Serial-in activo: stdin del host → COM1 (RX del guest)");
+    }
+
+    // ─── Cargar firmware ────────────────────────────────────────
+    let mut bios = Vec::new();
+    let bios_io = File::open(bios_path)
+        .and_then(|mut f| f.read_to_end(&mut bios));
+    if let Err(e) = bios_io {
+        eprintln!("[VMM] No se pudo leer '{}': {}", bios_path, e);
+        exit(1);
+    }
+    // Soporte para Legacy BIOS (<= 512 KB) y UEFI / OVMF (hasta 16 MB)
+    const BIOS_MAX: usize = 16 * 1024 * 1024;
+    if bios.len() > BIOS_MAX {
+        eprintln!(
+            "[VMM] ERROR: '{}' tiene {} bytes (>{} KB). Excede el tamaño máximo de firmware.",
+            bios_path, bios.len(), BIOS_MAX / 1024
+        );
+        exit(1);
+    }
+    let is_uefi = bios.len() > 512 * 1024
+        || bios_path.to_lowercase().contains("ovmf")
+        || bios_path.to_lowercase().contains(".fd");
+    IS_UEFI.store(is_uefi, Ordering::Relaxed);
+
+    if is_uefi {
+        // Rediseño de mapeo de flash para UEFI / OVMF (Item 22):
+        // OVMF se mapea justo debajo de 4 GiB (0x1_0000_0000 - len)
+        let flash_addr = (0x1_0000_0000u64).saturating_sub(bios.len() as u64);
+        if flash_addr >= HIGH_MEM_ADDR {
+            let offset_in_high = (flash_addr - HIGH_MEM_ADDR) as usize;
+            if offset_in_high + bios.len() <= high_mem.len() {
+                high_mem[offset_in_high..offset_in_high + bios.len()].copy_from_slice(&bios);
+                eprintln!("[VMM] Firmware UEFI/OVMF mapeado en {:#x}..{:#x} ({} MB)",
+                    flash_addr, flash_addr + bios.len() as u64, bios.len() / (1024 * 1024));
+            }
+        }
+
+        // Cargar o inicializar VarStore para UEFI (Item 22)
+        let vars_path = std::env::var("MI_VMM_VARS").ok();
+        let pflash = match vars_path {
+            Some(ref p) if std::path::Path::new(p).exists() => {
+                devices::pflash::ParallelFlash::load_file("OVMF_VARS", p, 64 * 1024, false)
+                    .unwrap_or_else(|_| devices::pflash::ParallelFlash::new("OVMF_VARS", 512 * 1024, 64 * 1024, false))
+            }
+            _ => devices::pflash::ParallelFlash::new("OVMF_VARS", 512 * 1024, 64 * 1024, false),
+        };
+        bus.lock().unwrap_or_else(|p| p.into_inner()).set_pflash(pflash);
+        eprintln!("[VMM] VarStore UEFI (pflash) inicializado.");
+    } else {
+        let load_addr = bios_load_addr(bios.len());
+        let load_off = load_addr as usize;
+        guest_mem[load_off..load_off + bios.len()].copy_from_slice(&bios);
+        eprintln!("[VMM] BIOS Legacy cargado en {:#x} ({} bytes)", load_addr, bios.len());
+
+        let rv_off = 0xFFFF0usize;
+        eprintln!("[VMM] Reset vector @0xFFFF0: {:02x?}", &guest_mem[rv_off..rv_off + 16]);
+        let ep_phys = 0xFE05B_usize;
+        if ep_phys + 16 <= guest_mem.len() {
+            eprintln!("[VMM] BIOS entry @phys {:#x}: {:02x?}", ep_phys, &guest_mem[ep_phys..ep_phys + 16]);
+        }
+
+        let flash_offset_in_high = (0xFFFC_0000u64 - HIGH_MEM_ADDR) as usize;
+        high_mem[flash_offset_in_high..flash_offset_in_high + bios.len()].copy_from_slice(&bios);
+        eprintln!("[VMM] Flash BIOS en {:#x}", 0xFFFC_0000u64);
+    }
+
+    // ─── Cargar VGA Option ROM (0xC0000) ─────────────────────────
+    let vga_candidates = [
+        "/usr/share/seabios/vgabios-stdvga.bin",
+        "/usr/share/seabios/vgabios-bochs-display.bin",
+        "/usr/share/qemu/vgabios-stdvga.bin",
+        "/usr/share/seabios/vgabios.bin",
+        "/usr/share/qemu/vgabios.bin",
+    ];
+    let mut vga_loaded = false;
+    for vga_path in &vga_candidates {
+        if let Ok(mut f) = File::open(vga_path) {
+            let mut vga_rom = Vec::new();
+            if f.read_to_end(&mut vga_rom).is_ok() {
+                let vga_load_off = 0xC0000usize;
+                if vga_load_off + vga_rom.len() <= guest_mem.len() {
+                    guest_mem[vga_load_off..vga_load_off + vga_rom.len()].copy_from_slice(&vga_rom);
+                    eprintln!("[VMM] VGA Option ROM cargado en 0xC0000 ({} bytes) desde {}", vga_rom.len(), vga_path);
+                    vga_loaded = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !vga_loaded {
+        eprintln!("[VMM] Info: No se encontró archivo VGA ROM externo. Usando emulación gráfica integrada.");
+    }
+
+    init_bios_data_area(guest_mem);
 
     // ─── vCPU en modo real ─────────────────────────────────────
     let mut vcpu = vm.create_vcpu(0).expect("create_vcpu falló");
     let mut sregs: kvm_sregs = vcpu.get_sregs().expect("get_sregs falló");
-    sregs.cs.base = (RESET_VECTOR_CS as u16 as u64) << 4;
-    sregs.cs.selector = RESET_VECTOR_CS as u16;
+    if IS_UEFI.load(Ordering::Relaxed) {
+        sregs.cs.base = 0xFFFF_0000;
+        sregs.cs.selector = 0xF000;
+        eprintln!("[VMM] Vector de reset UEFI: CS.base=0xFFFF0000, RIP={:#x} (GPA {:#x})",
+            RESET_VECTOR_RIP, 0xFFFF_0000 + RESET_VECTOR_RIP);
+    } else {
+        sregs.cs.base = (RESET_VECTOR_CS as u16 as u64) << 4;
+        sregs.cs.selector = RESET_VECTOR_CS as u16;
+    }
     sregs.cs.limit = 0xFFFF;
     sregs.cs.type_ = 11; sregs.cs.present = 1; sregs.cs.s = 1;
     for seg in [&mut sregs.ds, &mut sregs.es, &mut sregs.fs, &mut sregs.gs, &mut sregs.ss] {
@@ -446,18 +693,35 @@ fn main() {
     // NB_CPUS de FwCfg ya anuncia num_cpus).
     // El set_mp_state va ANTES del spawn: si el hilo llegara a correr sin
     // aparcar, el AP ejecutaría el vector de reset y duplicaría el BIOS.
+    // ─── Métricas y profiling de VM-Exits (Item 24) ────────────
+    let metrics = Arc::new(metrics::VmmMetrics::new());
+
+    // Cargar snapshot previo si se solicitó (Item 24)
+    if let Ok(snap_path) = std::env::var("MI_VMM_SNAPSHOT_LOAD") {
+        eprintln!("[VMM] Cargando snapshot desde: {}", snap_path);
+        snapshot::load_vm_snapshot(&snap_path, guest_mem, high_mem, &[&vcpu]).ok();
+    }
+
+    // ─── Configurar CPUID (FPU, SSE, MMX, etc. para Linux) ─────
+    let cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .expect("get_supported_cpuid falló");
+    vcpu.set_cpuid2(&cpuid).expect("set_cpuid2 falló");
+
     let mut ap_handles = Vec::new();
     for cpu_id in 1..num_cpus {
         let ap = vm.create_vcpu(cpu_id as u64).expect("create_vcpu (AP) falló");
+        ap.set_cpuid2(&cpuid).expect("set_cpuid2 (AP) falló");
         ap.set_mp_state(kvm_mp_state {
             mp_state: kvm_bindings::KVM_MP_STATE_INIT_RECEIVED,
         })
         .expect("set_mp_state (AP) falló");
         let bus_ap = Arc::clone(&bus);
+        let metrics_ap = Arc::clone(&metrics);
         ap_handles.push(
             std::thread::Builder::new()
                 .name(format!("vcpu-{cpu_id}"))
-                .spawn(move || ap_vcpu_worker(cpu_id, ap, bus_ap, verbose))
+                .spawn(move || ap_vcpu_worker(cpu_id, ap, bus_ap, metrics_ap, verbose))
                 .expect("spawn de hilo AP falló"),
         );
     }
@@ -470,22 +734,63 @@ fn main() {
         );
     }
 
-    // ─── Start SIGALRM every 1ms for PIT timing ────────────────
-    // This ensures PIT advances even when guest is stuck in CPU loop.
-    start_periodic_timer(1);
     // Handle Ctrl+C / SIGTERM: dump VGA screen and diagnostics on exit
     install_signal_handler(libc::SIGTERM, shutdown_handler);
     install_signal_handler(libc::SIGINT, shutdown_handler);
 
-    // ─── Expose guest memory to alarm handler for direct BDA tick ──
-
     // ─── Display GUI Manager ───────────────────────────────────
     let kbd_queue: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Cola del ratón host: (dx, dy, botones PS/2) desde la ventana minifb.
+    let mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>> = Arc::new(Mutex::new(VecDeque::new()));
+    
+    // Inyección de ENTER (tarea 3): acelera el arranque de ISOLINUX a los 3s
+    // para tests y modo headless; desactivable con MI_VMM_AUTO_ENTER=0.
+    if std::env::var("MI_VMM_AUTO_ENTER").map(|v| v != "0").unwrap_or(true) {
+        let auto_enter_kbd = Arc::clone(&kbd_queue);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let mut q = auto_enter_kbd.lock().unwrap();
+            q.push_back(0x1C);
+            q.push_back(0x9C);
+        });
+    }
+
     let _display = display::DisplayManager::start(
         vga_state,
-        guest_mem.as_ptr(),
+        guest_mem_handle.clone(),
         kbd_queue.clone(),
+        mouse_queue.clone(),
     );
+
+    // ─── Hilo de temporización (tarea 16) ──────────────────────
+    // Sustituye al setitimer(1ms)+SIGALRM: avanza el PIT, pulsa IRQ0,
+    // mantiene el tick del BDA e inyecta el input host cada 1 ms con
+    // clock_nanosleep absoluto (sin deriva), incluso con el guest en HLT.
+    let irq0_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let bda_tick_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    std::thread::Builder::new()
+        .name("pit-timer".to_string())
+        .spawn({
+            let bus_t = Arc::clone(&bus);
+            let kbd_t = Arc::clone(&kbd_queue);
+            let mouse_t = Arc::clone(&mouse_queue);
+            let irq0_t = Arc::clone(&irq0_flag);
+            let bda_t = Arc::clone(&bda_tick_count);
+            // vm (Arc<VmFd>) se clona ANTES del move (el BSP sigue usando vm).
+            let vm_t = Arc::clone(&vm);
+            move || {
+                pit_timer_thread(
+                    vm_t,
+                    bus_t,
+                    guest_mem_handle.clone(),
+                    kbd_t,
+                    mouse_t,
+                    irq0_t,
+                    bda_t,
+                )
+            }
+        })
+        .expect("spawn del hilo pit-timer falló");
 
     // ─── Bucle VMM ──────────────────────────────────────────────
     // Acceso al DeviceBus compartido (BSP y APs). Tolerante al
@@ -503,9 +808,6 @@ fn main() {
     let mut irq1_line_high = false;
     // Estado actual de kvm_run.request_interrupt_window (tarea 4).
     let mut irq_window_requested = false;
-    // BDA tick counter emulation (18.2 Hz) — see EINTR handler below
-    let mut ms_since_bda_tick: u32 = 0;
-    let mut bda_ticks: u32 = 0;
     let mut total_reboots: u32 = 0;
     let mut last_post = 0u8;
     let mut last_cr0: u64 = 0x6000_0010; // Initial CR0 (real mode)
@@ -524,41 +826,26 @@ fn main() {
             dump_vga_text_screen(guest_mem);
             exit(0);
         }
+        // ── Apagado limpio vía ACPI (SLP_EN en PM1a_CNT) ─────────
+        // El guest (Linux) evaluó _S5 y escribió SLP_EN en 0x604; AcpiPm
+        // lo detectó. Salimos igual que con SIGTERM/SIGINT: dump + exit.
+        if bus_lock().acpi_sleep_requested() {
+            eprintln!("[VMM] ACPI S5 solicitado por el guest — apagado limpio (exits={}, reboots={})...",
+                total_exits, total_reboots);
+            dump_vga_text_screen(guest_mem);
+            exit(0);
+        }
         // ── Input desde la ventana gráfica ───────────────────────
         if let Ok(mut q) = kbd_queue.try_lock() {
             while let Some(scancode) = q.pop_front() {
                 bus_lock().legacy_irq.inject_scancode(scancode);
             }
         }
-
-      // ── Si SIGALRM fired, advance PIT by the number of ms elapsed ──
-        // Using fetch_swap on a counter so we don't lose ticks when
-        // multiple alarms fire between loop iterations.
-        // BDA tick counter (0x46C) must be incremented at 18.2 Hz so
-        // SeaBIOS's wait_ms() polling loop can unblock.
-        let alarm_ticks = ALARM_TICKS.swap(0, Ordering::Relaxed);
-        if alarm_ticks > 0 {
-            // Advance PIT channel 0 for accuracy (SeaBIOS may read it).
-            // (tarea 4) Si hay underflow hay que pulsar IRQ0 AQUÍ también:
-            // antes solo se pulsaba en la rama EINTR y un tick contado
-            // mientras no estábamos dentro de vcpu.run() se quedaba sin
-            // interrupción.
-            if bus_lock().legacy_irq.pit_advance_ticks(alarm_ticks * 1193) {
-                vm.set_irq_line(0, false).ok();
-                vm.set_irq_line(0, true).ok();
-                irq0_raised = true;
+        // Movimiento/botones del ratón host → ratón PS/2 del guest (IRQ12)
+        if let Ok(mut q) = mouse_queue.try_lock() {
+            while let Some((dx, dy, buttons)) = q.pop_front() {
+                bus_lock().legacy_irq.inject_mouse_delta(dx, dy, buttons);
             }
-            // Increment BDA tick counter at 18.2 Hz (1 tick every ~55ms)
-            ms_since_bda_tick += alarm_ticks;
-            while ms_since_bda_tick >= 55 {
-                ms_since_bda_tick -= 55;
-                bda_ticks = bda_ticks.wrapping_add(1);
-                let tick_ptr = unsafe { guest_mem.as_ptr().add(BDA_TICK_ADDR) } as *mut u32;
-                unsafe { std::ptr::write_volatile(tick_ptr, bda_ticks); }
-            }
-            // (tarea 4) Ya NO se baja IRQ0 incondicionalmente aquí: eso
-            // hacía pic_set_irq1() limpiar el IRR de un tick pendiente no
-            // entregado (guest con IF=0) y el tick se perdía.
         }
 
         // ── Progreso periódico ──────────────────────────────────
@@ -580,14 +867,18 @@ fn main() {
                         let stack_dump = if stack_phys + 32 <= guest_mem.len() {
                             format!("{:02x?}", &guest_mem[stack_phys..stack_phys+32])
                         } else { String::from("???") };
+                        let (post_last, ps2_acc, pit_acc) = {
+                            let b = bus_lock();
+                            (b.post.last, b.legacy_irq.ps2_access_count, b.legacy_irq.pit_access_count)
+                        };
                         eprintln!(
                             "[VMM] {} exits (reboots={}) | POST=0x{:02X} phys={:#x} cr0={:#x} rflags={:#x} idt={:#x}/{:#x}\n  code: {}\n  stack(S:{:04x} P:{:#x}): {}",
-                            total_exits, total_reboots, bus_lock().post.last, phys, s.cr0, r.rflags, s.idt.base, s.idt.limit, code_dump,
+                            total_exits, total_reboots, post_last, phys, s.cr0, r.rflags, s.idt.base, s.idt.limit, code_dump,
                             s.ss.selector, stack_phys, stack_dump
                         );
                         eprintln!("  PS2 access={}, PIT access={}, mode_transitions={}",
-                            bus_lock().legacy_irq.ps2_access_count,
-                            bus_lock().legacy_irq.pit_access_count,
+                            ps2_acc,
+                            pit_acc,
                             mode_transitions);
                         // Dump segment registers and BDA keyboard buffer
                         eprintln!("  DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS={:04x} CS={:04x}",
@@ -597,7 +888,7 @@ fn main() {
                             | ((guest_mem[BDA_TICK_ADDR+2] as u32) << 16)
                             | ((guest_mem[BDA_TICK_ADDR+3] as u32) << 24);
                         eprintln!("  BDA tick@0x46C={:08x} (written={}) kbd: head@0x41A={:04x} tail@0x41C={:04x}",
-                            bda_tick_val, bda_ticks,
+                            bda_tick_val, bda_tick_count.load(Ordering::Relaxed),
                             guest_mem[0x41A] as u16 | ((guest_mem[0x41B] as u16) << 8),
                             guest_mem[0x41C] as u16 | ((guest_mem[0x41D] as u16) << 8));
                         // Dump bytes at ES:0x1A and ES:0x1C (the addresses the loop reads)
@@ -672,6 +963,7 @@ fn main() {
         // via VMCS — no shadow tracking needed. We log transitions
         // for diagnostics only.
         if total_exits % 50000 == 0 {
+            eprint!("{}", metrics.format_summary(1.0, total_exits.saturating_sub(50000)));
             if let Ok(s) = vcpu.get_sregs() {
                 if s.cr0 != last_cr0 {
                     mode_transitions += 1;
@@ -686,6 +978,14 @@ fn main() {
             }
         }
 
+        // ── IRQ0 pulsada por el hilo del PIT (tarea 16) ────────────
+        // El marcador del BSP (irq0_raised) alimenta la lógica de
+        // interrupt-window; el hilo de temporización la pulsa al haber
+        // underflow del PIT, así que la reflejamos aquí.
+        if irq0_flag.swap(false, Ordering::Relaxed) {
+            irq0_raised = true;
+        }
+
         // ── Ventana de interrupciones (tarea 4) ────────────────────
         // Si hay una IRQ pendiente y el guest corre con IF=0, activamos
         // kvm_run.request_interrupt_window para que KVM nos saque con
@@ -694,9 +994,14 @@ fn main() {
         // pierde, pero este aviso da entrega puntual en el mismo instante
         // en que el guest se vuelve interumpible.
         // SOLO con IF=0: con la ventana abierta KVM saldría en cada entrada
-        // (tormenta de IrqWindowOpen) y el guest nunca ejecutaría.
         {
-            let irq_pending = irq0_raised || bus_lock().legacy_irq.ps2_has_data();
+            let irq_pending = {
+                let b = bus_lock();
+                irq0_raised
+                    || b.legacy_irq.ps2_has_data()
+                    || b.legacy_irq.mouse_has_data()
+                    || b.uart_irq_pending()
+            };
             let want_window = if irq_pending {
                 // IF = bit 9 de RFLAGS. unwrap_or(true): ante error de ioctl
                 // no pedimos la ventana (comportamiento conservador previo).
@@ -715,45 +1020,24 @@ fn main() {
         let exit_reason = match vcpu.run() {
             Ok(r) => r,
             Err(e) if e.errno() == libc::EINTR => {
-                // SIGALRM interrupted vcpu.run(). Tick PIT and inject IRQ0.
-                // BDA tick (0x46C) is incremented by SeaBIOS's INT 08h handler
-                // once the IRQ0 is delivered — we must NOT write it ourselves.
-                let alarm_ticks = ALARM_TICKS.swap(0, Ordering::Relaxed);
-                if alarm_ticks > 0 {
-                    // BDA tick counter (0x46C): SeaBIOS's wait loops depend on
-                    // it. The PIT drives IRQ0 → INT 08h → tick increment, but
-                    // SeaBIOS may never program the PIT (it uses the PM Timer
-                    // instead). To keep the tick counter alive in all cases,
-                    // increment it here at the hardware rate (18.2065 Hz =
-                    // one tick every ~54.9 ms of PIT ticks at 1.193 MHz).
-                    ms_since_bda_tick += alarm_ticks;
-                    while ms_since_bda_tick >= 55 {
-                        ms_since_bda_tick -= 55;
-                        bda_ticks = bda_ticks.wrapping_add(1);
-                        let tick_ptr = unsafe { guest_mem.as_ptr().add(BDA_TICK_ADDR) } as *mut u32;
-                        unsafe { std::ptr::write_volatile(tick_ptr, bda_ticks); }
-                    }
-                    let irq0_fired = bus_lock().legacy_irq.pit_advance_ticks(alarm_ticks * 1193);
-                    if irq0_fired {
-                        // Pulse IRQ0 into the kernel PIC. La bajada es
-                        // segura: el raise inmediato vuelve a fijar IRR,
-                        // así que un tick pendiente no entregado nunca se
-                        // pierde aunque el guest tenga IF=0.
-                        vm.set_irq_line(0, false).ok();
-                        vm.set_irq_line(0, true).ok();
-                        irq0_raised = true;
-                    }
-                    // (tarea 4) Ya NO bajamos la línea cuando no hay
-                    // underflow nuevo: eso limpiaba el IRR de un tick
-                    // pendiente sin entregar y el tick se perdía.
-                }
-                // Also inject IRQ1 if the 8042 has undelivered data.
-                // SIEMPRE pulsamos (bajar→subir) para generar un flanco
-                // fresco aunque la línea ya estuviera alta: un PIC
-                // edge-triggered no reintenta sin flanco de subida.
+                // Señal (SIGINT/SIGTERM) interrumpió vcpu.run(). El PIT lo
+                // gobierna el hilo dedicado (tarea 16); aquí solo entregamos
+                // IRQ pendientes de dispositivos y reintentamos. SIEMPRE
+                // pulsamos (bajar→subir) para generar un flanco fresco:
+                // un PIC edge-triggered no reintenta sin flanco de subida.
                 if bus_lock().take_ps2_irq() {
                     vm.set_irq_line(1, false).ok();
                     vm.set_irq_line(1, true).ok();
+                }
+                // Ratón PS/2: mismo flanco en IRQ12 (esclavo) por cada byte.
+                if bus_lock().take_mouse_irq() {
+                    vm.set_irq_line(12, false).ok();
+                    vm.set_irq_line(12, true).ok();
+                }
+                // UART 16550: flanco en IRQ4 por cada RX/THRE pendiente.
+                if bus_lock().take_uart_irq() {
+                    vm.set_irq_line(4, false).ok();
+                    vm.set_irq_line(4, true).ok();
                 }
                 continue;
             }
@@ -761,9 +1045,9 @@ fn main() {
         };
         total_exits += 1;
 
-       // NOTE: PIT is only advanced via SIGALRM (alarm_ticks above).
-        // We do NOT call pit_tick() here to avoid double-counting.
-        // The PIT is driven by the real-time SIGALRM, not by exit counting.
+       // NOTE: The PIT is only advanced by the dedicated pit-timer thread
+        // (clock_nanosleep, tarea 16). We do NOT call pit_tick() here to
+        // avoid double-counting: no está gobernado por el conteo de exits.
 
         // Inject IRQ1 into the kernel PIC when the 8042 has undelivered
         // data. Lower→raise pulse: garantiza un flanco fresco por byte
@@ -773,6 +1057,32 @@ fn main() {
             vm.set_irq_line(1, false).ok();
             vm.set_irq_line(1, true).ok();
             irq1_line_high = true;
+            metrics.record_irq(1);
+        }
+        // Ratón PS/2 (IRQ12): flanco por cada byte pendiente del auxiliar.
+        if bus_lock().take_mouse_irq() {
+            vm.set_irq_line(12, false).ok();
+            vm.set_irq_line(12, true).ok();
+            metrics.record_irq(12);
+        }
+        // UART 16550 (IRQ4): flanco por cada RX/THRE pendiente (tarea 12).
+        if bus_lock().take_uart_irq() {
+            vm.set_irq_line(4, false).ok();
+            vm.set_irq_line(4, true).ok();
+            metrics.record_irq(4);
+        }
+        // APM / SMI (Item 23): inyectar SMI al vCPU si hubo comando en 0xB2
+        if bus_lock().take_smi() {
+            use std::os::unix::io::AsRawFd;
+            const KVM_SMI: libc::c_ulong = 0xAEB7;
+            unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_SMI); };
+            if verbose { eprintln!("[VMM] SMI inyectado a vCPU 0 tras comando APM en 0xB2"); }
+        }
+        // CPU Hotplug (Item 23): inyectar SCI (IRQ9) si se conectó/desconectó un vCPU
+        if bus_lock().take_cpu_hotplug_sci() {
+            vm.set_irq_line(9, false).ok();
+            vm.set_irq_line(9, true).ok();
+            metrics.record_irq(9);
         }
         // (tarea 4) Disciplina de nivel para IRQ1: si el guest consumió
         // todo el output buffer, la línea puede bajar con seguridad — la
@@ -785,6 +1095,7 @@ fn main() {
 
         match exit_reason {
             VcpuExit::IoOut(port, data) => {
+                metrics.record_io_out(port);
                 port_write_counts[port as usize] += 1;
                 if !bus_lock().out(port, data) {
                     eprintln!("[VMM] OUT no manejado: 0x{:X} <- {:02X?}", port, data);
@@ -793,7 +1104,7 @@ fn main() {
                 // 0x02 = soft reset, 0x04 = hard reset, 0x06 = full reset
                 if port == 0xCF9 && data.iter().any(|&v| v & 0x04 != 0) {
                     eprintln!("[VMM] Reset via puerto 0xCF9 (data={:02X?}) — reiniciando guest...", data);
-                    reset_vcpu_to_post(&vcpu);
+                    reset_vcpu_to_post(&vcpu, &vm, &mut bus_lock(), guest_mem);
                     total_reboots += 1;
                     continue;
                 }
@@ -815,6 +1126,7 @@ fn main() {
                 io_trace.push_back((1, port, data[0]));
             }
             VcpuExit::IoIn(port, data) => {
+                metrics.record_io_in(port);
                 port_read_counts[port as usize] += 1;
                 match bus_lock().input(port, data.len()) {
                     Some(bytes) => {
@@ -835,58 +1147,77 @@ fn main() {
                 io_trace.push_back((0, port, data[0]));
             }
             VcpuExit::Hlt => {
+                metrics.record_hlt();
                 let r = vcpu.get_regs().unwrap_or_default();
                 let s = vcpu.get_sregs().unwrap_or_default();
                 eprintln!("[VMM] HLT — phys={:#x} rflags={:#x}", s.cs.base + r.rip, r.rflags);
             }
             VcpuExit::Shutdown => {
+                metrics.record_shutdown();
                 eprintln!("[VMM] === TRIPLE FAULT ===");
                 dump_crash_state(&vcpu, &guest_mem, &recent, total_exits);
-                crash_reboot(&vcpu, &mut total_reboots);
+                crash_reboot(&vcpu, &vm, &mut bus_lock(), guest_mem, &mut total_reboots);
                 if total_reboots >= MAX_CRASH_REBOOTS { break; }
             }
             VcpuExit::IrqWindowOpen => {
-                // (tarea 4) El guest abrió la ventana (IF=1) con
-                // request_interrupt_window activo. Con irqchip en el kernel,
-                // KVM inyecta él mismo los IRR pendientes en la próxima
-                // entrada a la VM: no hay que inyectar nada a mano (el
-                // antiguo código consultaba el PIC emulado de usuariospace,
-                // que nunca tenía IRQ0/IRQ1 marcados → siempre no-op).
-                // Solo queda consumir pulsos nuevos del 8042 y dar por
-                // entregado el marcador de IRQ0.
+                metrics.record_irq_window();
                 irq0_raised = false;
                 if bus_lock().take_ps2_irq() {
                     vm.set_irq_line(1, false).ok();
                     vm.set_irq_line(1, true).ok();
                     irq1_line_high = true;
+                    metrics.record_irq(1);
+                }
+                if bus_lock().take_mouse_irq() {
+                    vm.set_irq_line(12, false).ok();
+                    vm.set_irq_line(12, true).ok();
+                    metrics.record_irq(12);
+                }
+                if bus_lock().take_uart_irq() {
+                    vm.set_irq_line(4, false).ok();
+                    vm.set_irq_line(4, true).ok();
+                    metrics.record_irq(4);
                 }
             }
-            VcpuExit::MmioWrite(addr, _data) => {
+            VcpuExit::MmioWrite(addr, data) => {
+                metrics.record_mmio_write();
+                bus_lock().mmio_write(addr, data);
                 if verbose { eprintln!("[VMM] MMIO W {:#x}", addr); }
             }
             VcpuExit::MmioRead(addr, data) => {
+                metrics.record_mmio_read();
+                let bytes = bus_lock().mmio_read(addr, data.len());
+                let count = bytes.len().min(data.len());
+                data[..count].copy_from_slice(&bytes[..count]);
                 if verbose { eprintln!("[VMM] MMIO R {:#x}", addr); }
-                data.fill(0xFF);
             }
             VcpuExit::InternalError => {
-                // KVM no pudo emular una instrucción (p. ej. INT en modo
-                // protegido con estado indefinido tras un probe fallido).
-                // En hardware real esto equivaldría a un fault del CPU:
-                // reseteamos el guest (como un 0xCF9) en vez de matar la VM.
+                metrics.record_internal_error();
                 let r = vcpu.get_regs().unwrap_or_default();
                 let s = vcpu.get_sregs().unwrap_or_default();
                 eprintln!("[VMM] KVM InternalError phys={:#x}", s.cs.base + r.rip);
                 dump_crash_state(&vcpu, &guest_mem, &recent, total_exits);
-                crash_reboot(&vcpu, &mut total_reboots);
+                crash_reboot(&vcpu, &vm, &mut bus_lock(), guest_mem, &mut total_reboots);
                 if total_reboots >= MAX_CRASH_REBOOTS { break; }
             }
             other => {
+                metrics.record_other();
                 let r = vcpu.get_regs().unwrap_or_default();
                 let s = vcpu.get_sregs().unwrap_or_default();
                 eprintln!("[VMM] Exit no manejado: {:?} phys={:#x}", other, s.cs.base + r.rip);
                 break;
             }
         }
+    }
+
+    // ─── Cierre de VM: sincronización y guardado de snapshots (Item 22, 24) ───
+    eprintln!("\n{}", metrics.format_summary(1.0, 0));
+    if let Some(pf) = bus.lock().unwrap_or_else(|p| p.into_inner()).pflash.as_mut() {
+        pf.flush_to_disk().ok();
+    }
+    if let Ok(snap_path) = std::env::var("MI_VMM_SNAPSHOT_SAVE") {
+        eprintln!("[VMM] Guardando snapshot en: {}", snap_path);
+        snapshot::save_vm_snapshot(&snap_path, guest_mem, high_mem, &[&vcpu]).ok();
     }
 }
 
@@ -897,9 +1228,9 @@ fn main() {
 /// irqchip del kernel lo maneja entero, incluido fijar CS:IP = vector<<4
 /// en modo real). Desde ahí ejecuta el guest igual que el BSP pero con
 /// una política de exits más simple:
-///   - El temporizador (PIT/IRQ0/tick del BDA) lo gobierna SOLO el BSP:
-///     si el SIGALRM interrumpe este hilo (EINTR) se reintenta sin tocar
-///     nada.
+///   - El temporizador (PIT/IRQ0/tick del BDA) lo gobierna el hilo dedicado
+///     pit-timer (tarea 16): si una señal interrumpe este hilo (EINTR) se
+///     reintenta sin tocar nada.
 ///   - Un triple fault en un AP solo "resetea" ese CPU: se re-aparca en
 ///     wait-for-SIPI y el siguiente INIT-SIPI del guest lo trae de vuelta
 ///     (en hardware real un triple fault de un AP no apaga la caja).
@@ -907,6 +1238,7 @@ fn ap_vcpu_worker(
     cpu_id: u32,
     vcpu: kvm_ioctls::VcpuFd,
     bus: Arc<Mutex<DeviceBus>>,
+    metrics: Arc<metrics::VmmMetrics>,
     verbose: bool,
 ) {
     let mut total_exits: u64 = 0;
@@ -919,8 +1251,8 @@ fn ap_vcpu_worker(
     loop {
         let exit_reason = match vcpu.run() {
             Ok(r) => r,
-            // Señal (SIGALRM/SIGINT/SIGTERM): el temporizador lo gobierna
-            // el BSP; aquí solo reintentamos.
+            // Señal (SIGINT/SIGTERM): el temporizador lo gobierna el hilo
+            // pit-timer (tarea 16); aquí solo reintentamos.
             Err(e) if e.errno() == libc::EINTR => continue,
             Err(e) => {
                 eprintln!("[AP{}] vcpu.run() falló: {}", cpu_id, e);
@@ -930,6 +1262,7 @@ fn ap_vcpu_worker(
         total_exits += 1;
         match exit_reason {
             VcpuExit::IoOut(port, data) => {
+                metrics.record_io_out(port);
                 let handled =
                     bus.lock().unwrap_or_else(|p| p.into_inner()).out(port, data);
                 if !handled {
@@ -937,6 +1270,7 @@ fn ap_vcpu_worker(
                 }
             }
             VcpuExit::IoIn(port, data) => {
+                metrics.record_io_in(port);
                 match bus.lock().unwrap_or_else(|p| p.into_inner()).input(port, data.len()) {
                     Some(bytes) => {
                         for (i, b) in bytes.iter().take(data.len()).enumerate() {
@@ -952,6 +1286,7 @@ fn ap_vcpu_worker(
                 }
             }
             VcpuExit::Hlt => {
+                metrics.record_hlt();
                 // STI;HLT del guest (p. ej. el bucle de paro de los APs de
                 // SeaBIOS). Con irqchip en el kernel, KVM bloquea dentro de
                 // run() hasta una interrupción o SIPI: no hay nada que hacer.
@@ -960,26 +1295,34 @@ fn ap_vcpu_worker(
                 }
             }
             VcpuExit::Intr => {
+                metrics.record_intr();
                 // KVM_EXIT_INTR: ejecución interrumpida por evento interno.
                 // Benigno: reintentar (aparcar aquí rompería el SMP).
             }
             VcpuExit::IrqWindowOpen => {
+                metrics.record_irq_window();
                 // La ventana de interrupciones solo la pide el BSP.
             }
             VcpuExit::Shutdown | VcpuExit::InternalError => {
+                metrics.record_shutdown();
                 eprintln!(
                     "[AP{}] triple fault/InternalError — AP re-aparcado en wait-for-SIPI",
                     cpu_id
                 );
                 park(&vcpu);
             }
-            VcpuExit::MmioRead(_addr, data) => {
-                data.fill(0xFF);
+            VcpuExit::MmioRead(addr, data) => {
+                metrics.record_mmio_read();
+                let bytes = bus.lock().unwrap_or_else(|p| p.into_inner()).mmio_read(addr, data.len());
+                let count = bytes.len().min(data.len());
+                data[..count].copy_from_slice(&bytes[..count]);
             }
-            VcpuExit::MmioWrite(_addr, _data) => {
-                // MMIO sin enrutar (tarea 1): misma política que el BSP.
+            VcpuExit::MmioWrite(addr, data) => {
+                metrics.record_mmio_write();
+                bus.lock().unwrap_or_else(|p| p.into_inner()).mmio_write(addr, data);
             }
             other => {
+                metrics.record_other();
                 eprintln!("[AP{}] exit no manejado: {:?} — AP aparcado", cpu_id, other);
                 park(&vcpu);
             }

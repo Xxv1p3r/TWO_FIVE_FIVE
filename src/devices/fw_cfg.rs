@@ -35,29 +35,38 @@ pub struct FwCfg {
 }
 
 impl FwCfg {
-    pub fn new(ram_size: u64, num_cpus: u32) -> Self {
+    /// `acpi`: tablas ACPI (tables + rsdp + loader) para exponerlas con el
+    /// interface estándar de QEMU; SeaBIOS las carga vía romfile-loader.
+    pub fn new(ram_size: u64, num_cpus: u32, acpi: Option<super::acpi::AcpiFiles>) -> Self {
         let mut items: HashMap<u16, Vec<u8>> = HashMap::new();
         items.insert(FW_CFG_SIGNATURE, b"QEMU".to_vec());
         // id: sin DMA (SeaBIOS usará lecturas PIO byte a byte).
         items.insert(FW_CFG_ID, vec![0x00]);
         items.insert(
             FW_CFG_RAM_SIZE,
-            ram_size.to_be_bytes().to_vec(), // fw_cfg usa big-endian
+            ram_size.to_le_bytes().to_vec(),
         );
         items.insert(
             FW_CFG_NB_CPUS,
-            (num_cpus as u16).to_be_bytes().to_vec(),
+            (num_cpus as u16).to_le_bytes().to_vec(),
         );
         items.insert(
             FW_CFG_MAX_CPUS,
-            num_cpus.to_be_bytes().to_vec(),
+            (num_cpus as u16).to_le_bytes().to_vec(),
         );
 
         // Directorio de archivos (selector 0x19):
         // Formato REAL de QEMU (ver struct QemuCfgFile en SeaBIOS):
         //   u32 count BE + entries { size: u32 BE, select: u16 BE,
         //                            reserved: u16, name: [u8;56] } = 64 bytes
-        let files: Vec<(&str, Vec<u8>)> = vec![("etc/ram-size", ram_size.to_be_bytes().to_vec())];
+        let mut files: Vec<(&str, Vec<u8>)> = vec![("etc/ram-size", ram_size.to_le_bytes().to_vec())];
+        if let Some(a) = &acpi {
+            // Tablas ACPI: los tres ficheros que SeaBIOS busca (acpi.c:
+            // loadQemuAcpiTables) para instalar RSDP/RSDT/FADT/DSDT/MADT.
+            files.push((super::acpi::ACPI_TABLES_FILE, a.tables.clone()));
+            files.push((super::acpi::ACPI_RSDP_FILE, a.rsdp.clone()));
+            files.push((super::acpi::TABLE_LOADER_FILE, a.loader.clone()));
+        }
         let mut dir = Vec::new();
         dir.extend_from_slice(&(files.len() as u32).to_be_bytes());
         let mut next_sel = FILE_BASE;
@@ -93,6 +102,50 @@ impl FwCfg {
             .get(&self.select)
             .cloned()
             .unwrap_or_else(|| vec![0])
+    }
+
+    /// Reset del dispositivo: vuelve al selector 0 (los items son hardware
+    /// estático y se conservan).
+    pub fn reset(&mut self) {
+        self.select = 0;
+        self.offset = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El directorio de archivos (0x19) debe listar los tres ficheros ACPI
+    /// con sus tamaños/selectores correctos para que SeaBIOS los encuentre.
+    #[test]
+    fn acpi_files_present_in_directory() {
+        let acpi = super::super::acpi::build_acpi_files(2);
+        let cfg = FwCfg::new(256 * 1024 * 1024, 2, Some(acpi));
+        let dir = cfg.items.get(&FW_CFG_FILE_DIR).unwrap();
+        // count BE + 4 entradas de 64 bytes (QemuCfgFile)
+        assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 4);
+        for (i, name) in [
+            "etc/ram-size",
+            super::super::acpi::ACPI_TABLES_FILE,
+            super::super::acpi::ACPI_RSDP_FILE,
+            super::super::acpi::TABLE_LOADER_FILE,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let off = 4 + i * 64;
+            let entry = &dir[off..off + 64];
+            let size = u32::from_be_bytes(entry[0..4].try_into().unwrap());
+            let sel = u16::from_be_bytes(entry[4..6].try_into().unwrap());
+            let entry_name =
+                String::from_utf8_lossy(&entry[8..64]).trim_end_matches('\0').to_string();
+            assert_eq!(entry_name, *name, "entrada {}", i);
+            assert!(size > 0);
+            assert_eq!(sel, (0x20 + i as u16) as u16);
+            // El contenido registrado bajo el selector coincide en tamaño.
+            assert_eq!(cfg.items.get(&sel).unwrap().len(), size as usize);
+        }
     }
 }
 
