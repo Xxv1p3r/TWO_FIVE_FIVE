@@ -1,0 +1,147 @@
+mi-vmm — LISTA DE TRABAJO PENDIENTE (TODO) + ASIGNACION DE EQUIPO
+Proyecto: viper-visor / mi-vmm (Hipervisor Tipo-2 sobre KVM + Rust)
+Fecha: 09/06/2026 — Mision: lograr el PRIMER DISPLAY del guest
+Estado base: compila en release, 20/20 tests pasan.
+
+============================================================
+ASIGNACION DE EQUIPO
+============================================================
+
+Persona 1 — VIPER — Input e interrupciones
+  Items: 3 ✓, 4 ✓, 6✓, 7, 19
+  Se encarga de: 8042, IRQ1, interrupt window, vCPU/SMP y teclado.
+
+Persona 2 — ALEX — Video y MMIO
+  Items: 1, 2, 10, 13, 14, 15, 21
+  Se encarga de: que el guest pueda comunicarse correctamente con los
+  dispositivos PCI/MMIO y de que finalmente se vea correctamente en pantalla.
+
+Persona 3 — IVAN — Dispositivos, sistema y calidad
+  Items: 5, 8, 9, 11, 12, 16, 17, 18, 20, 22, 23, 24, 25
+  Se encarga de: reset, almacenamiento, USB, ACPI, UART, rendimiento,
+  memoria segura, limpieza y roadmap.
+
+============================================================
+ROJO — CRITICO (bloquean el primer display fiable)
+============================================================
+
+1.  MMIO no implementado (main.rs:772-778)  [ALEX]
+    MmioRead siempre devuelve 0xFF y MmioWrite se descarta. Cualquier BAR de
+    PCI que no caiga en el slot 2 (0xE0000000-0xFFFFFFFF) se rompe en silencio.
+    ACCION: enrutar los exits MMIO al DeviceBus (o al menos a VRAM/VGA).
+
+2.  Modo VGA grafico estandar sin renderizar (display.rs)  [ALEX]
+    Solo se dibuja texto 80x25 y VBE lineal. Si el guest entra en modo grafico
+    planar (13h, 12h, 4bpp chain-4, etc.) la ventana queda congelada.
+    ACCION: renderizar desde seq_regs/grc_regs/crtc_regs + DAC palette.
+
+3.✓ Hack del teclado a los 3 segundos (main.rs:475-515)  [VIPER]
+    Escribir scancodes directamente en el buffer de teclado del EBDA es un
+    workaround que enmascara el bug real: la cadena host -> 8042 -> IRQ1 ->
+    INT 09h de SeaBIOS no funciona al 100%.
+    ACCION: depurar el emulador 8042 (legacy.rs / pic_pit.rs): status register,
+    output buffer, comando 0xAE (enable kbd port), IRQ1 y acknowledge_irq.
+    Eliminar el hack cuando funcione.
+
+4.✓ Interrupt window no gestionado de forma robusta (main.rs)  [VIPER]
+    Se inyectan IRQ0/IRQ1 con set_irq_line y se espera IrqWindowOpen, pero si
+    el guest tiene IF=0 y no se pide request_interrupt_window, la interrupcion
+    se pierde y el guest se cuelga ("Booting from CD-ROM..." infinito).
+    ACCION: activar request_interrupt_window de kvm_run siempre que haya IRQ
+    pendiente.
+
+5.  Reinicio incompleto (reset_vcpu_to_post)  [IVAN]
+    El reset (0xCF9, triple fault, InternalError) resetea el vCPU pero NO el
+    estado de dispositivos: CD-ROM/ATAPI, PIT, PIC, PCI, EBDA, banner 0xB8000.
+    Tras un reboot el guest ve hardware en estado raro (solo hay 5 reboots).
+    ACCION: anadir un reset de dispositivos al reset_vcpu_to_post.
+
+============================================================
+NARANJA — ALTO (drivers / emulacion de dispositivos)
+============================================================
+
+6✓  Solo 1 vCPU. Linux moderno necesita SMP (create_vcpu en loop + APIC).
+    No bloquea el primer display, pero planificar.  [VIPER]
+
+7.  APIC/IOAPIC falsos: solo 4 bytes fake del IOAPIC en high_mem
+    (main.rs:301-304). Linux en modo largo requiere LAPIC. Verificar que el
+    irqchip de KVM (KVM_CREATE_IRQCHIP) no se este pisando con el IOAPIC
+    falso.  [VIPER]
+
+8.  Disco duro ATA/IDE limitado (PrimaryIde): verificar soporte de escrituras
+    del guest (fsync), DMA/UDMA (o PIO multisetor rapido) y que bios_int13h
+    cubra int 13h para boot desde disco, no solo CD.  [IVAN]
+
+9.  USB UHCI minimo (246 lineas): sin tableta/raton USB no hay puntero en el
+    guest. Siguiente driver natural (alternativa: PS/2 mouse con IRQ12).  [IVAN]
+
+10. PCI: comprobar IDs correctos (PIIX3 8086:7000, VGA 1234:1111 o similar),
+    BARs asignables y que los accesos a BARs MMIO vayan al punto 1.  [ALEX]
+
+11. ACPI PM (AcpiPm) sin tablas ACPI (RSDP/RSDT/FADT): Linux ignorara ACPI y
+    no habra apagado limpio. Generar tablas en fw_cfg o RSDP en 0xE0000.  [IVAN]
+
+12. UART 16550 incompleta (164 lineas): sin loopback, LSR correctos ni IRQ4,
+
+============================================================
+AMARILLO — MEDIO (bugs / calidad)
+============================================================
+
+13. DebugCon escribiendo en 0xB8000 (legacy.rs:41-87): pisa/duplica caracteres
+    con lo que escribe el guest; el scroll es solo del mirror. Hacerlo
+    opt-in con MI_VMM_MIRROR_BIOS o quitarlo.  [ALEX]
+
+14. Banner "mi-vmm: waiting for BIOS..." queda pintado en 0xB8000 si SeaBIOS
+    nunca borra la pantalla.  [ALEX]
+
+15. VBE parcial: sin X_OFFSET/Y_OFFSET (panning), sin VIRT_WIDTH para
+    double-buffering, sin bpp 8/15; la ventana no escala al hacer resize.  [ALEX]
+
+16. Rendimiento del bucle: thread::sleep(16ms) extra + set_target_fps(60)
+    da ~30 FPS efectivos. El setitimer de 1 ms como unico timer es fragil:
+    usar un hilo con clock_nanosleep o timerfd.  [IVAN]
+
+17. Esc cierra la ventana pero la VM sigue viva sin display y sin forma de
+    reabrirla. Al cerrar ventana, apagar la VM limpiamente.  [IVAN]
+
+18. Seguridad de punteros crudos: guest_mem se pasa como *const u8 a 3 sitios
+    (display, DebugCon, alarm handler). Unificar en un tipo GuestMemory(Arc)
+    con read/write y bounds-check para eliminar UB potencial.  [IVAN]
+
+19. Mapeo de teclado incompleto: faltan AltGr/acentos (distribucion espanola),
+    teclas muertas; KeyRepeat::Yes puede desbordar el buffer del 8042.  [VIPER]
+
+20. 15 warnings de cargo: limpiar con cargo fix.  [IVAN]
+
+============================================================
+VERDE — BAJO (roadmap posterior al primer display)
+============================================================
+
+21. Virtio-blk / virtio-net / virtio-gpu: arranque rapido y red en el
+    guest.  [ALEX]
+
+22. OVMF/UEFI: el boot con bios-256k.bin limita a legacy boot; UEFI requiere
+    varstore + rediseño del mapeo de flash.  [IVAN]
+
+23. SMP + hotplug, SMM, TSS real para triple fault (en vez del reset
+    manual).  [IVAN]
+
+24. Snapshot/restore, metricas de exits, logs estructurados (exponer los
+    contadores de puertos en un TUI o log periodico).  [IVAN]
+
+25. Tests de integracion: bootear SeaBIOS real y verificar texto en 0xB8000
+    en menos de N segundos (CI-friendly con xvfb).  [IVAN]
+
+============================================================
+PLAN SUGERIDO PARA EL "PRIMER DISPLAY" (orden de ataque)
+============================================================
+
+Paso 1: Fix 8042/IRQ1 (quitar el hack del EBDA)      -> items 3 y 4   [VIPER]
+Paso 2: Reset completo de dispositivos               -> item 5        [IVAN]
+Paso 3: Render VGA grafico estandar + MMIO basico    -> items 2 y 1   [ALEX]
+Paso 4: UART real para depurar con console=ttyS0     -> item 12       [IVAN]
+
+Con eso el guest deberia mostrar el arranque del CD-ROM en la ventana.
+
+    GRUB/Linux no podran usar console=ttyS0 para debug. Es la mejor
+    herramienta de depuracion: priorizar.  [IVAN]

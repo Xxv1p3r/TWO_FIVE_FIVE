@@ -1,0 +1,15 @@
+[package]
+name = "mi-vmm"
+version = "0.1.0"
+edition = "2021"
+authors = ["v1p3r y equipo"]
+description = "Hipervisor Tipo-2 minimalista sobre KVM/Linux — proyecto universitario"
+
+[dependencies]
+kvm-bindings = "0.6"
+kvm-ioctls   = "0.14"
+vmm-sys-util = "0.12"
+libc         = "0.2"
+log          = "0.4"
+env_logger   = "0.11"
+minifb       = "0.27"
