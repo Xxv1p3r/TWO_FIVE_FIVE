@@ -2,7 +2,7 @@
 name = "two-five-five"
 version = "0.1.0"
 edition = "2021"
-authors = ["v1p3r y equipo"]
+authors = ["RExlEx-s", "FullHD618", "v1p3r"]
 description = "Two Five Five (255) — Hipervisor Tipo-2 minimalista sobre KVM/Linux"
 
 [dependencies]

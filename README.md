@@ -94,4 +94,4 @@ Actualmente: **149 tests pasando (0 fallos)**.
 
 ## Licencia
 
-Desarrollado por **v1p3r y equipo** como un hipervisor Tipo-2 de investigación y desarrollo de alto rendimiento.
+Desarrollado por **RExlEx-s, FullHD618 y v1p3r** como un hipervisor Tipo-2 de investigación y desarrollo de alto rendimiento.
