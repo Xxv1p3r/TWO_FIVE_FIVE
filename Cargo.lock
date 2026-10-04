@@ -444,19 +444,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mi-vmm"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "kvm-bindings",
- "kvm-ioctls",
- "libc",
- "log",
- "minifb",
- "vmm-sys-util 0.12.1",
-]
-
-[[package]]
 name = "minifb"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -767,6 +754,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "two-five-five"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "log",
+ "minifb",
+ "vmm-sys-util 0.12.1",
 ]
 
 [[package]]

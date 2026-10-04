@@ -1,143 +1,97 @@
-# mi-vmm
+# TWO FIVE FIVE (255)
 
-Emulador / hipervisor Tipo-2 minimalista construido sobre **KVM** y **Rust**.
+Hipervisor Tipo-2 minimalista de alto rendimiento sobre **KVM** y **Rust**.
 
-Arranca SeaBIOS y un guest Linux desde un CD-ROM ATAPI virtual sin necesidad de QEMU.
+**Two Five Five (255)** arranca firmwares estándar (SeaBIOS, coreboot) y sistemas operativos modernos (Linux x86_64, distros Live como Kali Linux, Linux Mint, Alpine, TinyCore) directamente sobre KVM sin dependencias pesadas como QEMU.
+
+---
+
+## Características Principales
+
+- **Arquitectura de Memoria $\ge 4\text{ GB}$**:
+  - Particionado de memoria KVM respetando la arquitectura PC y el hueco PCI MMIO (3.5 GB – 4 GB).
+  - RAM baja mapeada en GPA `0x0000_0000` (hasta 3584 MiB) y RAM alta en GPA `0x1_0000_0000`.
+  - Tablas E820 y CMOS RTC con soporte para memorias superiores a 4 GB.
+
+- **Multiprocesamiento Simétrico (SMP)**:
+  - Soporte multi-core nativo (por defecto 4 vCPUs: 1 BSP + 3 APs) con sondeo SIPI y tablas ACPI MADT enlazadas al RSDT.
+
+- **Paridad con Oracle VirtualBox**:
+  - **AHCI SATA (0x8086:0x2829)**: Controlador ICH-8M completo con máquina de estados COMRESET, conteo LBA48 (65,536 sectores), interrupciones NCQ Set Device Bits FIS (0xA1) y emulación ATAPI CD-ROM SATA.
+  - **VMMDev (0x80EE:0xCAFE)**: Soporte de eventos de host en `u32HostEvents`, Fast IRQ Ack sin consumo espurio de eventos y banderas HGCM.
+  - **Audio AC'97 (0x8086:0x2415)**: Códec ICH con registros extendidos EAID/EACS (`0x0809` y `0x0009` con VRM/VRA), control W1C en status y lecturas NAM protegidas.
+  - **BMDMA (Bus Master DMA IDE)**: Transferencias PRD DMA directas de alta velocidad.
+
+- **Subsistemas y Dispositivos Adicionales**:
+  - **Gráficos Bochs VBE**: Aceleración VBE con soporte `VBE_DISPI_GETCAPS` (hasta 2560×1600), Linear Framebuffer (LFB) y modos nativos del kernel Linux (`bochs-drm` a 1024×768@32bpp).
+  - **Red VirtIO (`virtio-net`)**: Stack de red en userspace integrado con DHCP (10.0.2.15), Gateway (10.0.2.2) y proxy DNS nativo, además de soporte para interfaces TAP de Linux.
+  - **VirtIO Serial (`virtio-serial`)**: Canal bidireccional guest-host para comunicación e integración con agentes.
+  - **USB UHCI + Tableta HID**: Entrada de cursor absoluto USB para integración sin captura forzada del ratón.
+  - **Reloj PIT de Alta Precisión**: Hilo independiente sincronizado con `CLOCK_MONOTONIC` (`clock_nanosleep` absoluto) que avanza el PIT y el BDA tick (18.2 Hz) sin deriva acumulada.
+
+- **Interfaz Dual**:
+  - **Frontend Gráfico**: Ventana nativa en el host (`minifb`) con escalado dinámico por interpolación nearest-neighbor y soporte de teclado en español.
+  - **Dashboard TUI interactivo**: Panel estilo `btop`/`htop` en terminal con telemetría en tiempo real (uso de CPUs, salidas KVM/s, E/S de almacenamiento, resolución y visor de logs).
+
+---
 
 ## Compilación
+
+Requiere Rust 1.75+ y Linux con soporte para KVM (`/dev/kvm`).
 
 ```bash
 cargo build --release
 ```
 
+El binario compilado se generará en `target/release/two-five-five`.
+
+---
+
 ## Ejecución
 
+Puedes usar el script automatizado [`run.sh`](file:///home/v1p3r/Escritorio/255_ver_0.80/run.sh):
+
 ```bash
-./target/release/mi-vmm /usr/share/seabios/bios-256k.bin [imagen.iso] [disco.img]
-# ó
+# Arranque automático (detecta SeaBIOS y cualquier ISO disponible)
 ./run.sh
+
+# Arranque explícito con BIOS, ISO y Disco Duro virtual
+./run.sh bios/bios-256k.bin kali.iso disk.img
 ```
 
-- Primer argumento: firmware BIOS (SeaBIOS, coreboot, etc.)
-- Segundo argumento (opcional): imagen ISO para el CD-ROM virtual
-- Tercer argumento (opcional): imagen de disco duro raw (.img)
+O ejecutar directamente el binario:
 
-## Test
+```bash
+./target/release/two-five-five bios/bios-256k.bin imagen.iso disco.img
+```
+
+### Variables de Entorno de Configuración
+
+| Variable | Descripción | Valor por Defecto |
+|----------|-------------|-------------------|
+| `TWO_FIVE_FIVE_RAM` (o `TFF_RAM`) | Memoria RAM en MiB | `4096` |
+| `TWO_FIVE_FIVE_CPUS` (o `TFF_CPUS`) | Número de núcleos vCPU | `4` |
+| `TWO_FIVE_FIVE_NO_TUI` | Desactiva el dashboard TUI interactivo | Desactivado |
+| `TWO_FIVE_FIVE_TAP` | Nombre de la interfaz TAP de red | No configurada (usa stack DHCP interno) |
+| `TWO_FIVE_FIVE_AUTO_ENTER` | Inyección automática de Enter para bootloaders | `1` (activo) |
+| `TWO_FIVE_FIVE_VERBOSE` | Muestra logs detallados de depuración de dispositivos | Desactivado |
+
+*(Nota: Los prefijos heredados `MI_VMM_*` continúan siendo compatibles).*
+
+---
+
+## Tests
+
+El proyecto cuenta con una amplia suite de pruebas que valida cada componente contra especificaciones reales de hardware y comportamiento de VirtualBox:
 
 ```bash
 cargo test
 ```
 
-Actualmente: **20/20 tests pasan**.
+Actualmente: **149 tests pasando (0 fallos)**.
 
-## Arquitectura
+---
 
-```
-┌─────────────────────────────────────────────────┐
-│  mi-vmm (Rust + KVM)                            │
-│                                                 │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │ VGA Text │  │ DebugCon │  │ CD-ROM ATAPI  │  │
-│  │ Display  │  │ (0x402)  │  │ (0x170-0x177) │  │
-│  └────┬─────┘  └────┬─────┘  └───────┬───────┘  │
-│       │              │                │          │
-│  ┌────┴──────────────┴────────────────┴───────┐  │
-│  │              DeviceBus                     │  │
-│  │  UART · PCI · USB · PM Timer · CMOS · ... │  │
-│  └────────────────────┬───────────────────────┘  │
-│                       │ KVM vmexit               │
-│  ┌────────────────────┴───────────────────────┐  │
-│  │              VMM Loop                      │  │
-│  │  I/O dispatch · IRQ injection · BDA tick   │  │
-│  └────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────┘
-         │ KVM /dev/kvm
-         ▼
-┌────────────────────────┐
-│  Guest (SeaBIOS + OS)  │
-│  256 MiB RAM + 512 Hi  │
-└────────────────────────┘
-```
+## Licencia
 
-## Dispositivos emulados
-
-| Puerto | Dispositivo | Estado |
-|--------|-------------|--------|
-| 0x0402 | DebugCon → VGA mirror | ✅ |
-| 0x0060/0x0064 | i8042 PS/2 | ✅ |
-| 0x0070/0x0071 | CMOS/RTC | ✅ |
-| 0x0040-0x0043 | PIT 8254 | ✅ |
-| 0x00A0/0x00A0 | PIC 8259 (dual) | ✅ |
-| 0x01F0-0x1F7 | Primary IDE (ATA disk) | ✅ |
-| 0x0170-0x177 | Secondary IDE (CD-ROM ATAPI) | ✅ |
-| 0x0376/0x3F6 | Alternate status | ✅ |
-| 0x02F8-0x3FF | UART 16550 + COM stubs | ✅ |
-| 0x0378/0x37A | LPT stubs | ✅ |
-| 0x03B0-0x3DF | VGA (Bochs VBE) | ✅ |
-| 0x0510-0x0511 | fw_cfg (QEMU) | ✅ |
-| 0x0CF9 | Hardware reset | ✅ |
-| 0x0800/0x808 | Port 92 (A20) | ✅ |
-| 0xB000-0xB007 | ACPI PM Timer | ✅ |
-| PCI config | i440FX + PIIX3 + VGA + USB | ✅ |
-| 0xFEE00000 | Local APIC stub | ✅ |
-| 0xFEC00000 | IOAPIC stub | ✅ |
-
-## Estado actual del boot
-
-```
-✅ Reset vector → SeaBIOS POST
-✅ PCI scan (6 dispositivos: i440FX, PIIX3, USB, VGA)
-✅ SeaBIOS version banner en VGA
-✅ ATA controllers detectados (primary + secondary)
-✅ CD-ROM ATAPI detectado (IDENTIFY PACKET + SCSI INQUIRY)
-✅ Boot sector leído del CD-ROM (ATAPI PACKET → SCSI READ 10)
-✅ "Booting from DVD/CD..." → "Booting from 0000:7c00"
-✅ ISOLINUX/GRUB loader ejecutándose desde 0x7C00
-✅ Lectura multisectorial masiva (~98 MB de kernel + initrd)
-✅ CR0 transitions tracked (real ↔ protected mode)
-⚠️  ISOLINUX carga kernel/initrd pero no muestra splash (text mode VGA)
-```
-
-### Progreso detallado del boot
-
-1. **POST** — SeaBIOS inicializa PCI, detecta dispositivos
-2. **VGA ROM** — Option ROM ejecutado, modo texto activado
-3. **ATA detection** — Primary (disk stub) + Secondary (CD-ROM)
-4. **Boot order** — Floppy (falla) → DVD/CD (éxito)
-5. **Boot sector** — SCSI READ(10) LBA=0 → 0x7C00
-6. **ISOLINUX** — Lee kernel (`vmlinuz`) y initrd desde el ISO
-7. **Multisector reads** — 32 sectores × 2048 bytes por operación
-8. **Kernel loading** — ~98 MB leídos del CD-ROM
-
-### Próximos pasos
-
-- VGA framebuffer para graphics mode (ISOLINUX/GRUB splash)
-- Soporte para Linux kernel mode (protected mode 32/64-bit completo)
-- INT 13h extensions handler para bootloaders que las requieran
-
-## INT 13h Handler Module
-
-El módulo `bios_int13h` proporciona funciones para manejar interrupciones BIOS INT 13h:
-
-- **AH=41h** — Check LBA Extensions (BX=0x55AA → CF=0, BX=0xAA55)
-- **AH=42h** — Extended Read via DAP (Disk Address Packet → SCSI READ(10))
-- **AH=08h** — Get Drive Parameters (BL=0x05 ATAPI CD-ROM)
-- **DAP parsing** — Structura DiskAddressPacket de 16 bytes
-- **LBA translation** — Conversión INT 13h (512B) → CD-ROM (2048B)
-- **SCSI CDB builder** — build_scsi_read10_cdb()
-
-## Cronología de correcciones
-
-| Fix | Problema | Solución |
-|-----|----------|----------|
-| ATA status bits | ST_DRDY/ST_DRQ en bits incorrectos | Corregidos a 0x40/0x08 (matching SeaBIOS ata.h) |
-| DebugCon → VGA | BIOS messages solo iban a serial | DebugCon escribe a 0xB8000 además de stderr |
-| BDA tick counter | wait_ms() no avanzaba | Incremento a 18.2 Hz en main loop |
-| CdRom stub | Secondary IDE no respondía sin ISO | `CdRom::stub()` creado siempre |
-| LPT/COM stubs | SeaBIOS no detectaba puertos | PlatformStubs con data latch y LSR correcto |
-| USB BAR sizing | pci_enable_iobar fallaba | Se salta detección durante sizing |
-| ATAPI BSY phase | SeaBIOS nunca veía DRQ clear | `pending_packet` / `pending_identify` flags |
-| CDB write handler | Solo procesaba 2 bytes de KVM | Ahora consume todos los bytes del buffer |
-| Multi-sector read | Lecturas de 32 sectores | SCSI READ(10) con transfer_len variable |
-| INT 13h module | Sin helpers para boot extensions | bios_int13h.rs con DAP parsing y SCSI CDB builder |
-| CR0 tracking | Sin visibility de mode transitions | Log cada 50K exits con GDT/IDT info |
+Desarrollado por **v1p3r y equipo** como un hipervisor Tipo-2 de investigación y desarrollo de alto rendimiento.

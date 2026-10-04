@@ -1,4 +1,4 @@
-//! mi-vmm — Hipervisor Tipo-2 minimalista sobre KVM/Linux.
+//! Two Five Five (255) — Hipervisor Tipo-2 minimalista sobre KVM/Linux.
 
 mod devices;
 mod display;
@@ -30,6 +30,13 @@ const MAX_CRASH_REBOOTS: u32 = 5;
 
 static IS_UEFI: AtomicBool = AtomicBool::new(false);
 
+/// Helper para consultar variables de entorno soportando TWO_FIVE_FIVE_*, TFF_* y MI_VMM_*
+pub fn get_vmm_env(key: &str) -> Result<String, std::env::VarError> {
+    std::env::var(format!("TWO_FIVE_FIVE_{}", key))
+        .or_else(|_| std::env::var(format!("TFF_{}", key)))
+        .or_else(|_| std::env::var(format!("MI_VMM_{}", key)))
+}
+
 /// Resetea la VM entera al POST (equivalente a un reset por hardware tras
 /// un crash del guest) e incrementa el contador de reboots.
 fn crash_reboot(
@@ -54,11 +61,11 @@ fn bios_load_addr(bios_len: usize) -> u64 {
 }
 
 fn usage() -> ! {
-    eprintln!("Uso: mi-vmm [bios.bin] [imagen.iso] [disco.img]");
-    eprintln!("O simplemente: mi-vmm <imagen.iso>");
+    eprintln!("Uso: two-five-five [bios.bin] [imagen.iso] [disco.img]");
+    eprintln!("O simplemente: two-five-five <imagen.iso>");
     eprintln!("Ejemplos:");
-    eprintln!("  mi-vmm CorePlus-current.iso");
-    eprintln!("  mi-vmm /usr/share/seabios/bios-256k.bin CorePlus-current.iso");
+    eprintln!("  two-five-five CorePlus-current.iso");
+    eprintln!("  two-five-five /usr/share/seabios/bios-256k.bin CorePlus-current.iso");
     exit(1);
 }
 
@@ -252,7 +259,7 @@ fn init_bios_data_area(guest_mem: &mut [u8]) {
         if vga_end <= guest_mem.len() {
             guest_mem[vga_off..vga_end].fill(0x00);
             // Write a startup banner in the first row
-            let banner = b"mi-vmm: waiting for BIOS...";
+            let banner = b"two-five-five: waiting for BIOS...";
             for (i, &ch) in banner.iter().enumerate() {
                 guest_mem[vga_off + i * 2] = ch;
                 guest_mem[vga_off + i * 2 + 1] = 0x07;

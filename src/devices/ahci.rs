@@ -761,13 +761,13 @@ impl AhciController {
         buf[8] = 0x03; buf[9] = 0x00;
         buf[12] = 63;  buf[13] = 0;   // Sectors per track
 
-        let serial = b"MI-VMM-SATA0    ";
+        let serial = b"TWO555-SATA0    ";
         for (i, &b) in serial.iter().take(20).enumerate() {
             buf[20 + i] = b;
         }
 
         buf[46..54].copy_from_slice(b"01.00   "); // Firmware rev
-        let model = b"MI-VMM Virtual SATA HDD                 ";
+        let model = b"Two Five Five Virtual SATA HDD          ";
         for (i, slot) in buf[54..94].chunks_mut(2).enumerate() {
             let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
             slot[0] = get(i * 2 + 1);
@@ -796,13 +796,13 @@ impl AhciController {
         pkt[0] = 0x05;
         pkt[1] = 0x85;
 
-        let serial = b"MI-VMM-SATA1    ";
+        let serial = b"TWO555-SATA1    ";
         for (i, &b) in serial.iter().take(20).enumerate() {
             pkt[20 + i] = b;
         }
 
         pkt[46..54].copy_from_slice(b"01.00   ");
-        let model = b"MI-VMM Virtual SATA CD-ROM              ";
+        let model = b"Two Five Five Virtual SATA CD-ROM       ";
         for (i, slot) in pkt[54..94].chunks_mut(2).enumerate() {
             let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
             slot[0] = get(i * 2 + 1);
@@ -846,7 +846,7 @@ impl AhciController {
                 inq[2] = 0x02; // SPC-2
                 inq[3] = 0x02;
                 inq[4] = 91;   // Additional length
-                inq[8..16].copy_from_slice(b"MI-VMM  ");
+                inq[8..16].copy_from_slice(b"TWO555  ");
                 inq[16..32].copy_from_slice(b"SATA CD-ROM     ");
                 inq[32..36].copy_from_slice(b"1.0 ");
                 let len = alloc.min(96);
@@ -1215,7 +1215,7 @@ mod tests {
         let mut inq_resp = [0u8; 96];
         guest_mem.copy_from(prd_data_buf as usize, &mut inq_resp);
         assert_eq!(inq_resp[0], 0x05); // CD-ROM
-        assert_eq!(&inq_resp[8..16], b"MI-VMM  ");
+        assert_eq!(&inq_resp[8..16], b"TWO555  ");
         assert_eq!(&inq_resp[16..28], b"SATA CD-ROM ");
 
         // 2. SCSI READ CAPACITY 10 (0x25)

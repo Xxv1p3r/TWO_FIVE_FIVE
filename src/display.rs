@@ -78,7 +78,7 @@ impl DisplayManager {
             let mut window_buf: Vec<u32> = vec![0; initial_width * initial_height];
 
             let mut window = match Window::new(
-                "mi-vmm — Virtual Display",
+                "Two Five Five — Virtual Display",
                 initial_width,
                 initial_height,
                 WindowOptions {

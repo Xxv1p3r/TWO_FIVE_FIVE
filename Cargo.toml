@@ -1,9 +1,9 @@
 [package]
-name = "mi-vmm"
+name = "two-five-five"
 version = "0.1.0"
 edition = "2021"
 authors = ["v1p3r y equipo"]
-description = "Hipervisor Tipo-2 minimalista sobre KVM/Linux — proyecto universitario"
+description = "Two Five Five (255) — Hipervisor Tipo-2 minimalista sobre KVM/Linux"
 
 [dependencies]
 kvm-bindings = "0.6"

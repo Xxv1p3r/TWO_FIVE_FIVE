@@ -380,7 +380,7 @@ impl CdRom {
         // Word 127: removable status
 
         // Word 128-159: model (40 chars, space-padded, byte-swapped)
-        let model_str = b"MI-VMM CD-ROM ATAPI    ";
+        let model_str = b"Two Five Five CD-ROM ATAPI   ";
         for (i, slot) in pkt[256..296].chunks_mut(2).enumerate() {
             let get = |k: usize| -> u8 { model_str.get(k).copied().unwrap_or(b' ') };
             slot[0] = get(i * 2 + 1);
@@ -470,7 +470,7 @@ impl CdRom {
                 // Additional length
                 inq[4] = 91;
                 // Vendor ID (8 bytes, space-padded)
-                inq[8..16].copy_from_slice(b"MI-VMM  ");
+                inq[8..16].copy_from_slice(b"TWO555  ");
                 // Product ID (16 bytes, space-padded)
                 inq[16..32].copy_from_slice(b"CD-ROM Drive    ");
                 // Product revision (4 bytes)
@@ -975,7 +975,7 @@ impl PrimaryIde {
         buf[12] = 63;  buf[13] = 0;
 
         // Word 10-19: serial number (20 bytes)
-        let serial = b"MI-VMM-HDD0     ";
+        let serial = b"TWO555-HDD0     ";
         for (i, &b) in serial.iter().take(20).enumerate() {
             buf[20 + i] = b;
         }
@@ -984,7 +984,7 @@ impl PrimaryIde {
         buf[46..54].copy_from_slice(b"01.00   ");
 
         // Word 27-46: model name (40 chars, byte-swapped per ATA spec)
-        let model = b"MI-VMM Virtual HDD                      ";
+        let model = b"Two Five Five Virtual HDD               ";
         for (i, slot) in buf[54..94].chunks_mut(2).enumerate() {
             let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
             slot[0] = get(i * 2 + 1);

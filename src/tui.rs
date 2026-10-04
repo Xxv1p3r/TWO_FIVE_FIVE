@@ -1,4 +1,4 @@
-//! Dashboard interactivo TUI (Terminal User Interface) para mi-vmm.
+//! Dashboard interactivo TUI (Terminal User Interface) para Two Five Five (255).
 //!
 //! Proporciona una interfaz rica en la consola estilo btop/htop con:
 //! - Monitoreo en tiempo real de vCPUs (cores activos, % uso, salidas KVM/s).
@@ -409,11 +409,11 @@ pub fn start_tui(
                         "─".repeat(border_width.saturating_sub(2))
                     ));
                     out.push_str(&format!(
-                        "\x1b[36;1m│\x1b[0m \x1b[1;37mmi-vmm Hypervisor v0.1\x1b[0m  ESTADO: {}  UPTIME: \x1b[36m{}\x1b[0m  FIRMWARE: \x1b[35mSeaBIOS\x1b[0m{:>pad$} \x1b[36;1m│\x1b[0m\r\n",
+                        "\x1b[36;1m│\x1b[0m \x1b[1;37mTwo Five Five Hypervisor v0.1\x1b[0m  ESTADO: {}  UPTIME: \x1b[36m{}\x1b[0m  FIRMWARE: \x1b[35mSeaBIOS\x1b[0m{:>pad$} \x1b[36;1m│\x1b[0m\r\n",
                         status_str,
                         uptime_str,
                         "",
-                        pad = border_width.saturating_sub(76)
+                        pad = border_width.saturating_sub(83)
                     ));
 
                     // Sección CPU

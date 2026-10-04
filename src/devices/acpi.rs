@@ -60,10 +60,10 @@ fn acpi_header(sig: &[u8; 4], length: u32, oem_table: &[u8; 8]) -> Vec<u8> {
     t[4..8].copy_from_slice(&length.to_le_bytes());
     t[8] = 1; // revision
     t[9] = 0; // checksum (lo rellena ADD_CHECKSUM del loader)
-    t[10..16].copy_from_slice(b"MI-VMM");
+    t[10..16].copy_from_slice(b"TWO555");
     t[16..24].copy_from_slice(oem_table);
     t[24..28].copy_from_slice(&1u32.to_le_bytes()); // oem revision
-    t[28..32].copy_from_slice(b"MI-V");
+    t[28..32].copy_from_slice(b"255_");
     t[32..36].copy_from_slice(&1u32.to_le_bytes()); // creator revision
     t
 }
@@ -154,7 +154,7 @@ fn build_rsdp() -> Vec<u8> {
     let mut t = vec![0u8; 20];
     t[0..8].copy_from_slice(b"RSD PTR ");
     t[8] = 0; // checksum (loader)
-    t[9..15].copy_from_slice(b"MI-VMM");
+    t[9..15].copy_from_slice(b"TWO555");
     t[15] = 0; // revision 0 (ACPI 1.0)
     // t[16..20] = 0 → RSDT (placeholder: offset 0 del blob)
     t

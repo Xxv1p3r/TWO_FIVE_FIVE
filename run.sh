@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ─── mi-vmm launcher ──────────────────────────────────────────────
+# ─── Two Five Five (255) launcher ──────────────────────────────────
 # Usage: ./run.sh [bios.bin] [image.iso] [disk.img]
 #
 # If no BIOS is specified, tries common SeaBIOS paths.
@@ -9,7 +9,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="$SCRIPT_DIR/target/release/mi-vmm"
+if [ -f "$SCRIPT_DIR/target/release/two-five-five" ]; then
+    BINARY="$SCRIPT_DIR/target/release/two-five-five"
+elif [ -f "$SCRIPT_DIR/target/release/mi-vmm" ]; then
+    BINARY="$SCRIPT_DIR/target/release/mi-vmm"
+else
+    BINARY="$SCRIPT_DIR/target/release/two-five-five"
+fi
 
 # ─── Colors ────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -142,7 +148,7 @@ find_iso() {
 # ─── Main ─────────────────────────────────────────────────────────
 echo ""
 info "═══════════════════════════════════════════════"
-info "  mi-vmm — Hipervisor Tipo-2 minimalista"
+info "  Two Five Five (255) — Hipervisor Tipo-2"
 info "═══════════════════════════════════════════════"
 echo ""
 
