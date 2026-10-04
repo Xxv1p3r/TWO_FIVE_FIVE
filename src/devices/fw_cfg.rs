@@ -64,11 +64,35 @@ impl FwCfg {
 
         // Directorio de archivos (selector 0x19):
         // Formato REAL de QEMU (ver struct QemuCfgFile en SeaBIOS):
-        //   u32 count BE + entries { size: u32 BE, select: u16 BE,
-        //                            reserved: u16, name: [u8;56] } = 64 bytes
-        let mut files: Vec<(&str, Vec<u8>)> = vec![("etc/ram-size", ram_size.to_le_bytes().to_vec())];
+        let mut e820_data = Vec::new();
+        let mut add_e820 = |addr: u64, len: u64, typ: u32| {
+            e820_data.extend_from_slice(&addr.to_le_bytes());
+            e820_data.extend_from_slice(&len.to_le_bytes());
+            e820_data.extend_from_slice(&typ.to_le_bytes());
+        };
+
+        // 1. RAM baja: 0..0x9FC00 (639 KiB)
+        add_e820(0, 0x9FC00, 1);
+        // 2. EBDA: 0x9FC00..0xA0000 (1 KiB)
+        add_e820(0x9FC00, 0x400, 2);
+        // 3. Video RAM y ROMs de BIOS: 0xA0000..0x100000 (384 KiB)
+        add_e820(0xA0000, 0x60000, 2);
+        // 4. RAM principal por debajo de 4GB: 0x100000..(ram_size.min(0xE000_0000))
+        let ram_below_4g = ram_size.min(0xE000_0000);
+        if ram_below_4g > 0x100000 {
+            add_e820(0x100000, ram_below_4g - 0x100000, 1);
+        }
+        // 5. Si hay RAM por encima de 4GB:
+        if ram_size > ram_below_4g {
+            add_e820(0x1_0000_0000, ram_size - ram_below_4g, 1);
+        }
+
+        let mut files: Vec<(&str, Vec<u8>)> = vec![
+            ("etc/ram-size", ram_size.to_le_bytes().to_vec()),
+            ("etc/e820", e820_data),
+        ];
         if let Some(rom) = &vga_rom {
-            files.push(("vgaroms/vgabios.bin", rom.clone()));
+            files.push(("pci1234,1111.rom", rom.clone()));
         }
         if let Some(a) = &acpi {
             // Tablas ACPI: los tres ficheros que SeaBIOS busca (acpi.c:
@@ -133,10 +157,11 @@ mod tests {
         let acpi = super::super::acpi::build_acpi_files(2);
         let cfg = FwCfg::new(256 * 1024 * 1024, 2, Some(acpi), None);
         let dir = cfg.items.get(&FW_CFG_FILE_DIR).unwrap();
-        // count BE + 4 entradas de 64 bytes (QemuCfgFile)
-        assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 4);
+        // count BE + 5 entradas de 64 bytes (QemuCfgFile)
+        assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 5);
         for (i, name) in [
             "etc/ram-size",
+            "etc/e820",
             super::super::acpi::ACPI_TABLES_FILE,
             super::super::acpi::ACPI_RSDP_FILE,
             super::super::acpi::TABLE_LOADER_FILE,
@@ -163,12 +188,12 @@ mod tests {
         let mock_rom = vec![0x55, 0xAA, 0x01, 0x02];
         let cfg = FwCfg::new(256 * 1024 * 1024, 1, None, Some(mock_rom.clone()));
         let dir = cfg.items.get(&FW_CFG_FILE_DIR).unwrap();
-        assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 2);
-        let off = 4 + 1 * 64;
+        assert_eq!(u32::from_be_bytes(dir[0..4].try_into().unwrap()), 3);
+        let off = 4 + 2 * 64;
         let entry = &dir[off..off + 64];
         let entry_name =
             String::from_utf8_lossy(&entry[8..64]).trim_end_matches('\0').to_string();
-        assert_eq!(entry_name, "vgaroms/vgabios.bin");
+        assert_eq!(entry_name, "pci1234,1111.rom");
         let sel = u16::from_be_bytes(entry[4..6].try_into().unwrap());
         assert_eq!(cfg.items.get(&sel).unwrap(), &mock_rom);
     }

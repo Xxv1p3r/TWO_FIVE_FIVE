@@ -173,17 +173,6 @@ enum Ps2Expect {
     AuxDev,
 }
 
-// ─── DMA Controller (8237) - stub ──────────────────────────────────
-/// Puertos del DMA controller maestro (0x00-0x0F) y esclavo (0xC0-0xDF).
-/// Plus puertos de manage page registers (0x81-0x83, 0x87).
-fn is_dma_port(port: u16) -> bool {
-    matches!(port,
-        0x00..=0x0F |   // DMA maestro (includes 0x08, 0x0C)
-        0x81..=0x83 |   // DMA page registers (ch 2,3,1)
-        0x87 |           // DMA page register (ch 0)
-        0xC0..=0xDF     // DMA esclavo (16-bit, includes 0xD0-0xDE)
-    )
-}
 
 pub struct LegacyInterrupts {
     // PIC state
@@ -339,7 +328,6 @@ impl LegacyInterrupts {
     /// Inyecta un scancode del host en el output buffer del 8042.
     /// El handler INT 09h del guest lo leerá por el puerto 0x60.
     pub fn inject_scancode(&mut self, scancode: u8) {
-        eprintln!("[PS2] inject_scancode: 0x{:02X}, kb_irq_enabled={}, out_buf_len={}", scancode, self.kb_irq_enabled, self.ps2_out_buf.len());
         self.push_out_buf(scancode);
     }
 
@@ -517,6 +505,19 @@ impl LegacyInterrupts {
                     self.pic2_irr = 0;
                     self.pic2_isr = 0;
                     self.pic2_mask = 0xFF;
+                } else if val & 0x08 == 0 {
+                    if val & OCW2_EOI != 0 {
+                        if val & 0x40 != 0 {
+                            self.pic_eoi(false, val & 0x07);
+                        } else {
+                            for bit in 0..8u8 {
+                                if self.pic2_isr & (1 << bit) != 0 {
+                                    self.pic2_isr &= !(1 << bit);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 } else if val & 0x08 != 0 {
                     if val & 0x02 != 0 { self.pic2_read_reg = val & 0x01; }
                 }
@@ -629,7 +630,6 @@ impl LegacyInterrupts {
             PS2_DATA => {
                 // Prioridad: teclado (IRQ1), luego auxiliar/ratón (IRQ12).
                 if let Some(val) = self.ps2_out_buf.pop_front() {
-                    eprintln!("[PS2] GUEST READ 0x60 -> 0x{:02X}", val);
                     self.irq1_pending = self.kb_irq_enabled && !self.ps2_out_buf.is_empty();
                     return val;
                 }
@@ -718,7 +718,6 @@ impl LegacyInterrupts {
 
     /// Procesa un comando escrito en el puerto 0x64 del 8042.
     fn ps2_command(&mut self, val: u8) {
-        eprintln!("[PS2] COMMAND 0x64 <- 0x{:02X}", val);
         match val {
             // Comandos que consumen un byte de datos por el puerto 0x60:
             // (NO generan respuesta: el ACK de antes envenenaba el buffer)
@@ -877,7 +876,7 @@ impl IoDevice for LegacyInterrupts {
                 | PIT_CH0..=PIT_CTRL
                 | 0x61
                 | PS2_DATA | PS2_STATUS
-        ) || is_dma_port(port)
+        )
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {
@@ -1173,5 +1172,20 @@ mod tests {
         d.reset();
         assert!(!d.mouse_has_data());
         assert!(!d.take_irq12_pending());
+    }
+
+    #[test]
+    fn pic2_slave_eoi_handling() {
+        let mut d = LegacyInterrupts::new();
+        // Simular que el slave tiene activas IRQ 8 e IRQ 12 (bits 0 y 4 en pic2_isr)
+        d.pic2_isr = (1 << 0) | (1 << 4);
+
+        // Non-specific EOI (0x20): limpia el bit más bajo activo en isr (bit 0)
+        d.write(PIC2_CMD, &[0x20]);
+        assert_eq!(d.pic2_isr, 1 << 4);
+
+        // Specific EOI (0x60 | irq_num): limpia específicamente el bit indicado (bit 4: 0x64)
+        d.write(PIC2_CMD, &[0x64]);
+        assert_eq!(d.pic2_isr, 0);
     }
 }

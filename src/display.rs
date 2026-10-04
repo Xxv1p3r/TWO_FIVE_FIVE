@@ -32,6 +32,21 @@ use std::thread;
 /// direcciona 256 KiB de VRAM (4 planos × 64 KiB).
 const VGA_ADDRABLE: usize = 256 * 1024;
 
+/// Calcula los deltas de movimiento (dx, dy) del ratón host adaptados al protocolo PS/2.
+///
+/// En el sistema de coordenadas de la ventana (minifb / host), el origen (0,0) está
+/// en la esquina superior izquierda y el eje Y crece hacia abajo (+Y = hacia abajo).
+/// En el protocolo de hardware del ratón PS/2, el eje Y sigue coordenadas cartesianas estándar:
+/// los valores positivos (+Y) indican movimiento hacia ARRIBA y los negativos (-Y) hacia ABAJO.
+/// Por tanto, dy se calcula como `(ly - my)` para que el movimiento hacia abajo en la ventana del
+/// host resulte en un delta negativo en PS/2 y el cursor del sistema operativo virtualizado se mueva hacia abajo.
+#[inline]
+pub fn compute_mouse_deltas(lx: f32, ly: f32, mx: f32, my: f32) -> (i16, i16) {
+    let dx = (mx - lx) as i16;
+    let dy = (ly - my) as i16;
+    (dx, dy)
+}
+
 pub struct DisplayManager {
     running: Arc<AtomicBool>,
 }
@@ -42,6 +57,9 @@ impl DisplayManager {
         guest_mem: Arc<GuestMemory>,
         kbd_queue: Arc<Mutex<VecDeque<u8>>>,
         mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>>,
+        tablet_queue: Arc<Mutex<VecDeque<(u16, u16, u8, i8)>>>,
+        resize_queue: Arc<Mutex<Option<(u32, u32)>>>,
+        metrics: Arc<crate::metrics::VmmMetrics>,
     ) -> Option<Self> {
         if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
             eprintln!("[DISPLAY] No se detectó servidor gráfico (DISPLAY/WAYLAND). Ejecutando en modo headless.");
@@ -52,21 +70,20 @@ impl DisplayManager {
         let running_clone = running.clone();
 
         thread::spawn(move || {
-            let initial_width = 640;
-            let initial_height = 400;
-            // (tarea 15) El buffer LÓGICO guarda el frame renderizado al
-            // tamaño nativo del modo; el buffer de ventana lo re-escala al
-            // tamaño actual de la ventana (resize sin distorsión).
+            let initial_width = 1024;
+            let initial_height = 768;
+            // El buffer LÓGICO guarda el frame renderizado al tamaño nativo del modo;
+            // el buffer de ventana lo re-escala suavemente sin pixelación.
             let mut render_buf: Vec<u32> = vec![0; initial_width * initial_height];
             let mut window_buf: Vec<u32> = vec![0; initial_width * initial_height];
 
             let mut window = match Window::new(
-                "mi-vmm — VGA Display",
+                "mi-vmm — Virtual Display",
                 initial_width,
                 initial_height,
                 WindowOptions {
                     resize: true,
-                    scale: minifb::Scale::X2,
+                    scale: minifb::Scale::X1,
                     ..WindowOptions::default()
                 },
             ) {
@@ -83,6 +100,10 @@ impl DisplayManager {
             let mem = guest_mem; // manija Arc<GuestMemory> movida al hilo
             let mut last_mouse: Option<(f32, f32)> = None;
             let mut last_buttons: u8 = 0;
+            let mut last_tablet: Option<(u16, u16, u8)> = None;
+            let mut last_window_size: Option<(usize, usize)> = None;
+            let mut last_size_change = std::time::Instant::now();
+            let mut size_pending = false;
 
             // ── Entrada de teclado (tarea 19) ─────────────────────────
             let caps_on = Arc::new(AtomicBool::new(false));
@@ -99,17 +120,28 @@ impl DisplayManager {
 
             // Teclas de control actualmente pulsadas → break al soltar.
             let mut held: HashMap<Key, Vec<u8>> = HashMap::new();
+            let mut logged_desktop = false;
+            let mut frame_count = 0u32;
+            let mut last_fps_time = std::time::Instant::now();
+            let mut last_mode = (false, false, false, 0usize, 0usize);
+            let mut preserve_aspect = true;
+            let mut current_viewport = (0usize, 0usize, initial_width, initial_height);
+            let mut scanline_hashes: Vec<u64> = Vec::new();
+            let mut last_text_hash = 0u64;
+            let mut last_planar_hash = 0u64;
+            let mut force_full_redraw = true;
 
             while running_clone.load(Ordering::Relaxed)
                 && window.is_open()
                 && !window.is_key_down(Key::Escape)
             {
                 // ── Snapshot del modo actual ────────────────────────
-                let (is_vbe, is_std_gfx, lw, lh, bpp, virt_w, x_off, y_off, dac8) = {
+                let (is_vbe, is_std_gfx, is_vbe_active, lw, lh, bpp, virt_w, x_off, y_off, dac8) = {
                     let st = vga_state.lock().unwrap();
                     let (w, h, b) = st.get_resolution();
                     let is_vbe = st.is_vbe_enabled();
                     let is_std_gfx = !is_vbe && st.is_standard_vga_graphics();
+                    let is_vbe_active = st.vbe_active;
                     let (lw, lh) = if is_vbe {
                         (w, h)
                     } else if is_std_gfx {
@@ -121,6 +153,7 @@ impl DisplayManager {
                     (
                         is_vbe,
                         is_std_gfx,
+                        is_vbe_active,
                         lw,
                         lh,
                         b,
@@ -131,15 +164,37 @@ impl DisplayManager {
                     )
                 };
 
+                metrics.display_width.store(lw as u32, Ordering::Relaxed);
+                metrics.display_height.store(lh as u32, Ordering::Relaxed);
+                metrics.display_bpp.store(bpp as u32, Ordering::Relaxed);
+                metrics.is_vbe.store(is_vbe, Ordering::Relaxed);
+
                 if render_buf.len() != lw * lh {
                     render_buf.resize(lw * lh, 0);
+                    force_full_redraw = true;
                 }
 
+                // Limpiar el buffer al cambiar de modo para evitar artefactos visuales
+                let current_mode = (is_vbe, is_std_gfx, is_vbe_active, lw, lh);
+                if current_mode != last_mode {
+                    render_buf.fill(0);
+                    scanline_hashes.clear();
+                    last_text_hash = 0;
+                    last_planar_hash = 0;
+                    force_full_redraw = true;
+                    last_mode = current_mode;
+                }
+
+                let mut is_dirty = false;
                 if is_vbe {
-                    // Modo gráfico VBE: leer directamente de VRAM
+                    // Modo gráfico VBE: leer directamente de VRAM con dirty tracking por scanline
                     let st = vga_state.lock().unwrap();
                     if !st.vram_ptr.is_null() {
-                        render_vbe_framebuffer(
+                        if scanline_hashes.len() != lh {
+                            scanline_hashes.resize(lh, 0);
+                            force_full_redraw = true;
+                        }
+                        is_dirty = render_vbe_framebuffer(
                             &mut render_buf,
                             st.vram_ptr,
                             st.vram_size,
@@ -151,30 +206,102 @@ impl DisplayManager {
                             y_off,
                             &st.dac_palette,
                             dac8,
+                            &mut scanline_hashes,
+                            force_full_redraw,
                         );
+                        let non_zeros = render_buf.iter().filter(|&&p| p != 0).count();
+                        if non_zeros > (lw * lh) / 100 && !logged_desktop {
+                            logged_desktop = true;
+                            let msg = format!(
+                                "[DISPLAY] ¡Escritorio gráfico detectado! {}x{}@{}bpp ({} píxeles activos)",
+                                lw, lh, bpp, non_zeros
+                            );
+                            crate::tui::log(&msg);
+                        }
                     }
                 } else if is_std_gfx {
                     // (tarea 2) Modo gráfico VGA estándar
                     let st = vga_state.lock().unwrap();
                     if !st.vram_ptr.is_null() {
-                        render_vga_graphics(&mut render_buf, &st, lw, lh);
+                        is_dirty = render_vga_graphics(&mut render_buf, &st, lw, lh, &mut last_planar_hash, force_full_redraw);
                     }
+                } else if is_vbe_active {
+                    // VBE activo pero temporalmente deshabilitado (transición de modo KMS / monitor blanking)
+                    render_buf.fill(0);
+                    is_dirty = true;
                 } else {
-                    // Modo texto VGA: renderizar buffer 80x25 desde 0xB8000
-                    render_vga_text_mode(&mut render_buf, &mem);
+                    // Modo texto VGA: renderizar buffer 80x25 desde 0xB8000 con dirty tracking
+                    is_dirty = render_vga_text_mode(&mut render_buf, &mem, &mut last_text_hash, force_full_redraw);
                 }
 
                 // ── (tarea 15) Escalar al tamaño actual de la ventana ──
                 let (ww, wh) = window.get_size();
-                let (ww, wh) = (ww.max(1), wh.max(1));
-                if window_buf.len() != ww * wh {
-                    window_buf.resize(ww * wh, 0);
-                }
-                scale_nearest(&mut window_buf, ww, wh, &render_buf, lw, lh);
+                let (ww, wh) = (ww.max(320), wh.max(200));
 
-                if let Err(e) = window.update_with_buffer(&window_buf, ww, wh) {
-                    eprintln!("[DISPLAY] Error de actualización de ventana: {}", e);
-                    break;
+                if last_window_size != Some((ww, wh)) {
+                    last_window_size = Some((ww, wh));
+                    last_size_change = std::time::Instant::now();
+                    size_pending = true;
+                    force_full_redraw = true;
+                }
+
+                // Debounce de 150 ms para evitar saturar Xorg/KMS mientras se arrastra la ventana
+                if size_pending && last_size_change.elapsed() >= std::time::Duration::from_millis(150) {
+                    size_pending = false;
+                    force_full_redraw = true;
+                    if let Ok(mut rq) = resize_queue.lock() {
+                        *rq = Some((ww as u32, wh as u32));
+                    }
+                }
+
+                // Alternar preservación de relación de aspecto con F11 (estilo VirtualBox)
+                if window.is_key_pressed(Key::F11, KeyRepeat::No) {
+                    preserve_aspect = !preserve_aspect;
+                    force_full_redraw = true;
+                    crate::tui::log(&format!(
+                        "[DISPLAY] Modo de visualización: {}",
+                        if preserve_aspect {
+                            "Preservar aspecto (Letterbox/Pillarbox)"
+                        } else {
+                            "Estirar a ventana completa (Stretch)"
+                        }
+                    ));
+                }
+
+                if is_dirty || force_full_redraw {
+                    let cur_scale = (ww as f32 / lw.max(1) as f32).round().max(1.0) as u32;
+                    metrics.display_scale.store(cur_scale, Ordering::Relaxed);
+                    if window_buf.len() != ww * wh {
+                        window_buf.resize(ww * wh, 0);
+                    }
+                    current_viewport = scale_framebuffer(
+                        &mut window_buf,
+                        ww,
+                        wh,
+                        &render_buf,
+                        lw,
+                        lh,
+                        preserve_aspect,
+                    );
+
+                    if let Err(e) = window.update_with_buffer(&window_buf, ww, wh) {
+                        let err_msg = format!("[DISPLAY] Error de actualización de ventana: {}", e);
+                        crate::tui::log(&err_msg);
+                        break;
+                    }
+                    force_full_redraw = false;
+                } else {
+                    window.update();
+                    thread::sleep(std::time::Duration::from_millis(16));
+                }
+
+                frame_count += 1;
+                let fps_elapsed = last_fps_time.elapsed();
+                if fps_elapsed >= std::time::Duration::from_millis(500) {
+                    let fps = (frame_count as f64 / fps_elapsed.as_secs_f64()).round() as u32;
+                    metrics.display_fps.store(fps, Ordering::Relaxed);
+                    frame_count = 0;
+                    last_fps_time = std::time::Instant::now();
                 }
 
                 // ── Entrada del host: make/break de teclas de control ──
@@ -268,14 +395,40 @@ impl DisplayManager {
                         let mut dx: i16 = 0;
                         let mut dy: i16 = 0;
                         if let Some((lx, ly)) = last_mouse {
-                            dx = (mx - lx) as i16;
-                            dy = (my - ly) as i16;
+                            let (cdx, cdy) = compute_mouse_deltas(lx, ly, mx, my);
+                            dx = cdx;
+                            dy = cdy;
                         }
                         last_mouse = Some((mx, my));
                         if dx != 0 || dy != 0 || buttons != last_buttons {
                             let mut q = mouse_queue.lock().unwrap();
                             q.push_back((dx, dy, buttons));
                             last_buttons = buttons;
+                        }
+
+                        // ── Tableta Gráfica USB: Coordenadas absolutas mapeadas al viewport del guest ──
+                        let (vp_x, vp_y, vp_w, vp_h) = current_viewport;
+                        let norm_x = if vp_w > 1 {
+                            (((mx - vp_x as f32) / (vp_w as f32 - 1.0)) * 32767.0).clamp(0.0, 32767.0) as u16
+                        } else {
+                            16384
+                        };
+                        let norm_y = if vp_h > 1 {
+                            (((my - vp_y as f32) / (vp_h as f32 - 1.0)) * 32767.0).clamp(0.0, 32767.0) as u16
+                        } else {
+                            16384
+                        };
+
+                        let wheel = if let Some((_sx, sy)) = window.get_scroll_wheel() {
+                            sy.clamp(-127.0, 127.0) as i8
+                        } else {
+                            0
+                        };
+
+                        if last_tablet != Some((norm_x, norm_y, buttons)) || wheel != 0 {
+                            last_tablet = Some((norm_x, norm_y, buttons));
+                            let mut tq = tablet_queue.lock().unwrap();
+                            tq.push_back((norm_x, norm_y, buttons, wheel));
                         }
                     }
                     None => {
@@ -293,7 +446,7 @@ impl DisplayManager {
                 }
             }
             running_clone.store(false, Ordering::Relaxed);
-            eprintln!("[DISPLAY] Ventana de visualización cerrada — apagando la VM...");
+            crate::tui::log("[DISPLAY] Ventana de visualización cerrada — apagando la VM...");
         });
 
         Some(Self { running })
@@ -305,8 +458,37 @@ impl DisplayManager {
     }
 }
 
+/// Hash ultra-rápido de 64 bits para detección de scanlines y regiones sucias (dirty tracking)
+/// Traducido conceptualmente de DevVGA.cpp de VirtualBox para evitar re-renderizados innecesarios.
+#[inline]
+pub fn fast_scanline_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let chunks = bytes.chunks_exact(8);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        let val = u64::from_ne_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3],
+            chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        hash = (hash ^ val).wrapping_mul(0x100000001b3);
+    }
+    if !remainder.is_empty() {
+        let mut last = [0u8; 8];
+        last[..remainder.len()].copy_from_slice(remainder);
+        let val = u64::from_ne_bytes(last);
+        hash = (hash ^ val).wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// Renderiza la memoria de texto VGA en 0xB8000 a un buffer RGB de 640x400.
-fn render_vga_text_mode(buffer: &mut [u32], mem: &GuestMemory) {
+/// Devuelve true si el contenido cambió respecto al último frame.
+fn render_vga_text_mode(
+    buffer: &mut [u32],
+    mem: &GuestMemory,
+    last_text_hash: &mut u64,
+    force_full: bool,
+) -> bool {
     const COLS: usize = 80;
     const ROWS: usize = 25;
     const CHAR_W: usize = 8;
@@ -317,12 +499,18 @@ fn render_vga_text_mode(buffer: &mut [u32], mem: &GuestMemory) {
 
     if mem.size() < TEXT_OFFSET + TEXT_SIZE {
         buffer.fill(0);
-        return;
+        return false;
     }
 
     // Copia acotada de la pantalla de texto (el guest la escribe en paralelo).
     let mut text = [0u8; TEXT_SIZE];
     let _ = mem.copy_from(TEXT_OFFSET, &mut text);
+    let hash = fast_scanline_hash(&text);
+
+    if !force_full && *last_text_hash == hash {
+        return false;
+    }
+    *last_text_hash = hash;
 
     for row in 0..ROWS {
         for col in 0..COLS {
@@ -351,6 +539,7 @@ fn render_vga_text_mode(buffer: &mut [u32], mem: &GuestMemory) {
             }
         }
     }
+    true
 }
 
 // ─── (tarea 2) Renderizado de modos gráficos VGA estándar ──────────
@@ -392,7 +581,14 @@ fn build_dac_lut(dac: &[u8; 768], eight_bit: bool) -> [u32; 256] {
 /// Renderiza un modo gráfico VGA estándar decodificando los registros
 /// reales del hardware emulado (Sequencer, Graphics Controller, Attribute
 /// Controller y DAC).
-fn render_vga_graphics(buffer: &mut [u32], st: &VgaState, width: usize, height: usize) {
+fn render_vga_graphics(
+    buffer: &mut [u32],
+    st: &VgaState,
+    width: usize,
+    height: usize,
+    last_planar_hash: &mut u64,
+    force_full: bool,
+) -> bool {
     let chain4 = st.seq_regs[0x04] & 0x08 != 0;
     let oe_seq = st.seq_regs[0x01] & 0x08 != 0;
     let g_mode = st.grc_regs[0x05] & 0x20 != 0;
@@ -421,11 +617,17 @@ fn render_vga_graphics(buffer: &mut [u32], st: &VgaState, width: usize, height: 
         AddrMode::Planar4
     } else {
         buffer.fill(0x000000);
-        return;
+        return false;
     };
 
     let vram = st.vram_ptr;
     let vram_size = st.vram_size;
+    let raw = unsafe { std::slice::from_raw_parts(vram, vram_size.min(VGA_ADDRABLE)) };
+    let hash = fast_scanline_hash(raw);
+    if !force_full && *last_planar_hash == hash {
+        return false;
+    }
+    *last_planar_hash = hash;
 
     for row in 0..height.min(1024) {
         for col in 0..width.min(2048) {
@@ -464,6 +666,7 @@ fn render_vga_graphics(buffer: &mut [u32], st: &VgaState, width: usize, height: 
             buffer[buf_idx] = color;
         }
     }
+    true
 }
 
 // ─── (tarea 15) VBE con VIRT_WIDTH / X_OFFSET / Y_OFFSET ───────────
@@ -481,9 +684,11 @@ fn render_vbe_framebuffer(
     y_offset: usize,
     dac: &[u8; 768],
     dac8: bool,
-) {
+    scanline_hashes: &mut [u64],
+    force_full: bool,
+) -> bool {
     if width == 0 || height == 0 || vram_size == 0 {
-        return;
+        return false;
     }
     let vw = if virt_width >= width { virt_width } else { width };
     let bytes_pp = match bpp {
@@ -493,7 +698,7 @@ fn render_vbe_framebuffer(
         8 | 4 => 1,
         _ => {
             buffer.fill(0);
-            return;
+            return false;
         }
     };
     let row_bytes = vw * bytes_pp;
@@ -503,14 +708,26 @@ fn render_vbe_framebuffer(
         row_bytes
     };
     let (xo, yo) = if x_offset + width <= vw { (x_offset, y_offset) } else { (0, y_offset) };
+    let mut any_dirty = false;
 
     match bpp {
         32 => {
             for y in 0..height {
                 let src_row = (yo + y) * row_bytes + xo * 4;
                 if src_row + width * 4 > vram_size {
+                    let start = y * width;
+                    let end = (start + width).min(buffer.len());
+                    buffer[start..end].fill(0);
                     continue;
                 }
+                let raw_line = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width * 4) };
+                let hash = fast_scanline_hash(raw_line);
+                if !force_full && scanline_hashes[y] == hash {
+                    continue;
+                }
+                scanline_hashes[y] = hash;
+                any_dirty = true;
+
                 let src_slice =
                     unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u32, width) };
                 for (x, &src) in src_slice.iter().enumerate() {
@@ -525,9 +742,20 @@ fn render_vbe_framebuffer(
             for y in 0..height {
                 let src_row = (yo + y) * row_bytes + xo * 3;
                 if src_row + width * 3 > vram_size {
+                    let start = y * width;
+                    let end = (start + width).min(buffer.len());
+                    buffer[start..end].fill(0);
                     continue;
                 }
-                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width * 3) };
+                let raw_line = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width * 3) };
+                let hash = fast_scanline_hash(raw_line);
+                if !force_full && scanline_hashes[y] == hash {
+                    continue;
+                }
+                scanline_hashes[y] = hash;
+                any_dirty = true;
+
+                let src = raw_line;
                 for x in 0..width {
                     let b = src[x * 3] as u32;
                     let g = src[x * 3 + 1] as u32;
@@ -540,8 +768,19 @@ fn render_vbe_framebuffer(
             for y in 0..height {
                 let src_row = (yo + y) * row_bytes + xo * 2;
                 if src_row + width * 2 > vram_size {
+                    let start = y * width;
+                    let end = (start + width).min(buffer.len());
+                    buffer[start..end].fill(0);
                     continue;
                 }
+                let raw_line = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width * 2) };
+                let hash = fast_scanline_hash(raw_line);
+                if !force_full && scanline_hashes[y] == hash {
+                    continue;
+                }
+                scanline_hashes[y] = hash;
+                any_dirty = true;
+
                 let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u16, width) };
                 for (x, &p) in src.iter().enumerate() {
                     let r = (((p >> 11) & 0x1F) * 255 / 31) as u32;
@@ -555,8 +794,19 @@ fn render_vbe_framebuffer(
             for y in 0..height {
                 let src_row = (yo + y) * row_bytes + xo * 2;
                 if src_row + width * 2 > vram_size {
+                    let start = y * width;
+                    let end = (start + width).min(buffer.len());
+                    buffer[start..end].fill(0);
                     continue;
                 }
+                let raw_line = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width * 2) };
+                let hash = fast_scanline_hash(raw_line);
+                if !force_full && scanline_hashes[y] == hash {
+                    continue;
+                }
+                scanline_hashes[y] = hash;
+                any_dirty = true;
+
                 let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u16, width) };
                 for (x, &p) in src.iter().enumerate() {
                     let r = (((p >> 10) & 0x1F) * 255 / 31) as u32;
@@ -571,9 +821,20 @@ fn render_vbe_framebuffer(
             for y in 0..height {
                 let src_row = (yo + y) * row_bytes + xo;
                 if src_row + width > vram_size {
+                    let start = y * width;
+                    let end = (start + width).min(buffer.len());
+                    buffer[start..end].fill(0);
                     continue;
                 }
-                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width) };
+                let raw_line = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), width) };
+                let hash = fast_scanline_hash(raw_line);
+                if !force_full && scanline_hashes[y] == hash {
+                    continue;
+                }
+                scanline_hashes[y] = hash;
+                any_dirty = true;
+
+                let src = raw_line;
                 for (x, &idx) in src.iter().enumerate() {
                     buffer[y * width + x] = lut[idx as usize];
                 }
@@ -584,9 +845,20 @@ fn render_vbe_framebuffer(
             for y in 0..height {
                 let src_row = (yo + y) * row_bytes + xo / 2;
                 if src_row + (width + 1) / 2 > vram_size {
+                    let start = y * width;
+                    let end = (start + width).min(buffer.len());
+                    buffer[start..end].fill(0);
                     continue;
                 }
-                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), (width + 1) / 2) };
+                let raw_line = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row), (width + 1) / 2) };
+                let hash = fast_scanline_hash(raw_line);
+                if !force_full && scanline_hashes[y] == hash {
+                    continue;
+                }
+                scanline_hashes[y] = hash;
+                any_dirty = true;
+
+                let src = raw_line;
                 for (x, &byte) in src.iter().enumerate() {
                     let px = y * width + x * 2;
                     buffer[px] = lut[(byte >> 4) as usize];
@@ -600,11 +872,12 @@ fn render_vbe_framebuffer(
             buffer.fill(0);
         }
     }
+    any_dirty
 }
 
-/// (tarea 15) Escalado nearest-neighbor del framebuffer lógico al tamaño
-/// actual de la ventana. `dst` debe ser exactamente dw*dh píxeles.
-fn scale_nearest(dst: &mut [u32], dw: usize, dh: usize, src: &[u32], sw: usize, sh: usize) {
+/// Escalado bilineal de alta velocidad en espacio de color RGB (8:8:8:8).
+/// Elimina el efecto pixelado/pixelation suavizando los bordes mediante interpolación 2D.
+pub fn scale_bilinear(dst: &mut [u32], dw: usize, dh: usize, src: &[u32], sw: usize, sh: usize) {
     if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
         dst.fill(0);
         return;
@@ -613,14 +886,155 @@ fn scale_nearest(dst: &mut [u32], dw: usize, dh: usize, src: &[u32], sw: usize, 
         dst.copy_from_slice(src);
         return;
     }
+
+    let x_ratio = if dw > 1 { (((sw - 1) as u32) << 16) / ((dw - 1) as u32) } else { 0 };
+    let y_ratio = if dh > 1 { (((sh - 1) as u32) << 16) / ((dh - 1) as u32) } else { 0 };
+
     for y in 0..dh {
-        let sy = y * sh / dh;
-        let src_row = &src[sy * sw..(sy + 1) * sw];
+        let sy = ((y as u32 * y_ratio) >> 16) as usize;
+        let y_diff = ((y as u32 * y_ratio) & 0xFFFF) as u32;
+        let y_diff_inv = 65536 - y_diff;
+
+        let sy_next = (sy + 1).min(sh - 1);
+        let row0 = &src[sy * sw..(sy + 1) * sw];
+        let row1 = &src[sy_next * sw..(sy_next + 1) * sw];
         let dst_row = &mut dst[y * dw..(y + 1) * dw];
+
         for (x, px) in dst_row.iter_mut().enumerate() {
-            *px = src_row[x * sw / dw];
+            let sx = ((x as u32 * x_ratio) >> 16) as usize;
+            let x_diff = ((x as u32 * x_ratio) & 0xFFFF) as u32;
+            let x_diff_inv = 65536 - x_diff;
+            let sx_next = (sx + 1).min(sw - 1);
+
+            let a = row0[sx];
+            let b = row0[sx_next];
+            let c = row1[sx];
+            let d = row1[sx_next];
+
+            let w00 = ((x_diff_inv as u64) * (y_diff_inv as u64)) >> 16;
+            let w01 = ((x_diff as u64) * (y_diff_inv as u64)) >> 16;
+            let w10 = ((x_diff_inv as u64) * (y_diff as u64)) >> 16;
+            let w11 = ((x_diff as u64) * (y_diff as u64)) >> 16;
+
+            let blue = ((a & 0xFF) as u64 * w00
+                + (b & 0xFF) as u64 * w01
+                + (c & 0xFF) as u64 * w10
+                + (d & 0xFF) as u64 * w11) >> 16;
+
+            let green = (((a >> 8) & 0xFF) as u64 * w00
+                + ((b >> 8) & 0xFF) as u64 * w01
+                + ((c >> 8) & 0xFF) as u64 * w10
+                + ((d >> 8) & 0xFF) as u64 * w11) >> 16;
+
+            let red = (((a >> 16) & 0xFF) as u64 * w00
+                + ((b >> 16) & 0xFF) as u64 * w01
+                + ((c >> 16) & 0xFF) as u64 * w10
+                + ((d >> 16) & 0xFF) as u64 * w11) >> 16;
+
+            let alpha = (((a >> 24) & 0xFF) as u64 * w00
+                + ((b >> 24) & 0xFF) as u64 * w01
+                + ((c >> 24) & 0xFF) as u64 * w10
+                + ((d >> 24) & 0xFF) as u64 * w11) >> 16;
+
+            *px = ((alpha as u32) << 24) | ((red as u32) << 16) | ((green as u32) << 8) | (blue as u32);
         }
     }
+}
+
+/// Escalado del framebuffer lógico al tamaño de ventana con opción de preservación
+/// de relación de aspecto y centrado con bandas negras (VirtualBox letterbox/pillarbox).
+///
+/// Devuelve la tupla `(vp_x, vp_y, vp_w, vp_h)` que delimita el viewport efectivo en `dst`.
+pub fn scale_framebuffer(
+    dst: &mut [u32],
+    dw: usize,
+    dh: usize,
+    src: &[u32],
+    sw: usize,
+    sh: usize,
+    preserve_aspect: bool,
+) -> (usize, usize, usize, usize) {
+    if dw == 0 || dh == 0 || sw == 0 || sh == 0 || dst.len() != dw * dh || src.len() != sw * sh {
+        dst.fill(0);
+        return (0, 0, dw, dh);
+    }
+
+    if dw == sw && dh == sh {
+        dst.copy_from_slice(src);
+        return (0, 0, dw, dh);
+    }
+
+    if !preserve_aspect {
+        scale_bilinear(dst, dw, dh, src, sw, sh);
+        return (0, 0, dw, dh);
+    }
+
+    let scale_x = dw as f32 / sw as f32;
+    let scale_y = dh as f32 / sh as f32;
+    let scale = scale_x.min(scale_y);
+
+    let vp_w = ((sw as f32 * scale).round() as usize).clamp(1, dw);
+    let vp_h = ((sh as f32 * scale).round() as usize).clamp(1, dh);
+    let vp_x = (dw - vp_w) / 2;
+    let vp_y = (dh - vp_h) / 2;
+
+    dst.fill(0);
+
+    let x_ratio = if vp_w > 1 { (((sw - 1) as u32) << 16) / ((vp_w - 1) as u32) } else { 0 };
+    let y_ratio = if vp_h > 1 { (((sh - 1) as u32) << 16) / ((vp_h - 1) as u32) } else { 0 };
+
+    for y in 0..vp_h {
+        let sy = ((y as u32 * y_ratio) >> 16) as usize;
+        let y_diff = ((y as u32 * y_ratio) & 0xFFFF) as u32;
+        let y_diff_inv = 65536 - y_diff;
+
+        let sy_next = (sy + 1).min(sh - 1);
+        let row0 = &src[sy * sw..(sy + 1) * sw];
+        let row1 = &src[sy_next * sw..(sy_next + 1) * sw];
+        let dst_row_start = (vp_y + y) * dw + vp_x;
+        let dst_row = &mut dst[dst_row_start..dst_row_start + vp_w];
+
+        for (x, px) in dst_row.iter_mut().enumerate() {
+            let sx = ((x as u32 * x_ratio) >> 16) as usize;
+            let x_diff = ((x as u32 * x_ratio) & 0xFFFF) as u32;
+            let x_diff_inv = 65536 - x_diff;
+            let sx_next = (sx + 1).min(sw - 1);
+
+            let a = row0[sx];
+            let b = row0[sx_next];
+            let c = row1[sx];
+            let d = row1[sx_next];
+
+            let w00 = ((x_diff_inv as u64) * (y_diff_inv as u64)) >> 16;
+            let w01 = ((x_diff as u64) * (y_diff_inv as u64)) >> 16;
+            let w10 = ((x_diff_inv as u64) * (y_diff as u64)) >> 16;
+            let w11 = ((x_diff as u64) * (y_diff as u64)) >> 16;
+
+            let blue = ((a & 0xFF) as u64 * w00
+                + (b & 0xFF) as u64 * w01
+                + (c & 0xFF) as u64 * w10
+                + (d & 0xFF) as u64 * w11) >> 16;
+
+            let green = (((a >> 8) & 0xFF) as u64 * w00
+                + ((b >> 8) & 0xFF) as u64 * w01
+                + ((c >> 8) & 0xFF) as u64 * w10
+                + ((d >> 8) & 0xFF) as u64 * w11) >> 16;
+
+            let red = (((a >> 16) & 0xFF) as u64 * w00
+                + ((b >> 16) & 0xFF) as u64 * w01
+                + ((c >> 16) & 0xFF) as u64 * w10
+                + ((d >> 16) & 0xFF) as u64 * w11) >> 16;
+
+            let alpha = (((a >> 24) & 0xFF) as u64 * w00
+                + ((b >> 24) & 0xFF) as u64 * w01
+                + ((c >> 24) & 0xFF) as u64 * w10
+                + ((d >> 24) & 0xFF) as u64 * w11) >> 16;
+
+            *px = ((alpha as u32) << 24) | ((red as u32) << 16) | ((green as u32) << 8) | (blue as u32);
+        }
+    }
+
+    (vp_x, vp_y, vp_w, vp_h)
 }
 
 // ─── Entrada de teclado host → PS/2 (Set 1) ───────────────────────
@@ -1078,6 +1492,163 @@ mod tests {
     fn no_soportado_devuelve_none() {
         assert_eq!(seq('🚀', false), None);
         assert_eq!(seq('±', false), None);
+    }
+
+    #[test]
+    fn mouse_delta_y_inversion() {
+        // Mover hacia abajo en la ventana (my > ly):
+        // ly = 100.0, my = 120.0
+        // En PS/2, el movimiento hacia abajo debe tener delta Y negativo (-20)
+        let (dx, dy) = compute_mouse_deltas(50.0, 100.0, 50.0, 120.0);
+        assert_eq!(dx, 0);
+        assert_eq!(dy, -20);
+
+        // Mover hacia arriba en la ventana (my < ly):
+        // ly = 100.0, my = 80.0
+        // En PS/2, el movimiento hacia arriba debe tener delta Y positivo (+20)
+        let (dx, dy) = compute_mouse_deltas(50.0, 100.0, 50.0, 80.0);
+        assert_eq!(dx, 0);
+        assert_eq!(dy, 20);
+
+        // Mover hacia la derecha (mx > lx): dx positivo
+        let (dx, dy) = compute_mouse_deltas(50.0, 100.0, 75.0, 100.0);
+        assert_eq!(dx, 25);
+        assert_eq!(dy, 0);
+
+        // Mover hacia la izquierda (mx < lx): dx negativo
+        let (dx, dy) = compute_mouse_deltas(50.0, 100.0, 30.0, 100.0);
+        assert_eq!(dx, -20);
+        assert_eq!(dy, 0);
+    }
+
+    #[test]
+    fn test_scale_framebuffer_identity() {
+        let src = vec![0xFF00FF00; 640 * 480];
+        let mut dst = vec![0; 640 * 480];
+        let (vx, vy, vw, vh) = scale_framebuffer(&mut dst, 640, 480, &src, 640, 480, true);
+        assert_eq!((vx, vy, vw, vh), (0, 0, 640, 480));
+        assert_eq!(dst[0], 0xFF00FF00);
+        assert_eq!(dst[640 * 480 - 1], 0xFF00FF00);
+    }
+
+    #[test]
+    fn test_scale_framebuffer_pillarbox() {
+        // Fuente 4x4 (1:1), destino 8x4 (2:1) -> bandas negras a izquierda y derecha
+        let src = vec![0xFFFFFFFF; 16];
+        let mut dst = vec![0; 32];
+        let (vx, vy, vw, vh) = scale_framebuffer(&mut dst, 8, 4, &src, 4, 4, true);
+        assert_eq!((vx, vy, vw, vh), (2, 0, 4, 4));
+        // Bandas negras a la izquierda (x=0,1) y derecha (x=6,7)
+        assert_eq!(dst[0], 0);
+        assert_eq!(dst[1], 0);
+        assert_eq!(dst[2], 0xFFFFFFFF);
+        assert_eq!(dst[5], 0xFFFFFFFF);
+        assert_eq!(dst[6], 0);
+        assert_eq!(dst[7], 0);
+    }
+
+    #[test]
+    fn test_scale_framebuffer_letterbox() {
+        // Fuente 4x4 (1:1), destino 4x8 (1:2) -> bandas negras arriba y abajo
+        let src = vec![0xFFFFFFFF; 16];
+        let mut dst = vec![0; 32];
+        let (vx, vy, vw, vh) = scale_framebuffer(&mut dst, 4, 8, &src, 4, 4, true);
+        assert_eq!((vx, vy, vw, vh), (0, 2, 4, 4));
+        // Bandas negras arriba (filas 0,1) y abajo (filas 6,7)
+        assert_eq!(dst[0], 0);
+        assert_eq!(dst[7], 0);
+        assert_eq!(dst[8], 0xFFFFFFFF);
+        assert_eq!(dst[23], 0xFFFFFFFF);
+        assert_eq!(dst[24], 0);
+        assert_eq!(dst[31], 0);
+    }
+
+    #[test]
+    fn test_scale_framebuffer_stretch() {
+        // Desactivando preservación de aspecto: estirar a toda la ventana
+        let src = vec![0xFFFFFFFF; 16];
+        let mut dst = vec![0; 32];
+        let (vx, vy, vw, vh) = scale_framebuffer(&mut dst, 8, 4, &src, 4, 4, false);
+        assert_eq!((vx, vy, vw, vh), (0, 0, 8, 4));
+        assert!(dst.iter().all(|&p| p == 0xFFFFFFFF));
+    }
+
+    #[test]
+    fn test_fast_scanline_hash_consistency() {
+        let line1 = vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let line2 = vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let line3 = vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF1];
+
+        assert_eq!(fast_scanline_hash(&line1), fast_scanline_hash(&line2));
+        assert_ne!(fast_scanline_hash(&line1), fast_scanline_hash(&line3));
+    }
+
+    #[test]
+    fn test_dirty_scanline_tracking() {
+        let width = 64;
+        let height = 8;
+        let bpp = 32;
+        let vram_size = width * height * 4;
+        let mut vram = vec![0u8; vram_size];
+        let mut buffer = vec![0u32; width * height];
+        let mut scanline_hashes = vec![0u64; height];
+        let dac = [0u8; 768];
+
+        // Primer pase: todo está sucio porque scanline_hashes está a cero y vram tiene datos
+        vram[0] = 0xAA;
+        let dirty1 = render_vbe_framebuffer(
+            &mut buffer,
+            vram.as_ptr(),
+            vram_size,
+            width,
+            height,
+            bpp,
+            width,
+            0,
+            0,
+            &dac,
+            false,
+            &mut scanline_hashes,
+            false,
+        );
+        assert!(dirty1, "Primer pase debe detectar scanlines sucias");
+
+        // Segundo pase con VRAM idéntica: debe reportar limpio (false)
+        let dirty2 = render_vbe_framebuffer(
+            &mut buffer,
+            vram.as_ptr(),
+            vram_size,
+            width,
+            height,
+            bpp,
+            width,
+            0,
+            0,
+            &dac,
+            false,
+            &mut scanline_hashes,
+            false,
+        );
+        assert!(!dirty2, "Segundo pase sin cambios en VRAM debe ser limpio (dirty = false)");
+
+        // Modificar una sola línea en VRAM: línea 3 (offset 3 * width * 4)
+        vram[3 * width * 4] = 0xFF;
+        let dirty3 = render_vbe_framebuffer(
+            &mut buffer,
+            vram.as_ptr(),
+            vram_size,
+            width,
+            height,
+            bpp,
+            width,
+            0,
+            0,
+            &dac,
+            false,
+            &mut scanline_hashes,
+            false,
+        );
+        assert!(dirty3, "Modificar una scanline debe marcar dirty = true");
     }
 }
 

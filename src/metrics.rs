@@ -6,7 +6,7 @@
 //! - Inyecciones de interrupciones (IRQ0, IRQ1, IRQ4, IRQ12).
 //! - Formateo estructurado para salida periódica y TUI en consola.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct VmmMetrics {
@@ -28,6 +28,34 @@ pub struct VmmMetrics {
 
     // Interrupciones inyectadas por línea (0-15)
     pub irq_counts: [AtomicU64; 16],
+
+    // Telemetría por vCPU (soporta hasta 16 vCPUs)
+    pub vcpu_exits: [AtomicU64; 16],
+    pub vcpu_active_nanos: [AtomicU64; 16],
+    pub vcpu_usage_pct: [AtomicU32; 16],
+    pub num_cpus: AtomicU32,
+    pub max_cpus: AtomicU32,
+
+    // Memoria
+    pub ram_bytes: AtomicU64,
+    pub high_mem_bytes: AtomicU64,
+
+    // Almacenamiento
+    pub cdrom_sectors_read: AtomicU64,
+    pub disk_sectors_read: AtomicU64,
+    pub disk_sectors_written: AtomicU64,
+
+    // Estado de VM
+    pub is_paused: AtomicBool,
+
+    // Pantalla / Resolución
+    pub display_width: AtomicU32,
+    pub display_height: AtomicU32,
+    pub display_bpp: AtomicU32,
+    pub display_fps: AtomicU32,
+    pub display_scale: AtomicU32,
+    pub is_vbe: AtomicBool,
+    pub lfb_gpa: AtomicU64,
 }
 
 impl Default for VmmMetrics {
@@ -54,7 +82,8 @@ impl VmmMetrics {
             Err(_) => unreachable!(),
         };
 
-        const INIT_ZERO: AtomicU64 = AtomicU64::new(0);
+        const INIT_ZERO_64: AtomicU64 = AtomicU64::new(0);
+        const INIT_ZERO_32: AtomicU32 = AtomicU32::new(0);
         Self {
             exits_total: AtomicU64::new(0),
             exits_io_in: AtomicU64::new(0),
@@ -69,7 +98,25 @@ impl VmmMetrics {
             exits_other: AtomicU64::new(0),
             port_in_counts: boxed_in,
             port_out_counts: boxed_out,
-            irq_counts: [INIT_ZERO; 16],
+            irq_counts: [INIT_ZERO_64; 16],
+            vcpu_exits: [INIT_ZERO_64; 16],
+            vcpu_active_nanos: [INIT_ZERO_64; 16],
+            vcpu_usage_pct: [INIT_ZERO_32; 16],
+            num_cpus: AtomicU32::new(1),
+            max_cpus: AtomicU32::new(8),
+            ram_bytes: AtomicU64::new(0),
+            high_mem_bytes: AtomicU64::new(0),
+            cdrom_sectors_read: AtomicU64::new(0),
+            disk_sectors_read: AtomicU64::new(0),
+            disk_sectors_written: AtomicU64::new(0),
+            is_paused: AtomicBool::new(false),
+            display_width: AtomicU32::new(640),
+            display_height: AtomicU32::new(480),
+            display_bpp: AtomicU32::new(32),
+            display_fps: AtomicU32::new(60),
+            display_scale: AtomicU32::new(2),
+            is_vbe: AtomicBool::new(false),
+            lfb_gpa: AtomicU64::new(0),
         }
     }
 
@@ -140,6 +187,42 @@ impl VmmMetrics {
         if (line as usize) < self.irq_counts.len() {
             self.irq_counts[line as usize].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[inline]
+    pub fn record_vcpu_exit(&self, cpu_id: usize) {
+        if cpu_id < self.vcpu_exits.len() {
+            self.vcpu_exits[cpu_id].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_vcpu_active(&self, cpu_id: usize, nanos: u64) {
+        if cpu_id < self.vcpu_active_nanos.len() {
+            self.vcpu_active_nanos[cpu_id].fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn set_vcpu_usage(&self, cpu_id: usize, pct: u32) {
+        if cpu_id < self.vcpu_usage_pct.len() {
+            self.vcpu_usage_pct[cpu_id].store(pct.min(100), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_cdrom_read(&self, sectors: u64) {
+        self.cdrom_sectors_read.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_disk_read(&self, sectors: u64) {
+        self.disk_sectors_read.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_disk_write(&self, sectors: u64) {
+        self.disk_sectors_written.fetch_add(sectors, Ordering::Relaxed);
     }
 
     /// Obtiene los N puertos I/O con mayor tráfico acumulado (IN + OUT).

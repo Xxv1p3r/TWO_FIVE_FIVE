@@ -11,6 +11,10 @@ pub mod pic_pit;
 pub mod vga;
 pub mod font;
 pub mod usb_uhci;
+pub mod usb_tablet;
+pub mod virtio_serial;
+pub mod virtio_net;
+pub mod bmdma;
 // Librería de helpers INT 13h (AH=41h/42h/08h/02h): se consume desde sus
 // tests y queda lista para un futuro dispatch directo del VMM, de ahí que
 // el binario no la use todavía (mismo criterio que los helpers de vga.rs).
@@ -18,12 +22,20 @@ pub mod usb_uhci;
 pub mod bios_int13h;
 pub mod pflash;
 pub mod cpu_hotplug;
+pub mod ahci;
+pub mod vmmdev;
+pub mod ac97;
 
+use bmdma::BmdmaController;
 use fw_cfg::FwCfg;
 use pic_pit::LegacyInterrupts;
-use legacy::{A20Gate, AcpiPm, ApmSmiDevice, CmosRtc, DebugCon, FloppyStub, PlatformStubs, PostCode};
+use legacy::{A20Gate, AcpiPm, ApmSmiDevice, CmosRtc, DebugCon, FloppyStub, I8237Dma, PlatformStubs, PostCode};
 use vga::VgaDevice;
 use usb_uhci::UsbUhci;
+use virtio_serial::{VirtioSerialDevice, VirtioSerialState};
+use virtio_net::{VirtioNetDevice, VirtioNetState};
+use vmmdev::{VmmDevDevice, VmmDevState};
+use ac97::{Ac97Device, Ac97State};
 use cpu_hotplug::CpuHotplugController;
 use pflash::ParallelFlash;
 
@@ -93,6 +105,10 @@ pub struct DeviceBus {
     pub cdrom: Option<cdrom::CdRom>,
     pub pci: pci::PciBus,
     pub usb: UsbUhci,
+    pub virtio_serial: VirtioSerialDevice,
+    pub virtio_serial_state: std::sync::Arc<std::sync::Mutex<VirtioSerialState>>,
+    pub virtio_net: VirtioNetDevice,
+    pub virtio_net_state: std::sync::Arc<std::sync::Mutex<VirtioNetState>>,
     pub debugcon: DebugCon,
     pub post: PostCode,
     pub cmos: CmosRtc,
@@ -103,9 +119,17 @@ pub struct DeviceBus {
     pub vga: VgaDevice,
     pub floppy: FloppyStub,
     pub platform: PlatformStubs,
+    pub dma: I8237Dma,
     pub apm: ApmSmiDevice,
     pub cpu_hotplug: CpuHotplugController,
     pub pflash: Option<ParallelFlash>,
+    pub bmdma: BmdmaController,
+    pub ahci: ahci::AhciController,
+    pub vmmdev: VmmDevDevice,
+    pub vmmdev_state: std::sync::Arc<std::sync::Mutex<VmmDevState>>,
+    pub ac97: Ac97Device,
+    pub ac97_state: std::sync::Arc<std::sync::Mutex<Ac97State>>,
+    pub guest_mem: Option<std::sync::Arc<crate::guest_mem::GuestMemory>>,
     // (tarea 1) Ventana de high RAM de KVM (slot 2): necesaria para
     // re-apuntar el framebuffer cuando el guest asigna el BAR0 VGA dentro
     // de RAM respaldada (esos accesos no generan exits MMIO).
@@ -151,13 +175,26 @@ impl DeviceBus {
         };
         let (vga_device, vga_state) = VgaDevice::new(vram_ptr, vram_size);
         let usb = UsbUhci::new();
+        let virtio_serial_state = std::sync::Arc::new(std::sync::Mutex::new(VirtioSerialState::new()));
+        let virtio_serial = VirtioSerialDevice::new(virtio_serial_state.clone());
+        let virtio_net_state = std::sync::Arc::new(std::sync::Mutex::new(VirtioNetState::new()));
+        let virtio_net = VirtioNetDevice::new(virtio_net_state.clone());
         let mut pci = pci::PciBus::with_legacy_ide();
         pci.connect_usb(usb.state.clone());
+        pci.connect_virtio_serial(virtio_serial_state.clone());
+        pci.connect_virtio_net(virtio_net_state.clone());
+        let vmmdev_state = std::sync::Arc::new(std::sync::Mutex::new(VmmDevState::new()));
+        let vmmdev = VmmDevDevice::new(vmmdev_state.clone());
+        pci.connect_vmmdev(vmmdev_state.clone());
+        let ac97_state = std::sync::Arc::new(std::sync::Mutex::new(Ac97State::new()));
+        let ac97 = Ac97Device::new(ac97_state.clone());
+        pci.connect_ac97(ac97_state.clone());
         // Tablas ACPI (RSDP/RSDT/FADT/DSDT/MADT/FACS) expuestas por fw_cfg
         // con el interface estándar de QEMU: SeaBIOS las instala en RAM y el
         // guest (Linux) encuentra el RSDP en FSEG → apagado limpio vía _S5.
         let acpi_files = acpi::build_acpi_files(num_cpus);
         let cpu_hotplug = CpuHotplugController::new(num_cpus, 16);
+        let ahci = ahci::AhciController::with_files(disk_path, iso_path);
         Ok((
             Self {
                 uart: uart::Uart16550::new(),
@@ -165,6 +202,10 @@ impl DeviceBus {
                 cdrom,
                 pci,
                 usb,
+                virtio_serial,
+                virtio_serial_state,
+                virtio_net,
+                virtio_net_state,
                 debugcon: DebugCon::new(),
                 post: PostCode::new(),
                 cmos: CmosRtc::with_ram_size(ram_size),
@@ -175,9 +216,17 @@ impl DeviceBus {
                 vga: vga_device,
                 floppy: FloppyStub::new(),
                 platform: PlatformStubs::new(),
+                dma: I8237Dma::new(),
                 apm: ApmSmiDevice::new(),
                 cpu_hotplug,
                 pflash: None,
+                bmdma: BmdmaController::new(),
+                ahci,
+                vmmdev,
+                vmmdev_state,
+                ac97,
+                ac97_state,
+                guest_mem: None,
                 high_mem_ptr,
                 high_mem_gpa,
                 high_mem_size,
@@ -185,6 +234,11 @@ impl DeviceBus {
             },
             vga_state,
         ))
+    }
+
+    /// Asigna la memoria física del guest para transferencias DMA y diagnósticos
+    pub fn set_guest_mem(&mut self, mem: std::sync::Arc<crate::guest_mem::GuestMemory>) {
+        self.guest_mem = Some(mem);
     }
 
     /// Reset de todo el hardware emulado (equivalente a un power-on reset
@@ -198,7 +252,13 @@ impl DeviceBus {
             cd.reset();
         }
         self.pci.reset();
+        self.bmdma.reset();
+        self.ahci.reset();
+        self.vmmdev_state.lock().unwrap().reset();
+        self.ac97_state.lock().unwrap().reset();
         self.usb.reset();
+        self.virtio_serial_state.lock().unwrap().reset();
+        self.virtio_net_state.lock().unwrap().reset();
         self.debugcon.reset();
         self.post.reset();
         self.cmos.reset();
@@ -209,13 +269,14 @@ impl DeviceBus {
         self.vga.reset();
         self.floppy.reset();
         self.platform.reset();
+        self.dma.reset();
         self.apm.reset();
         self.cpu_hotplug.reset(1);
         if let Some(pf) = self.pflash.as_mut() {
             pf.mode = pflash::PFlashMode::ReadArray;
             pf.status = pflash::ParallelFlash::STATUS_READY;
         }
-        eprintln!("[VMM] Dispositivos reiniciados (UART, IDE/ATAPI, PCI, USB, PIT/PIC/PS2, VGA, CMOS, ACPI, APM, CPU-Hotplug...)");
+        eprintln!("[VMM] Dispositivos reiniciados (UART, IDE/ATAPI, PCI, USB, VirtIO-Serial, VirtIO-Net, VMMDev, AC'97, DMA, PIT/PIC/PS2, VGA, CMOS, ACPI, APM, CPU-Hotplug...)");
     }
 
     /// Despacha un OUT del guest. Devuelve true si algún dispositivo lo manejó.
@@ -228,8 +289,19 @@ impl DeviceBus {
         if let Some(cd) = self.cdrom.as_mut() {
             if cd.matches_port(port) {
                 cd.write(port, data);
+                if let Some(ref mem) = self.guest_mem {
+                    self.bmdma.execute_secondary_dma(cd, mem);
+                }
                 return true;
             }
+        }
+        if self.vmmdev.matches_port(port) {
+            self.vmmdev.write(port, data, self.guest_mem.as_deref());
+            return true;
+        }
+        if self.ac97.matches_port(port) {
+            self.ac97.write(port, data, self.guest_mem.as_deref());
+            return true;
         }
         io_dispatch_out!(self, port, data;
             debugcon,
@@ -253,12 +325,49 @@ impl DeviceBus {
                 if let Some(base) = self.pci.last_vga_mmio_bar_write.take() {
                     self.apply_vga_bar_assignment(base, false);
                 }
+                if let Some(base) = self.pci.last_ide_bmdma_bar_write.take() {
+                    self.bmdma.set_iobase(base);
+                }
+                if let Some(base) = self.pci.last_ahci_bar_write.take() {
+                    self.ahci.bar5 = base;
+                }
+                if let Some(base) = self.pci.last_vmmdev_io_bar_write.take() {
+                    self.vmmdev.set_iobase(base);
+                }
+                if let Some(base) = self.pci.last_vmmdev_mmio_bar_write.take() {
+                    self.vmmdev.set_mmio_base(base);
+                }
+                if let Some(base) = self.pci.last_ac97_nam_bar_write.take() {
+                    self.ac97.set_nambar(base);
+                }
+                if let Some(base) = self.pci.last_ac97_nabm_bar_write.take() {
+                    self.ac97.set_nabmbar(base);
+                }
             },
+            bmdma => {
+                if let Some(ref mem) = self.guest_mem {
+                    self.bmdma.execute_primary_dma(&mut self.primary_ide, mem);
+                    if let Some(ref mut cd) = self.cdrom {
+                        self.bmdma.execute_secondary_dma(cd, mem);
+                    }
+                }
+            },
+            dma,
             legacy_irq,
-            primary_ide,
+            primary_ide => {
+                if let Some(ref mem) = self.guest_mem {
+                    self.bmdma.execute_primary_dma(&mut self.primary_ide, mem);
+                }
+            },
             floppy,
             vga,
             usb,
+            virtio_serial,
+            virtio_net => {
+                if let Some(mem) = self.guest_mem.clone() {
+                    self.step_virtio_net(&mem);
+                }
+            },
             platform,
             apm,
             cpu_hotplug,
@@ -302,6 +411,14 @@ impl DeviceBus {
         if self.vga.mmio_write(addr, data) {
             return;
         }
+        if self.ahci.bar5 != 0 && addr >= self.ahci.bar5 as u64 && addr < (self.ahci.bar5 as u64) + 0x1000 {
+            let off = addr - self.ahci.bar5 as u64;
+            self.ahci.write(off, data, self.guest_mem.as_deref());
+            return;
+        }
+        if self.vmmdev.mmio_write(addr, data) {
+            return;
+        }
         if let Some(pf) = self.pflash.as_mut() {
             let flash_offset = addr.saturating_sub(0xFFC0_0000);
             if flash_offset < pf.data.len() as u64 {
@@ -322,6 +439,13 @@ impl DeviceBus {
     /// Devuelve exactamente `size` bytes (0xFF si nadie atiende la dirección).
     pub fn mmio_read(&mut self, addr: u64, size: usize) -> Vec<u8> {
         if let Some(bytes) = self.vga.mmio_read(addr, size) {
+            return bytes;
+        }
+        if self.ahci.bar5 != 0 && addr >= self.ahci.bar5 as u64 && addr < (self.ahci.bar5 as u64) + 0x1000 {
+            let off = addr - self.ahci.bar5 as u64;
+            return self.ahci.read(off, size);
+        }
+        if let Some(bytes) = self.vmmdev.mmio_read(addr, size) {
             return bytes;
         }
         if let Some(pf) = self.pflash.as_ref() {
@@ -349,6 +473,12 @@ impl DeviceBus {
                 return Some(cd.read(port, count));
             }
         }
+        if self.vmmdev.matches_port(port) {
+            return Some(self.vmmdev.read(port, count));
+        }
+        if self.ac97.matches_port(port) {
+            return Some(self.ac97.read(port, count));
+        }
         io_dispatch_in!(self, port, count;
             debugcon,
             post,
@@ -358,11 +488,15 @@ impl DeviceBus {
             fw_cfg,
             uart,
             pci,
+            bmdma,
+            dma,
             legacy_irq,
             primary_ide,
             floppy,
             vga,
             usb,
+            virtio_serial,
+            virtio_net,
             platform,
             apm,
             cpu_hotplug,
@@ -445,9 +579,179 @@ impl DeviceBus {
         self.uart.irq_pending()
     }
 
+    /// Comprueba si hay interrupciones pendientes de los canales IDE:
+    /// devuelve (irq14_primary, irq15_secondary).
+    pub fn take_ide_irq(&mut self) -> (bool, bool) {
+        let irq14 = self.primary_ide.take_irq();
+        let irq15 = self.cdrom.as_mut().map(|c| c.take_irq()).unwrap_or(false);
+        (irq14, irq15)
+    }
+
+    /// Nivel actual de interrupción pendiente en los canales IDE.
+    pub fn ide_irq_pending(&self) -> bool {
+        self.primary_ide.irq_pending || self.cdrom.as_ref().map(|c| c.irq_pending()).unwrap_or(false)
+    }
+
+    // ─── USB UHCI & Tablet ──────────────────────────────────────────
+
+    /// Ejecuta un tick del scheduler UHCI (Frame List, QHs y TDs).
+    pub fn step_usb(&mut self, mem: &crate::guest_mem::GuestMemory) {
+        self.usb.step(mem);
+    }
+
+    /// Comprueba si la línea de interrupción del USB UHCI está activa.
+    pub fn is_usb_irq_asserted(&self) -> bool {
+        self.usb.is_irq_asserted()
+    }
+
+    /// Extrae el flag de pulso de interrupción fresca del USB UHCI.
+    pub fn take_usb_irq_pulse(&mut self) -> bool {
+        self.usb.take_irq_pulse()
+    }
+
+    /// Devuelve la línea IRQ asignada al USB UHCI en el bus PCI (dev 1:2).
+    pub fn usb_irq_line(&self) -> u8 {
+        self.pci.usb_irq_line()
+    }
+
+    /// Inyecta un evento en la tableta USB (X, Y en 0..32767, botones, rueda).
+    pub fn inject_tablet_event(&mut self, x: u16, y: u16, buttons: u8, wheel: i8) {
+        self.usb.inject_tablet_event(x, y, buttons, wheel);
+    }
+
+    // ─── VirtIO Serial & SPICE Dynamic Resolution ───────────────────
+
+    /// Avanza las virtqueues del VirtIO-Serial y despacha mensajes de resolución.
+    pub fn step_virtio_serial(&mut self, mem: &crate::guest_mem::GuestMemory) {
+        self.virtio_serial_state.lock().unwrap().step(mem);
+    }
+
+    /// Extrae el flag de pulso de interrupción de VirtIO-Serial.
+    pub fn take_virtio_serial_irq_pulse(&mut self) -> bool {
+        self.virtio_serial_state.lock().unwrap().take_irq_pulse()
+    }
+
+    /// Devuelve la línea IRQ asignada a VirtIO-Serial (dev 3:0).
+    pub fn virtio_serial_irq_line(&self) -> u8 {
+        self.pci.virtio_serial_irq_line()
+    }
+
+    /// Comprueba si la línea de interrupción de VirtIO-Serial está activa.
+    pub fn is_virtio_serial_irq_asserted(&self) -> bool {
+        self.virtio_serial_state.lock().unwrap().isr_status != 0
+    }
+
+    /// Solicita un cambio de resolución dinámica a VirtIO-Serial.
+    pub fn request_resolution(&mut self, width: u32, height: u32) {
+        self.virtio_serial_state.lock().unwrap().request_resolution(width, height);
+    }
+
+    // ─── VirtIO-Net & Red Integrada (Slirp / Modo Usuario / TAP) ────
+
+    /// Avanza las virtqueues del VirtIO-Net (procesa TX y despacha tramas RX pendientes).
+    pub fn step_virtio_net(&mut self, mem: &crate::guest_mem::GuestMemory) {
+        self.virtio_net_state.lock().unwrap().step(mem);
+    }
+
+    /// Extrae el flag de pulso de interrupción de VirtIO-Net.
+    pub fn take_virtio_net_irq_pulse(&mut self) -> bool {
+        self.virtio_net_state.lock().unwrap().take_irq_pulse()
+    }
+
+    /// Comprueba si la línea de interrupción de VirtIO-Net está activa.
+    pub fn is_virtio_net_irq_asserted(&self) -> bool {
+        self.virtio_net_state.lock().unwrap().isr_status != 0
+    }
+
+    /// Devuelve la línea IRQ asignada a VirtIO-Net en el bus PCI (dev 4:0).
+    pub fn virtio_net_irq_line(&self) -> u8 {
+        self.pci.virtio_net_irq_line()
+    }
+
+    // ─── SATA AHCI Controller (dev 5:0) ─────────────────────────────
+
+    /// Devuelve la línea IRQ asignada al AHCI en el bus PCI (dev 5:0).
+    pub fn ahci_irq_line(&self) -> u8 {
+        self.pci.ahci_irq_line()
+    }
+
+    /// Comprueba si la línea de interrupción del AHCI está activa.
+    pub fn is_ahci_irq_asserted(&self) -> bool {
+        self.ahci.is_irq_asserted()
+    }
+
+    // ─── VirtualBox VMMDev (dev 6:0) ─────────────────────────────────
+
+    /// Devuelve la línea IRQ asignada al VMMDev en el bus PCI (dev 6:0).
+    pub fn vmmdev_irq_line(&self) -> u8 {
+        self.pci.vmmdev_irq_line()
+    }
+
+    /// Comprueba si la línea de interrupción del VMMDev está activa.
+    pub fn is_vmmdev_irq_asserted(&self) -> bool {
+        self.vmmdev_state.lock().unwrap().irq_asserted
+    }
+
+    // ─── Intel 82801AA AC'97 Audio (dev 7:0) ─────────────────────────
+
+    /// Devuelve la línea IRQ asignada al AC'97 en el bus PCI (dev 7:0).
+    pub fn ac97_irq_line(&self) -> u8 {
+        self.pci.ac97_irq_line()
+    }
+
+    /// Comprueba si la línea de interrupción del AC'97 está activa.
+    pub fn is_ac97_irq_asserted(&self) -> bool {
+        self.ac97_state.lock().unwrap().irq_asserted
+    }
+
     /// True si el guest pidió apagado limpio vía ACPI: escribió SLP_EN en
     /// PM1a_CNT (0x604) tras evaluar _S5. El VMM lo consulta para salir.
     pub fn acpi_sleep_requested(&self) -> bool {
         self.acpi_pm.sleep_requested()
+    }
+
+    /// Expulsa el CD-ROM en caliente.
+    pub fn eject_cdrom(&mut self) {
+        if let Some(cd) = self.cdrom.as_mut() {
+            cd.eject();
+        }
+    }
+
+    /// Inserta una nueva imagen ISO en caliente.
+    pub fn insert_cdrom(&mut self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
+        if let Some(cd) = self.cdrom.as_mut() {
+            cd.insert(path)
+        } else {
+            let cd = cdrom::CdRom::new(path)?;
+            let size = cd.iso_size;
+            self.cdrom = Some(cd);
+            Ok(size)
+        }
+    }
+
+    pub fn is_cdrom_inserted(&self) -> bool {
+        self.cdrom.as_ref().map(|c| c.is_inserted()).unwrap_or(false)
+    }
+
+    pub fn cdrom_sectors_read(&self) -> u64 {
+        self.cdrom.as_ref().map(|c| c.sectors_read_total).unwrap_or(0)
+    }
+
+    pub fn disk_sectors_read(&self) -> u64 {
+        self.primary_ide.sectors_read_total
+    }
+
+    pub fn disk_sectors_written(&self) -> u64 {
+        self.primary_ide.sectors_written_total
+    }
+
+    /// Dispara el evento del botón de encendido ACPI (PWRBTN).
+    pub fn trigger_power_button(&mut self) -> bool {
+        self.acpi_pm.trigger_power_button()
+    }
+
+    /// Conecta un vCPU en caliente vía el controlador ACPI.
+    pub fn plug_cpu(&mut self, cpu_id: u32) -> Result<bool, &'static str> {
+        self.cpu_hotplug.plug_cpu(cpu_id)
     }
 }

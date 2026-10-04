@@ -58,6 +58,10 @@ find_bios() {
 
     # Common SeaBIOS paths
     local candidates=(
+        "$SCRIPT_DIR/bios/bios-256k.bin"
+        "$SCRIPT_DIR/bios-256k.bin"
+        "bios/bios-256k.bin"
+        "bios-256k.bin"
         "/usr/share/seabios/bios-256k.bin"
         "/usr/share/seabios/bios-128k.bin"
         "/usr/share/qemu/bios-256k.bin"
@@ -153,19 +157,44 @@ BIOS=""
 ISO=""
 DISK=""
 
-if [ -n "$ARG1" ]; then
-    if [[ "$ARG1" == *.bin ]] || [[ "$ARG1" == *.fd ]] || [[ "$ARG1" == *seabios* ]] || [[ "$ARG1" == *ovmf* ]]; then
-        BIOS=$(find_bios "$ARG1")
-        ISO=$(find_iso "$ARG2")
-        DISK="$ARG3"
-    else
-        BIOS=$(find_bios "")
-        ISO=$(find_iso "$ARG1")
-        DISK="$ARG2"
+# Categorizar los argumentos pasados (BIOS, ISO o DISK)
+for arg in "$ARG1" "$ARG2" "$ARG3"; do
+    [ -z "$arg" ] && continue
+    if [ -z "$BIOS" ] && ([[ "$arg" == *.bin ]] || [[ "$arg" == *.fd ]] || [[ "$arg" == *seabios* ]] || [[ "$arg" == *ovmf* ]]); then
+        BIOS=$(find_bios "$arg")
+    elif [ -z "$DISK" ] && ([[ "$arg" == *.img ]] || [[ "$arg" == *.raw ]] || [[ "$arg" == *.vdi ]] || [[ "$arg" == *.qcow2 ]]); then
+        [ -f "$arg" ] || error "Disco no encontrado: $arg"
+        DISK="$arg"
+    elif [ -z "$ISO" ]; then
+        candidate_iso=$(find_iso "$arg" 2>/dev/null || true)
+        if [ -n "$candidate_iso" ] && [ -f "$candidate_iso" ]; then
+            ISO="$candidate_iso"
+        elif [ -f "$arg" ]; then
+            DISK="$arg"
+        fi
     fi
-else
+done
+
+if [ -z "$BIOS" ]; then
     BIOS=$(find_bios "")
+fi
+
+# Si no se pasó ni ISO ni DISK, buscar ISO disponible
+if [ -z "$DISK" ] && [ -z "$ISO" ]; then
     ISO=$(find_iso "")
+fi
+
+# Si hay una ISO pero no hay disco asignado, asegurar que exista un disco virtual (disk.img)
+# para que el instalador de la VM siempre tenga un disco donde instalarse
+if [ -n "$ISO" ] && [ -z "$DISK" ]; then
+    if [ -f "$SCRIPT_DIR/disk.img" ]; then
+        DISK="$SCRIPT_DIR/disk.img"
+        info "Disco duro virtual detectado: $DISK"
+    else
+        info "Creando disco duro virtual sparse de 20 GB (disk.img, ocupa 0 MB reales)..."
+        truncate -s 20G "$SCRIPT_DIR/disk.img"
+        DISK="$SCRIPT_DIR/disk.img"
+    fi
 fi
 
 echo ""
@@ -173,7 +202,7 @@ info "BIOS: $BIOS"
 if [ -n "$ISO" ]; then
     info "ISO:  $ISO"
 else
-    warn "Sin ISO — VM arrancará sin medio booteable"
+    info "ISO:  (ninguna — arrancando directamente desde disco duro)"
 fi
 if [ -n "$DISK" ]; then
     [ -f "$DISK" ] || error "Disco no encontrado: $DISK"

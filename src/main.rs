@@ -5,6 +5,7 @@ mod display;
 mod guest_mem;
 mod metrics;
 mod snapshot;
+pub mod tui;
 
 use devices::DeviceBus;
 use guest_mem::GuestMemory;
@@ -18,7 +19,8 @@ use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-const GUEST_MEM_SIZE: usize = 2048 * 1024 * 1024;
+#[allow(dead_code)]
+const GUEST_MEM_SIZE: usize = 4096 * 1024 * 1024;
 const RESET_VECTOR_CS: u64 = 0xF000;
 const RESET_VECTOR_RIP: u64 = 0xFFF0;
 /// Máximo de reboots provocados por crashes del guest (triple fault o
@@ -62,6 +64,8 @@ fn usage() -> ! {
 
 fn find_default_bios() -> Option<PathBuf> {
     let candidates = [
+        "bios/bios-256k.bin",
+        "bios-256k.bin",
         "/usr/share/seabios/bios-256k.bin",
         "/usr/share/seabios/bios-128k.bin",
         "/usr/share/qemu/bios-256k.bin",
@@ -72,6 +76,17 @@ fn find_default_bios() -> Option<PathBuf> {
         let p = Path::new(c);
         if p.is_file() {
             return Some(p.to_path_buf());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let root = exe_dir.join("../..");
+            for c in &candidates {
+                let p = root.join(c);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
         }
     }
     None
@@ -163,13 +178,44 @@ fn auto_detect_iso() -> Option<PathBuf> {
     None
 }
 
+fn is_bios_file(p: &str) -> bool {
+    let s = p.to_lowercase();
+    s.ends_with(".bin") || s.ends_with(".fd") || s.ends_with(".rom") || s.contains("seabios") || s.contains("ovmf")
+}
+
+fn is_disk_file(p: &str) -> bool {
+    let s = p.to_lowercase();
+    s.ends_with(".img") || s.ends_with(".raw") || s.ends_with(".vdi") || s.ends_with(".qcow2")
+}
+
+fn auto_detect_disk() -> Option<PathBuf> {
+    for name in &["disk.img", "hdd.img", "rootfs.img", "vm_disk.img"] {
+        let p = Path::new(name);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let root = exe_dir.join("../..");
+            for name in &["disk.img", "hdd.img", "rootfs.img", "vm_disk.img"] {
+                let p = root.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Set by SIGTERM/SIGINT handler; checked in the vCPU loop to dump state and exit.
-static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// TID del hilo BSP (el principal). Lo usa el hilo de display para despertar
 /// al BSP con tgkill cuando se cierra la ventana (tarea 17): una señal de
 /// proceso podría caer en un hilo AP y nadie procesaría el cierre.
-static BSP_TID: AtomicI32 = AtomicI32::new(0);
+pub static BSP_TID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -299,7 +345,20 @@ fn init_bios_data_area(guest_mem: &mut [u8]) {
 /// (ICR→INIT-SIPI) ni enrutar INTx (IOREDTBL). Estas ventanas se recortan
 /// al registrar high_mem, y los antiguos "stubs falsos" se eliminaron:
 /// eran exactamente lo que pisaba al irqchip real.
+#[cfg(test)]
 const KERNEL_IRQCHIP_HOLES: [(u64, u64); 2] = [
+    (0xFEC0_0000, 0x1000), // IOAPIC: página de 4 KiB
+    (0xFEE0_0000, 0x1000), // LAPIC: página de 4 KiB (APIC base por defecto)
+];
+
+/// Ventana PCI MMIO no respaldada por RAM para que los accesos a BARs MMIO
+/// (como el BAR2 de VGA en 0xFE01F000) generen exits MMIO a userspace en vez
+/// de ser resueltos silenciosamente como memoria física en RAM por la EPT.
+pub const PCI_MMIO_HOLE_START: u64 = 0xFE00_0000;
+pub const PCI_MMIO_HOLE_SIZE: u64 = 0x00C0_0000; // 12 MiB hasta 0xFEC0_0000 (IOAPIC)
+
+pub const HIGH_MEM_HOLES: [(u64, u64); 3] = [
+    (PCI_MMIO_HOLE_START, PCI_MMIO_HOLE_SIZE),
     (0xFEC0_0000, 0x1000), // IOAPIC: página de 4 KiB
     (0xFEE0_0000, 0x1000), // LAPIC: página de 4 KiB (APIC base por defecto)
 ];
@@ -379,6 +438,8 @@ fn pit_timer_thread(
     guest_mem: Arc<GuestMemory>,
     kbd_queue: Arc<Mutex<VecDeque<u8>>>,
     mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>>,
+    tablet_queue: Arc<Mutex<VecDeque<(u16, u16, u8, i8)>>>,
+    resize_queue: Arc<Mutex<Option<(u32, u32)>>>,
     irq0_raised: Arc<AtomicBool>,
     bda_tick_count: Arc<AtomicU32>,
 ) {
@@ -459,10 +520,101 @@ fn pit_timer_thread(
                 }
             }
         }
+        // Tableta Gráfica USB: inyección de coordenadas absolutas (0..32767)
+        if let Ok(mut q) = tablet_queue.try_lock() {
+            if !q.is_empty() {
+                let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                while let Some((x, y, buttons, wheel)) = q.pop_front() {
+                    b.inject_tablet_event(x, y, buttons, wheel);
+                }
+            }
+        }
+        // Solicitud de cambio de resolución dinámica desde la ventana host
+        if let Ok(mut rq) = resize_queue.try_lock() {
+            if let Some((w, h)) = rq.take() {
+                bus.lock().unwrap_or_else(|p| p.into_inner()).request_resolution(w, h);
+            }
+        }
+        // USB UHCI: avanzar el scheduler de DMA cada 1 ms (Frame List, QHs, TDs)
+        {
+            let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            b.step_usb(&guest_mem);
+            let irq = b.usb_irq_line() as u32;
+            if b.take_usb_irq_pulse() {
+                vm.set_irq_line(irq, false).ok();
+                vm.set_irq_line(irq, true).ok();
+            } else if !b.is_usb_irq_asserted() {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // VirtIO-Serial: procesar virtqueues y mensajes de control/display SPICE
+        {
+            let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            b.step_virtio_serial(&guest_mem);
+            let irq = b.virtio_serial_irq_line() as u32;
+            if b.take_virtio_serial_irq_pulse() {
+                vm.set_irq_line(irq, false).ok();
+                vm.set_irq_line(irq, true).ok();
+            } else if !b.is_virtio_serial_irq_asserted() {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // VirtIO-Net: procesar virtqueues RX/TX y red integrada
+        {
+            let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            b.step_virtio_net(&guest_mem);
+            let irq = b.virtio_net_irq_line() as u32;
+            if b.take_virtio_net_irq_pulse() {
+                vm.set_irq_line(irq, false).ok();
+                vm.set_irq_line(irq, true).ok();
+            } else if !b.is_virtio_net_irq_asserted() {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // SATA AHCI: sincronizar línea de interrupción
+        {
+            let b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            let irq = b.ahci_irq_line() as u32;
+            if b.is_ahci_irq_asserted() {
+                vm.set_irq_line(irq, true).ok();
+            } else {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // VirtualBox VMMDev: sincronizar línea de interrupción (dev 6:0)
+        {
+            let b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            let irq = b.vmmdev_irq_line() as u32;
+            if b.is_vmmdev_irq_asserted() {
+                vm.set_irq_line(irq, true).ok();
+            } else {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // Intel 82801AA AC'97 Audio: sincronizar línea de interrupción (dev 7:0)
+        {
+            let b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            let irq = b.ac97_irq_line() as u32;
+            if b.is_ac97_irq_asserted() {
+                vm.set_irq_line(irq, true).ok();
+            } else {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
         // UART 16550 (IRQ4): RX/THRE pendientes también con el guest parado.
         if bus.lock().unwrap_or_else(|p| p.into_inner()).take_uart_irq() {
             vm.set_irq_line(4, false).ok();
             vm.set_irq_line(4, true).ok();
+        }
+        // IDE (IRQ14/IRQ15): transferencias completadas pendientes de notificación
+        let (ide14, ide15) = bus.lock().unwrap_or_else(|p| p.into_inner()).take_ide_irq();
+        if ide14 {
+            vm.set_irq_line(14, false).ok();
+            vm.set_irq_line(14, true).ok();
+        }
+        if ide15 {
+            vm.set_irq_line(15, false).ok();
+            vm.set_irq_line(15, true).ok();
         }
 
         // Dormir hasta ahora + 1 ms. clock_nanosleep absoluto: si una señal
@@ -533,6 +685,11 @@ fn reset_vcpu_to_post(
     vm.set_irq_line(1, false).ok();
     // IRQ4 del UART 16550 (COM1) también limpia en cada reset.
     vm.set_irq_line(4, false).ok();
+    // IRQ14 (IDE primario) e IRQ15 (IDE secundario / ATAPI)
+    vm.set_irq_line(14, false).ok();
+    vm.set_irq_line(15, false).ok();
+    // IRQ11 (USB UHCI PIIX3)
+    vm.set_irq_line(11, false).ok();
 }
 
 /// Reserva una región de memoria anónima alineada a página y la pone a cero.
@@ -579,39 +736,42 @@ fn main() {
     BSP_TID.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, Ordering::Relaxed);
 
     let args: Vec<String> = std::env::args().collect();
-    let (bios_path_buf, mut iso_path_buf, disk_path_buf) = if args.len() < 2 {
+    let positional_args: Vec<String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).cloned().collect();
+
+    let (bios_path_buf, mut iso_path_buf, disk_path_buf) = if positional_args.is_empty() {
         let bios = find_default_bios().unwrap_or_else(|| {
             eprintln!("[VMM] ERROR: No se especificó BIOS ni se encontró SeaBIOS en rutas estándar.");
             usage();
         });
         let iso = auto_detect_iso();
-        (bios, iso, None)
+        let disk = auto_detect_disk();
+        (bios, iso, disk)
     } else {
-        let arg1 = &args[1];
-        let arg1_is_iso = arg1.to_lowercase().ends_with(".iso")
-            || (!arg1.to_lowercase().ends_with(".bin")
-                && !arg1.to_lowercase().ends_with(".fd")
-                && !arg1.to_lowercase().ends_with(".rom")
-                && resolve_iso_file(arg1).is_some());
+        let mut bios = None;
+        let mut iso = None;
+        let mut disk = None;
 
-        if arg1_is_iso {
-            let bios = find_default_bios().unwrap_or_else(|| {
-                eprintln!("[VMM] ERROR: No se encontró SeaBIOS para arrancar la ISO.");
-                usage();
-            });
-            let iso = resolve_iso_file(arg1).or_else(|| Some(PathBuf::from(arg1)));
-            let disk = args.get(2).map(PathBuf::from);
-            (bios, iso, disk)
-        } else {
-            let bios = PathBuf::from(arg1);
-            let iso = if let Some(arg2) = args.get(2) {
-                resolve_iso_file(arg2).or_else(|| Some(PathBuf::from(arg2)))
-            } else {
-                auto_detect_iso()
-            };
-            let disk = args.get(3).map(PathBuf::from);
-            (bios, iso, disk)
+        for arg in &positional_args {
+            if bios.is_none() && is_bios_file(arg) {
+                bios = Some(PathBuf::from(arg));
+            } else if iso.is_none() && (arg.to_lowercase().ends_with(".iso") || resolve_iso_file(arg).is_some()) {
+                iso = resolve_iso_file(arg).or_else(|| Some(PathBuf::from(arg)));
+            } else if disk.is_none() && (is_disk_file(arg) || Path::new(arg).is_file()) {
+                disk = Some(PathBuf::from(arg));
+            }
         }
+
+        let bios = bios.unwrap_or_else(|| {
+            find_default_bios().unwrap_or_else(|| {
+                eprintln!("[VMM] ERROR: No se encontró SeaBIOS para arrancar la VM.");
+                usage();
+            })
+        });
+
+        // Si se especificó una ISO pero ningún disco, conectar el disco por defecto si existe
+        let disk = disk.or_else(auto_detect_disk);
+
+        (bios, iso, disk)
     };
 
     if args.iter().any(|a| a == "--no-iso" || a == "--no-cdrom") {
@@ -641,8 +801,8 @@ fn main() {
     let num_cpus: u32 = std::env::var("MI_VMM_CPUS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(2)
-        .clamp(1, 8);
+        .unwrap_or(4)
+        .clamp(1, 16);
 
     let kvm = Kvm::new().expect("No se pudo abrir /dev/kvm");
     // vm se comparte con el hilo pit-timer (tarea 16): kvm-ioctls 0.14 no
@@ -652,18 +812,50 @@ fn main() {
     let vm = Arc::new(kvm.create_vm().expect("create_vm falló"));
     vm.create_irq_chip().expect("create_irq_chip falló");
 
-    // ─── RAM principal: 256 MiB ────────────────────────────────
-    let guest_mem = mmap_zeroed_region(GUEST_MEM_SIZE);
+    // ─── RAM principal: 4096 MiB (con split para hueco PCI a 3.5GB) ────────
+    let ram_mb: usize = std::env::var("MI_VMM_RAM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096)
+        .max(256);
+    let guest_mem_size = ram_mb * 1024 * 1024;
+
+    let guest_mem = mmap_zeroed_region(guest_mem_size);
     // Manija compartida con bounds-check (tarea 18): display, DebugCon y el
     // hilo de temporización la reciben en vez de punteros `*const u8` crudos.
     let guest_mem_handle: Arc<GuestMemory> =
         GuestMemory::arc(guest_mem.as_mut_ptr(), guest_mem.len());
+
+    const RAM_BELOW_4G_LIMIT: u64 = 0xE000_0000;
+    let ram_below_4g = (guest_mem_size as u64).min(RAM_BELOW_4G_LIMIT);
     unsafe {
         vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
-            slot: 0, guest_phys_addr: 0,
-            memory_size: guest_mem.len() as u64,
-            userspace_addr: guest_mem_handle.as_mut_ptr() as u64, flags: 0,
-        }).expect("set_user_memory_region falló");
+            slot: 0,
+            guest_phys_addr: 0,
+            memory_size: ram_below_4g,
+            userspace_addr: guest_mem_handle.as_mut_ptr() as u64,
+            flags: 0,
+        })
+        .expect("set_user_memory_region (RAM baja) falló");
+    }
+
+    if (guest_mem_size as u64) > ram_below_4g {
+        let ram_above_4g = (guest_mem_size as u64) - ram_below_4g;
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 1,
+                guest_phys_addr: 0x1_0000_0000,
+                memory_size: ram_above_4g,
+                userspace_addr: guest_mem_handle.as_mut_ptr() as u64 + ram_below_4g,
+                flags: 0,
+            })
+            .expect("set_user_memory_region (RAM alta >4GB) falló");
+        }
+        eprintln!(
+            "[VMM] RAM dividida: {} MiB baja (<3.5GB) + {} MiB alta (>4GB)",
+            ram_below_4g / (1024 * 1024),
+            ram_above_4g / (1024 * 1024)
+        );
     }
 
     // ─── High memory: 512 MiB desde 0xE0000000 ─────────────────
@@ -676,7 +868,7 @@ fn main() {
     const HIGH_MEM_ADDR: u64 = 0xE000_0000u64;
     let high_mem = mmap_zeroed_region(HIGH_MEM_SIZE);
     for (i, (start, end)) in
-        carve_reserved_holes(HIGH_MEM_ADDR, HIGH_MEM_SIZE as u64, &KERNEL_IRQCHIP_HOLES)
+        carve_reserved_holes(HIGH_MEM_ADDR, HIGH_MEM_SIZE as u64, &HIGH_MEM_HOLES)
             .into_iter()
             .enumerate()
     {
@@ -693,7 +885,7 @@ fn main() {
         }
     }
     eprintln!(
-        "[VMM] irqchip en kernel: LAPIC@0xFEE00000 e IOAPIC@0xFEC00000 reservados al kernel (sin memslot de RAM)"
+        "[VMM] Huecos reservados en high_mem: PCI MMIO@0xFE000000 (12MB), LAPIC@0xFEE00000 e IOAPIC@0xFEC00000 (sin memslot de RAM)"
     );
 
     // ─── VRAM: 16 MiB en GPA 0xE8000000 (offset 128MB de high_mem) ───
@@ -702,6 +894,8 @@ fn main() {
 
     // ─── Buscar VGA Option ROM para fw_cfg y C0000 ─────────────
     let vga_candidates = [
+        "bios/vgabios-stdvga.bin",
+        "vgabios-stdvga.bin",
         "/usr/share/seabios/vgabios-stdvga.bin",
         "/usr/share/seabios/vgabios-bochs-display.bin",
         "/usr/share/qemu/vgabios-stdvga.bin",
@@ -710,10 +904,21 @@ fn main() {
     ];
     let mut vga_rom_data: Option<Vec<u8>> = None;
     for vga_path in &vga_candidates {
-        if let Ok(mut f) = File::open(vga_path) {
+        let mut path_to_try = PathBuf::from(vga_path);
+        if !path_to_try.is_file() {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    let root_candidate = exe_dir.join("../..").join(vga_path);
+                    if root_candidate.is_file() {
+                        path_to_try = root_candidate;
+                    }
+                }
+            }
+        }
+        if let Ok(mut f) = File::open(&path_to_try) {
             let mut vga_rom = Vec::new();
             if f.read_to_end(&mut vga_rom).is_ok() {
-                eprintln!("[VMM] VGA Option ROM encontrado en {} ({} bytes)", vga_path, vga_rom.len());
+                eprintln!("[VMM] VGA Option ROM encontrado en {} ({} bytes)", path_to_try.display(), vga_rom.len());
                 vga_rom_data = Some(vga_rom);
                 break;
             }
@@ -725,7 +930,7 @@ fn main() {
         disk_path,
         vram_ptr,
         VRAM_SIZE,
-        GUEST_MEM_SIZE as u64,
+        guest_mem_size as u64,
         num_cpus,
         high_mem.as_mut_ptr(),
         HIGH_MEM_ADDR,
@@ -740,6 +945,8 @@ fn main() {
     };
     // Connect DebugCon to guest memory for VGA text mirroring
     bus.debugcon.set_guest_mem(guest_mem_handle.clone());
+    // Connect DeviceBus to guest memory for Bus Master DMA (BMDMA)
+    bus.set_guest_mem(guest_mem_handle.clone());
     if !bus.debugcon.mirror_enabled() {
         eprintln!("[VMM] Espejo BIOS→0xB8000 desactivado (MI_VMM_MIRROR_BIOS=1 para activarlo)");
     }
@@ -895,6 +1102,10 @@ fn main() {
     // aparcar, el AP ejecutaría el vector de reset y duplicaría el BIOS.
     // ─── Métricas y profiling de VM-Exits (Item 24) ────────────
     let metrics = Arc::new(metrics::VmmMetrics::new());
+    metrics.ram_bytes.store(guest_mem_size as u64, Ordering::Relaxed);
+    metrics.high_mem_bytes.store(HIGH_MEM_SIZE as u64, Ordering::Relaxed);
+    metrics.num_cpus.store(num_cpus, Ordering::Relaxed);
+    metrics.max_cpus.store(16, Ordering::Relaxed);
 
     // Cargar snapshot previo si se solicitó (Item 24)
     if let Ok(snap_path) = std::env::var("MI_VMM_SNAPSHOT_LOAD") {
@@ -942,13 +1153,17 @@ fn main() {
     let kbd_queue: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
     // Cola del ratón host: (dx, dy, botones PS/2) desde la ventana minifb.
     let mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Cola de la tableta gráfica USB: (x, y, botones, rueda) coordenadas absolutas (0..32767).
+    let tablet_queue: Arc<Mutex<VecDeque<(u16, u16, u8, i8)>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Solicitud de cambio de resolución dinámica desde la ventana minifb
+    let resize_queue: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
     
-    // Inyección de ENTER (tarea 3): acelera el arranque de ISOLINUX/menu.c32 a los 3s, 5s y 7s
+    // Inyección de ENTER (tarea 3): acelera el arranque de ISOLINUX/menu.c32 a los 3s, 5s, 7s, 9s y 11s
     // para tests y modo headless; desactivable con MI_VMM_AUTO_ENTER=0.
     if std::env::var("MI_VMM_AUTO_ENTER").map(|v| v != "0").unwrap_or(true) {
         let auto_enter_kbd = Arc::clone(&kbd_queue);
         std::thread::spawn(move || {
-            for wait_secs in [3, 2, 2] {
+            for wait_secs in [3, 2, 2, 2, 2] {
                 std::thread::sleep(std::time::Duration::from_secs(wait_secs));
                 if let Ok(mut q) = auto_enter_kbd.lock() {
                     q.push_back(0x1C);
@@ -959,11 +1174,36 @@ fn main() {
     }
 
     let _display = display::DisplayManager::start(
-        vga_state,
+        vga_state.clone(),
         guest_mem_handle.clone(),
         kbd_queue.clone(),
         mouse_queue.clone(),
+        tablet_queue.clone(),
+        resize_queue.clone(),
+        Arc::clone(&metrics),
     );
+
+    // ─── Dashboard TUI interactivo ─────────────────────────────
+    let force_tui = args.iter().any(|a| a == "--tui") || std::env::var("MI_VMM_TUI").is_ok();
+    let no_tui = args.iter().any(|a| a == "--no-tui") || std::env::var("MI_VMM_NO_TUI").is_ok();
+    let is_interactive = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0 };
+    let use_tui = (force_tui || (!no_tui && is_interactive)) && std::env::var("MI_VMM_SERIAL_IN").is_err();
+
+    let tui_running = Arc::new(AtomicBool::new(true));
+    let tui_handle = if use_tui {
+        let iso_name = iso_path.and_then(|p| Path::new(p).file_name()).map(|n| n.to_string_lossy().to_string());
+        let disk_name = disk_path.and_then(|p| Path::new(p).file_name()).map(|n| n.to_string_lossy().to_string());
+        tui::start_tui(
+            Arc::clone(&metrics),
+            vga_state.clone(),
+            Arc::clone(&bus),
+            iso_name,
+            disk_name,
+            Arc::clone(&tui_running),
+        )
+    } else {
+        None
+    };
 
     // ─── Hilo de temporización (tarea 16) ──────────────────────
     // Sustituye al setitimer(1ms)+SIGALRM: avanza el PIT, pulsa IRQ0,
@@ -977,6 +1217,8 @@ fn main() {
             let bus_t = Arc::clone(&bus);
             let kbd_t = Arc::clone(&kbd_queue);
             let mouse_t = Arc::clone(&mouse_queue);
+            let tablet_t = Arc::clone(&tablet_queue);
+            let resize_t = Arc::clone(&resize_queue);
             let irq0_t = Arc::clone(&irq0_flag);
             let bda_t = Arc::clone(&bda_tick_count);
             // vm (Arc<VmFd>) se clona ANTES del move (el BSP sigue usando vm).
@@ -988,6 +1230,8 @@ fn main() {
                     guest_mem_handle.clone(),
                     kbd_t,
                     mouse_t,
+                    tablet_t,
+                    resize_t,
                     irq0_t,
                     bda_t,
                 )
@@ -1024,6 +1268,8 @@ fn main() {
     loop {
         // ── Shutdown solicitado (SIGTERM/SIGINT) ──────────────────
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            tui_running.store(false, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(150));
             eprintln!("[VMM] Shutdown solicitado — volcando estado final (exits={}, reboots={})...",
                 total_exits, total_reboots);
             dump_vga_text_screen(guest_mem);
@@ -1033,6 +1279,8 @@ fn main() {
         // El guest (Linux) evaluó _S5 y escribió SLP_EN en 0x604; AcpiPm
         // lo detectó. Salimos igual que con SIGTERM/SIGINT: dump + exit.
         if bus_lock().acpi_sleep_requested() {
+            tui_running.store(false, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(150));
             eprintln!("[VMM] ACPI S5 solicitado por el guest — apagado limpio (exits={}, reboots={})...",
                 total_exits, total_reboots);
             dump_vga_text_screen(guest_mem);
@@ -1050,13 +1298,135 @@ fn main() {
                 bus_lock().legacy_irq.inject_mouse_delta(dx, dy, buttons);
             }
         }
+        // Eventos de la tableta gráfica USB (coordenadas absolutas 0..32767)
+        if let Ok(mut q) = tablet_queue.try_lock() {
+            while let Some((x, y, buttons, wheel)) = q.pop_front() {
+                bus_lock().inject_tablet_event(x, y, buttons, wheel);
+            }
+        }
+
+        // ── Comandos interactivos del Dashboard TUI ──────────────
+        if let Some(ref handle) = tui_handle {
+            while let Some(cmd) = handle.pop_command() {
+                match cmd {
+                    tui::DashboardCommand::TogglePause => {
+                        let cur = metrics.is_paused.load(Ordering::Relaxed);
+                        metrics.is_paused.store(!cur, Ordering::Relaxed);
+                        tui::log(if !cur { "[TUI] Máquina virtual pausada" } else { "[TUI] Máquina virtual reanudada" });
+                    }
+                    tui::DashboardCommand::AddCpu => {
+                        let current_cpus = metrics.num_cpus.load(Ordering::Relaxed);
+                        let max_cpus = metrics.max_cpus.load(Ordering::Relaxed);
+                        if current_cpus < max_cpus {
+                            let new_id = current_cpus;
+                            if bus_lock().plug_cpu(new_id).is_ok() {
+                                match vm.create_vcpu(new_id as u64) {
+                                    Ok(new_vcpu) => {
+                                        let _ = new_vcpu.set_cpuid2(&cpuid);
+                                        let _ = new_vcpu.set_mp_state(kvm_mp_state {
+                                            mp_state: kvm_bindings::KVM_MP_STATE_INIT_RECEIVED,
+                                        });
+                                        let bus_ap = Arc::clone(&bus);
+                                        let metrics_ap = Arc::clone(&metrics);
+                                        ap_handles.push(
+                                            std::thread::Builder::new()
+                                                .name(format!("vcpu-{new_id}"))
+                                                .spawn(move || ap_vcpu_worker(new_id, new_vcpu, bus_ap, metrics_ap, verbose))
+                                                .expect("spawn de hilo AP falló"),
+                                        );
+                                        metrics.num_cpus.fetch_add(1, Ordering::Relaxed);
+                                        vm.set_irq_line(9, false).ok();
+                                        vm.set_irq_line(9, true).ok();
+                                        metrics.record_irq(9);
+                                        tui::log(format!("[TUI] vCPU #{} conectado en caliente con éxito (total: {})", new_id, current_cpus + 1));
+                                    }
+                                    Err(e) => {
+                                        tui::log(format!("[TUI] Error al crear vCPU #{}: {}", new_id, e));
+                                    }
+                                }
+                            }
+                        } else {
+                            tui::log("[TUI] Ya se alcanzó el número máximo de vCPUs (16).");
+                        }
+                    }
+                    tui::DashboardCommand::RemoveCpu => {
+                        let current_cpus = metrics.num_cpus.load(Ordering::Relaxed);
+                        if current_cpus > 1 {
+                            let target_id = current_cpus - 1;
+                            if bus_lock().cpu_hotplug.unplug_cpu(target_id).is_ok() {
+                                metrics.num_cpus.fetch_sub(1, Ordering::Relaxed);
+                                vm.set_irq_line(9, false).ok();
+                                vm.set_irq_line(9, true).ok();
+                                metrics.record_irq(9);
+                                tui::log(format!("[TUI] vCPU #{} marcado para desconexión", target_id));
+                            }
+                        } else {
+                            tui::log("[TUI] No se puede desconectar el BSP (CPU 0).");
+                        }
+                    }
+                    tui::DashboardCommand::EjectCdrom => {
+                        let is_inserted = bus_lock().is_cdrom_inserted();
+                        if is_inserted {
+                            bus_lock().eject_cdrom();
+                            tui::log("[TUI] CD-ROM expulsado.");
+                        } else if let Some(ref path) = iso_path {
+                            let _ = bus_lock().insert_cdrom(path);
+                            tui::log("[TUI] CD-ROM reinsertado.");
+                        } else {
+                            tui::log("[TUI] No hay ruta de ISO disponible para reinsertar.");
+                        }
+                    }
+                    tui::DashboardCommand::CycleScale => {
+                        let cur = metrics.display_scale.load(Ordering::Relaxed);
+                        let next = if cur >= 3 { 1 } else { cur + 1 };
+                        metrics.display_scale.store(next, Ordering::Relaxed);
+                        tui::log(format!("[TUI] Escala cambiada a {}x", next));
+                    }
+                    tui::DashboardCommand::ShutdownAcpi => {
+                        bus_lock().trigger_power_button();
+                        tui::log("[TUI] Solicitud de apagado ACPI enviada al SO.");
+                    }
+                    tui::DashboardCommand::ResetVm => {
+                        tui::log("[TUI] Reinicio manual solicitado desde el Dashboard.");
+                        reset_vcpu_to_post(&vcpu, &vm, &mut bus_lock(), guest_mem);
+                        total_reboots += 1;
+                    }
+                    tui::DashboardCommand::Quit => {
+                        tui::log("[TUI] Salida solicitada.");
+                        SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // ── Pausa de la VM ──────────────────────────────────────
+        while metrics.is_paused.load(Ordering::Relaxed) && !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(ref handle) = tui_handle {
+                while let Some(cmd) = handle.pop_command() {
+                    match cmd {
+                        tui::DashboardCommand::TogglePause => {
+                            metrics.is_paused.store(false, Ordering::Relaxed);
+                            tui::log("[TUI] Máquina virtual reanudada");
+                        }
+                        tui::DashboardCommand::Quit => {
+                            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // ── Progreso periódico ──────────────────────────────────
         {
             let now = std::time::Instant::now();
             if now.duration_since(last_report) >= std::time::Duration::from_secs(5) {
                 last_report = now;
-                if let Ok(r) = vcpu.get_regs() {
+                if tui::is_active() {
+                    let post_last = bus_lock().post.last;
+                    tui::log(format!("[VMM] exits={} (reboots={}) | POST=0x{:02X}", total_exits, total_reboots, post_last));
+                } else if let Ok(r) = vcpu.get_regs() {
                     if let Ok(s) = vcpu.get_sregs() {
                         let phys = s.cs.base + r.rip;
                         let p = phys as usize;
@@ -1156,8 +1526,9 @@ fn main() {
         if cur_post != last_post {
             let r = vcpu.get_regs().unwrap_or_default();
             let s = vcpu.get_sregs().unwrap_or_default();
-            eprintln!("[VMM] POST: 0x{:02X} → 0x{:02X} (phys={:#x})",
+            let msg = format!("[VMM] POST: 0x{:02X} → 0x{:02X} (phys={:#x})",
                 last_post, cur_post, s.cs.base + r.rip);
+            tui::log(&msg);
             last_post = cur_post;
         }
 
@@ -1166,16 +1537,19 @@ fn main() {
         // via VMCS — no shadow tracking needed. We log transitions
         // for diagnostics only.
         if total_exits % 50000 == 0 {
-            eprint!("{}", metrics.format_summary(1.0, total_exits.saturating_sub(50000)));
+            if !tui::is_active() {
+                eprint!("{}", metrics.format_summary(1.0, total_exits.saturating_sub(50000)));
+            }
             if let Ok(s) = vcpu.get_sregs() {
                 if s.cr0 != last_cr0 {
                     mode_transitions += 1;
                     let pe_old = (last_cr0 & 1) != 0;
                     let pe_new = (s.cr0 & 1) != 0;
                     let r = vcpu.get_regs().unwrap_or_default();
-                    eprintln!("[VMM] CR0 change: {:#x} → {:#x} (PE {}→{}) at phys={:#x} gdt={:#x}/{:#x} idt={:#x}/{:#x}",
+                    let msg = format!("[VMM] CR0 change: {:#x} → {:#x} (PE {}→{}) at phys={:#x} gdt={:#x}/{:#x} idt={:#x}/{:#x}",
                         last_cr0, s.cr0, pe_old, pe_new,
                         s.cs.base + r.rip, s.gdt.base, s.gdt.limit, s.idt.base, s.idt.limit);
+                    tui::log(&msg);
                     last_cr0 = s.cr0;
                 }
             }
@@ -1204,6 +1578,7 @@ fn main() {
                     || b.legacy_irq.ps2_has_data()
                     || b.legacy_irq.mouse_has_data()
                     || b.uart_irq_pending()
+                    || b.ide_irq_pending()
             };
             let want_window = if irq_pending {
                 // IF = bit 9 de RFLAGS. unwrap_or(true): ante error de ioctl
@@ -1220,6 +1595,7 @@ fn main() {
         }
 
         // ── Ejecutar guest ──────────────────────────────────────
+        let bsp_run_start = std::time::Instant::now();
         let exit_reason = match vcpu.run() {
             Ok(r) => r,
             Err(e) if e.errno() == libc::EINTR => {
@@ -1242,10 +1618,86 @@ fn main() {
                     vm.set_irq_line(4, false).ok();
                     vm.set_irq_line(4, true).ok();
                 }
+                // IDE (IRQ14/IRQ15)
+                let (ide14, ide15) = bus_lock().take_ide_irq();
+                if ide14 {
+                    vm.set_irq_line(14, false).ok();
+                    vm.set_irq_line(14, true).ok();
+                }
+                if ide15 {
+                    vm.set_irq_line(15, false).ok();
+                    vm.set_irq_line(15, true).ok();
+                }
+                // USB UHCI (IRQ11)
+                {
+                    let mut b = bus_lock();
+                    let irq = b.usb_irq_line() as u32;
+                    if b.take_usb_irq_pulse() {
+                        vm.set_irq_line(irq, false).ok();
+                        vm.set_irq_line(irq, true).ok();
+                    } else if !b.is_usb_irq_asserted() {
+                        vm.set_irq_line(irq, false).ok();
+                    }
+                }
+                // VirtIO-Serial (IRQ10)
+                {
+                    let mut b = bus_lock();
+                    let irq = b.virtio_serial_irq_line() as u32;
+                    if b.take_virtio_serial_irq_pulse() {
+                        vm.set_irq_line(irq, false).ok();
+                        vm.set_irq_line(irq, true).ok();
+                    } else if !b.is_virtio_serial_irq_asserted() {
+                        vm.set_irq_line(irq, false).ok();
+                    }
+                }
+                // VirtIO-Net (IRQ9)
+                {
+                    let mut b = bus_lock();
+                    let irq = b.virtio_net_irq_line() as u32;
+                    if b.take_virtio_net_irq_pulse() {
+                        vm.set_irq_line(irq, false).ok();
+                        vm.set_irq_line(irq, true).ok();
+                    } else if !b.is_virtio_net_irq_asserted() {
+                        vm.set_irq_line(irq, false).ok();
+                    }
+                }
+                // SATA AHCI (IRQ10)
+                {
+                    let b = bus_lock();
+                    let irq = b.ahci_irq_line() as u32;
+                    if b.is_ahci_irq_asserted() {
+                        vm.set_irq_line(irq, true).ok();
+                    } else {
+                        vm.set_irq_line(irq, false).ok();
+                    }
+                }
+                // VirtualBox VMMDev (IRQ11)
+                {
+                    let b = bus_lock();
+                    let irq = b.vmmdev_irq_line() as u32;
+                    if b.is_vmmdev_irq_asserted() {
+                        vm.set_irq_line(irq, true).ok();
+                    } else {
+                        vm.set_irq_line(irq, false).ok();
+                    }
+                }
+                // Intel 82801AA AC'97 Audio
+                {
+                    let b = bus_lock();
+                    let irq = b.ac97_irq_line() as u32;
+                    if b.is_ac97_irq_asserted() {
+                        vm.set_irq_line(irq, true).ok();
+                    } else {
+                        vm.set_irq_line(irq, false).ok();
+                    }
+                }
                 continue;
             }
             Err(e) => { eprintln!("[VMM] vcpu.run() falló: {}", e); exit(1); }
         };
+        let bsp_nanos = bsp_run_start.elapsed().as_nanos() as u64;
+        metrics.record_vcpu_active(0, bsp_nanos);
+        metrics.record_vcpu_exit(0);
         total_exits += 1;
 
        // NOTE: The PIT is only advanced by the dedicated pit-timer thread
@@ -1273,6 +1725,87 @@ fn main() {
             vm.set_irq_line(4, false).ok();
             vm.set_irq_line(4, true).ok();
             metrics.record_irq(4);
+        }
+        // Canales IDE (IRQ14 disco / IRQ15 CD-ROM ATAPI)
+        let (ide14, ide15) = bus_lock().take_ide_irq();
+        if ide14 {
+            vm.set_irq_line(14, false).ok();
+            vm.set_irq_line(14, true).ok();
+            metrics.record_irq(14);
+        }
+        if ide15 {
+            vm.set_irq_line(15, false).ok();
+            vm.set_irq_line(15, true).ok();
+            metrics.record_irq(15);
+        }
+        // USB UHCI (IRQ11)
+        {
+            let mut b = bus_lock();
+            let irq = b.usb_irq_line() as u32;
+            if b.take_usb_irq_pulse() {
+                vm.set_irq_line(irq, false).ok();
+                vm.set_irq_line(irq, true).ok();
+                metrics.record_irq(irq as u8);
+            } else if !b.is_usb_irq_asserted() {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // VirtIO-Serial (IRQ10)
+        {
+            let mut b = bus_lock();
+            let irq = b.virtio_serial_irq_line() as u32;
+            if b.take_virtio_serial_irq_pulse() {
+                vm.set_irq_line(irq, false).ok();
+                vm.set_irq_line(irq, true).ok();
+                metrics.record_irq(irq as u8);
+            } else if !b.is_virtio_serial_irq_asserted() {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // VirtIO-Net (IRQ9)
+        {
+            let mut b = bus_lock();
+            let irq = b.virtio_net_irq_line() as u32;
+            if b.take_virtio_net_irq_pulse() {
+                vm.set_irq_line(irq, false).ok();
+                vm.set_irq_line(irq, true).ok();
+                metrics.record_irq(irq as u8);
+            } else if !b.is_virtio_net_irq_asserted() {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // SATA AHCI (IRQ10)
+        {
+            let b = bus_lock();
+            let irq = b.ahci_irq_line() as u32;
+            if b.is_ahci_irq_asserted() {
+                vm.set_irq_line(irq, true).ok();
+                metrics.record_irq(irq as u8);
+            } else {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // VirtualBox VMMDev (IRQ11)
+        {
+            let b = bus_lock();
+            let irq = b.vmmdev_irq_line() as u32;
+            if b.is_vmmdev_irq_asserted() {
+                vm.set_irq_line(irq, true).ok();
+                metrics.record_irq(irq as u8);
+            } else {
+                vm.set_irq_line(irq, false).ok();
+            }
+        }
+        // Intel 82801AA AC'97 Audio
+        {
+            let b = bus_lock();
+            let irq = b.ac97_irq_line() as u32;
+            if b.is_ac97_irq_asserted() {
+                vm.set_irq_line(irq, true).ok();
+                metrics.record_irq(irq as u8);
+            } else {
+                vm.set_irq_line(irq, false).ok();
+            }
         }
         // APM / SMI (Item 23): inyectar SMI al vCPU si hubo comando en 0xB2
         if bus_lock().take_smi() {
@@ -1381,6 +1914,17 @@ fn main() {
                     vm.set_irq_line(4, true).ok();
                     metrics.record_irq(4);
                 }
+                let (ide14, ide15) = bus_lock().take_ide_irq();
+                if ide14 {
+                    vm.set_irq_line(14, false).ok();
+                    vm.set_irq_line(14, true).ok();
+                    metrics.record_irq(14);
+                }
+                if ide15 {
+                    vm.set_irq_line(15, false).ok();
+                    vm.set_irq_line(15, true).ok();
+                    metrics.record_irq(15);
+                }
             }
             VcpuExit::MmioWrite(addr, data) => {
                 metrics.record_mmio_write();
@@ -1414,6 +1958,8 @@ fn main() {
     }
 
     // ─── Cierre de VM: sincronización y guardado de snapshots (Item 22, 24) ───
+    tui_running.store(false, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(150));
     eprintln!("\n{}", metrics.format_summary(1.0, 0));
     if let Some(pf) = bus.lock().unwrap_or_else(|p| p.into_inner()).pflash.as_mut() {
         pf.flush_to_disk().ok();
@@ -1452,6 +1998,11 @@ fn ap_vcpu_worker(
         .ok();
     };
     loop {
+        while metrics.is_paused.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let run_start = std::time::Instant::now();
         let exit_reason = match vcpu.run() {
             Ok(r) => r,
             // Señal (SIGINT/SIGTERM): el temporizador lo gobierna el hilo
@@ -1462,6 +2013,9 @@ fn ap_vcpu_worker(
                 return;
             }
         };
+        let run_nanos = run_start.elapsed().as_nanos() as u64;
+        metrics.record_vcpu_active(cpu_id as usize, run_nanos);
+        metrics.record_vcpu_exit(cpu_id as usize);
         total_exits += 1;
         match exit_reason {
             VcpuExit::IoOut(port, data) => {
@@ -1583,6 +2137,19 @@ mod tests {
         // Cobertura total: 512 MiB menos las dos páginas reservadas.
         let covered: u64 = r.iter().map(|(s, e)| e - s).sum();
         assert_eq!(covered, 0x2000_0000 - 2 * 0x1000);
+    }
+
+    #[test]
+    fn carve_high_mem_with_pci_mmio_hole() {
+        let r = carve_reserved_holes(0xE000_0000, 0x2000_0000, &HIGH_MEM_HOLES);
+        assert_eq!(
+            r,
+            vec![
+                (0xE000_0000, 0xFE00_0000),
+                (0xFEC0_1000, 0xFEE0_0000),
+                (0xFEE0_1000, 0x1_0000_0000),
+            ]
+        );
     }
 
     #[test]

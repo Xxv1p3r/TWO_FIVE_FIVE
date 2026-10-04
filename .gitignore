@@ -1,2 +1,9 @@
 target/
 *.iso
+*.img
+*.qcow2
+*.vdi
+*.raw
+vb/
+.idea/
+.vscode/

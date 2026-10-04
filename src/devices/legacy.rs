@@ -24,6 +24,7 @@ pub struct DebugCon {
     /// INT 10h y el espejo duplicaba/pisaba caracteres. Se activa con
     /// MI_VMM_MIRROR_BIOS=1 para depurar arranques que no llegan a pintar.
     mirror_vga: bool,
+    line_buf: Vec<u8>,
 }
 
 impl DebugCon {
@@ -40,6 +41,7 @@ impl DebugCon {
             mirror_vga: std::env::var("MI_VMM_MIRROR_BIOS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            line_buf: Vec::with_capacity(256),
         }
     }
 
@@ -125,6 +127,18 @@ impl IoDevice for DebugCon {
                 self.vga_putchar(b);
             }
         }
+        if crate::tui::is_active() {
+            for &b in data {
+                if b == b'\n' {
+                    let s = format!("[BIOS] {}", String::from_utf8_lossy(&self.line_buf));
+                    self.line_buf.clear();
+                    crate::tui::log(s);
+                } else if b != b'\r' {
+                    self.line_buf.push(b);
+                }
+            }
+            return;
+        }
         // Also write to stderr
         use std::io::Write;
         let mut err = std::io::stderr();
@@ -185,29 +199,57 @@ impl IoDevice for PostCode {
         vec![self.last]
     }
 }
-// ─── CMOS/RTC: 0x70 = índice, 0x71 = dato ──────────────────────────
+// ─── Algoritmo civil gregoriano (Howard Hinnant) para fecha UTC ───────
+fn civil_from_days(days: i64) -> (u16, u8, u8) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1024 + doe / 1461 - doe / 142456) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u16, m as u8, d as u8)
+}
+
+// ─── CMOS/RTC: Motorola MC146818 con extensiones PIIX4 (DevRTC.cpp) ───
+/// Emula el reloj de tiempo real MC146818 y la RAM NVRAM CMOS con dos bancos
+/// de 128 bytes (256 bytes totales). Banco 0 en puertos 0x70/0x71 y Banco 1 en
+/// puertos 0x72/0x73, idéntico a VirtualBox (`DevRTC.cpp`).
 pub struct CmosRtc {
-    index: u8,
+    /// cmos_index[0] para Banco 0 (0..127), cmos_index[1] para Banco 1 (0..127)
+    index: [u8; 2],
     /// Start time for RTC emulation
-    rtc_start: std::time::Instant,
+    rtc_start: Instant,
+    /// Unix timestamp base at start (seconds)
+    rtc_base_unix_secs: u64,
     /// Status C: UF (Update Finished) interrupt pending bit
     status_c: u8,
     /// Track the last second we saw (to detect second transitions)
     last_second: u64,
-    /// CMOS RAM (128 bytes) — writable registers
-    ram: [u8; 128],
+    /// CMOS RAM (256 bytes: 0..128 Banco 0, 128..256 Banco 1)
+    ram: [u8; 256],
 }
 
 impl CmosRtc {
     pub const PORT_INDEX: u16 = 0x70;
     pub const PORT_DATA: u16 = 0x71;
+    pub const PORT_INDEX_EXT: u16 = 0x72;
+    pub const PORT_DATA_EXT: u16 = 0x73;
 
     pub fn new() -> Self {
         Self::with_ram_size(512 * 1024 * 1024)
     }
 
     pub fn with_ram_size(ram_size: u64) -> Self {
-        let mut ram = [0u8; 128];
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1774828800);
+
+        let mut ram = [0u8; 256];
         ram[0x0F] = 0x00; // Shutdown status: normal boot
         ram[0x10] = 0x00; // Equipment byte: 0 floppies
         ram[0x14] = 0x23; // Equipment: 80x25 color, keyboard installed
@@ -231,16 +273,46 @@ impl CmosRtc {
 
         // Extended memory >16MB in 64KB chunks
         let ext_above_16m = if ram_size > 16 * 1024 * 1024 {
-            ((ram_size - 16 * 1024 * 1024) / 65536) as u16
+            (((ram_size - 16 * 1024 * 1024) / 65536) as u64).min(0xFFFF) as u16
         } else {
             0
         };
         ram[0x34] = ext_above_16m as u8;
         ram[0x35] = (ext_above_16m >> 8) as u8;
 
+        // High memory above 4GB in 64KB chunks (SeaBIOS standard: 0x5b, 0x5c, 0x5d)
+        if ram_size > 0xE000_0000 {
+            let high_chunks = ((ram_size - 0xE000_0000) / 65536) as u32;
+            ram[0x5B] = high_chunks as u8;
+            ram[0x5C] = (high_chunks >> 8) as u8;
+            ram[0x5D] = (high_chunks >> 16) as u8;
+        }
+
+        // Boot sequence: SeaBIOS / VirtualBox standard
+        // 0x38: Boot sequence (0x31: CD-ROM then HDD)
+        // 0x3D: 1st boot drive (0x20 = CDROM, 0x02 = HDD)
+        ram[0x38] = 0x31;
+        ram[0x3D] = 0x20;
+
+        // Century bytes (0x32: Century BCD, 0x37: IBM PS/2 Date Century BCD)
+        let days = (unix_secs / 86400) as i64;
+        let (cur_y, _, _) = civil_from_days(days);
+        let century_bcd = Self::to_bcd((cur_y / 100) as u8);
+        ram[0x32] = century_bcd;
+        ram[0x37] = century_bcd;
+
+        // Calculate standard PC/AT CMOS checksum across 0x10..=0x2D
+        let mut sum: u16 = 0;
+        for i in 0x10..=0x2D {
+            sum = sum.wrapping_add(ram[i] as u16);
+        }
+        ram[0x2E] = (sum >> 8) as u8;
+        ram[0x2F] = (sum & 0xFF) as u8;
+
         Self {
-            index: 0,
-            rtc_start: std::time::Instant::now(),
+            index: [0, 0],
+            rtc_start: Instant::now(),
+            rtc_base_unix_secs: unix_secs,
             status_c: 0,
             last_second: 0,
             ram,
@@ -251,11 +323,10 @@ impl CmosRtc {
     /// Status C, byte de shutdown) pero conserva la hora y la RAM CMOS
     /// respaldada por batería (persisten entre resets en hardware real).
     pub fn reset(&mut self) {
-        self.index = 0;
+        self.index = [0, 0];
         self.status_c = 0;
-        self.last_second = self.current_second();
-        // Shutdown status: boot normal (evita que SeaBIOS entre en la
-        // rutina de shutdown tras un reset).
+        self.last_second = self.rtc_start.elapsed().as_secs();
+        // Shutdown status: boot normal
         self.ram[0x0F] = 0x00;
     }
 
@@ -264,8 +335,29 @@ impl CmosRtc {
         ((val / 10) << 4) | (val % 10)
     }
 
+    /// Recalcula el checksum estándar PC/AT (suma 16-bit de 0x10..=0x2D)
+    pub fn recalc_crc(&mut self) {
+        let mut sum: u16 = 0;
+        for i in 0x10..=0x2D {
+            sum = sum.wrapping_add(self.ram[i] as u16);
+        }
+        self.ram[0x2E] = (sum >> 8) as u8;
+        self.ram[0x2F] = (sum & 0xFF) as u8;
+    }
+
+    /// Retorna los componentes actuales del calendario UTC (año, mes, día, hora, min, seg, día_semana)
+    fn current_utc(&self) -> (u16, u8, u8, u8, u8, u8, u8) {
+        let s = self.rtc_base_unix_secs + self.rtc_start.elapsed().as_secs();
+        let sec = (s % 60) as u8;
+        let min = ((s / 60) % 60) as u8;
+        let hour = ((s / 3600) % 24) as u8;
+        let days = (s / 86400) as i64;
+        let wday = ((days + 4) % 7) as u8 + 1; // 1=Sunday..7=Saturday
+        let (year, month, day) = civil_from_days(days);
+        (year, month, day, hour, min, sec, wday)
+    }
+
     /// Check for RTC update cycle: set UF bit when second transitions.
-    /// This is called on every read to simulate the RTC update interrupt.
     fn update_rtc_cycle(&mut self) {
         let current_second = self.rtc_start.elapsed().as_secs();
         if current_second != self.last_second {
@@ -275,40 +367,26 @@ impl CmosRtc {
         }
     }
 
-    /// Current second (real time, BCD-decoded)
-    fn current_second(&self) -> u64 {
-        self.rtc_start.elapsed().as_secs()
-    }
-
-    /// Valores CMOS que reportamos al guest.
+    /// Valores CMOS que reportamos al guest para Banco 0.
     fn read_reg(&mut self, reg: u8) -> u8 {
+        let (year, month, day, hour, min, sec, wday) = self.current_utc();
         match reg {
-            // RTC: tiempo real emulado
+            // RTC: tiempo real UTC emulado
             0x00 => { // Seconds
                 self.update_rtc_cycle();
-                let elapsed = self.current_second() % 60;
-                Self::to_bcd(elapsed as u8)
+                Self::to_bcd(sec)
             }
-            0x02 => { // Minutes
-                let elapsed = self.current_second() / 60;
-                Self::to_bcd((elapsed % 60) as u8)
-            }
-            0x04 => { // Hours
-                let elapsed = self.current_second() / 3600;
-                Self::to_bcd((elapsed % 24) as u8)
-            }
-            0x06 => 1, // Day of week (Monday)
-            0x07 => 1, // Day of month
-            0x08 => 1, // Month
-            0x09 => 25, // Year (2025)
+            0x02 => Self::to_bcd(min), // Minutes
+            0x04 => Self::to_bcd(hour), // Hours
+            0x06 => wday,               // Day of week (1..=7)
+            0x07 => Self::to_bcd(day),  // Day of month
+            0x08 => Self::to_bcd(month), // Month
+            0x09 => Self::to_bcd((year % 100) as u8), // Year
             0x01..=0x03 | 0x05 => 0,
             0x0A => {
                 // Status A: bit 7 = UIP (Update In Progress)
-                // We set UIP=1 for a brief window (~244μs) before the second changes,
-                // then clear it. This allows SeaBIOS pmtimer calibration to complete.
                 let elapsed_ns = self.rtc_start.elapsed().as_nanos() as u64;
                 let nanos_in_second = elapsed_ns % 1_000_000_000;
-                // UIP=1 during the last 244μs before second boundary
                 let uip = if nanos_in_second >= 999_756_000 { 0x80 } else { 0x00 };
                 uip | 0x26 // dividers: 32768 Hz, 22-stage divider
             }
@@ -320,9 +398,9 @@ impl CmosRtc {
                 val
             }
             0x0D => 0x80, // Status D: batería OK
-            0x0F => 0,    // Shutdown status: boot normal (soft reset)
-            0x3D..=0x3F => 0, // sin option ROMs
-            // Para registros de memoria (0x14-0x18, 0x30-0x35) y registros escribibles:
+            0x0F => 0x00, // Shutdown status: boot normal (soft reset)
+            0x32 | 0x37 => Self::to_bcd((year / 100) as u8),
+            // Registros de memoria, configuración y NVRAM de Banco 0:
             _ => self.ram[reg as usize],
         }
     }
@@ -336,51 +414,50 @@ impl Default for CmosRtc {
 
 impl IoDevice for CmosRtc {
     fn matches_port(&self, port: u16) -> bool {
-        port == Self::PORT_INDEX || port == Self::PORT_DATA
+        matches!(port, 0x70..=0x73)
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {
-        if port == Self::PORT_INDEX && !data.is_empty() {
-            self.index = data[0] & 0x7F; // bit 7 = NMI mask, ignorado
-        }
-        if port == Self::PORT_DATA && !data.is_empty() {
-            // Store value in CMOS RAM
-            let idx = self.index as usize;
-            if idx < 128 {
-                self.ram[idx] = data[0];
+        if data.is_empty() { return; }
+        let val = data[0];
+        match port {
+            0x70 => {
+                self.index[0] = val & 0x7F; // bit 7 = NMI mask
             }
+            0x71 => {
+                let idx = self.index[0] as usize;
+                if idx < 128 {
+                    self.ram[idx] = val;
+                    if (0x10..=0x2D).contains(&idx) {
+                        self.recalc_crc();
+                    }
+                }
+            }
+            0x72 => {
+                self.index[1] = val & 0x7F;
+            }
+            0x73 => {
+                let idx = 128 + (self.index[1] as usize);
+                if idx < 256 {
+                    self.ram[idx] = val;
+                }
+            }
+            _ => {}
         }
     }
 
     fn read(&mut self, port: u16, _count: usize) -> Vec<u8> {
-        if port == Self::PORT_DATA {
-            let val = self.read_reg(self.index);
-           // Track which CMOS registers are being polled (using atomics, not static mut)
-            static CMOS_REG_COUNTS: [AtomicU32; 128] = [const { AtomicU32::new(0) }; 128];
-            static CMOS_TOTAL: AtomicU32 = AtomicU32::new(0);
-            let idx = (self.index & 0x7F) as usize;
-            if idx < 128 {
-                CMOS_REG_COUNTS[idx].fetch_add(1, Ordering::Relaxed);
+        match port {
+            0x70 | 0x72 => vec![0xFF], // Motorola MC146818 & VirtualBox DevRTC line 373: index ports return 0xFF on read
+            0x71 => {
+                let val = self.read_reg(self.index[0]);
+                vec![val]
             }
-            let total = CMOS_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-            if total == 500 || total == 1000 || total == 1500 {
-                // Find top CMOS registers
-                let mut regs: Vec<(u8, u32)> = Vec::new();
-                for i in 0..128u8 {
-                    let c = CMOS_REG_COUNTS[i as usize].load(Ordering::Relaxed);
-                    if c > 0 {
-                        regs.push((i, c));
-                    }
-                }
-               regs.sort_by(|a, b| b.1.cmp(&a.1));
-                let top: Vec<String> = regs.iter().take(10)
-                    .map(|(r, c)| format!("0x{:02X}:{}", r, c))
-                    .collect();
-                eprintln!("[CMOS] total={}, top: {}", total, top.join(", "));     
+            0x73 => {
+                let idx = 128 + (self.index[1] as usize);
+                vec![self.ram[idx]]
             }
-            vec![val]
-        } else {
-            vec![self.index]
+            _ => vec![0xFF],
         }
     }
 }
@@ -522,6 +599,18 @@ impl AcpiPm {
     /// True si el guest escribió SLP_EN en PM1a_CNT (apagado limpio vía _S5).
     pub fn sleep_requested(&self) -> bool {
         self.sleep_requested
+    }
+
+    /// Simula la pulsación del botón de encendido ACPI (PWRBTN_STS).
+    /// Devuelve true si la interrupción SCI debe dispararse (PWRBTN_EN == 1).
+    pub fn trigger_power_button(&mut self) -> bool {
+        self.pm1a_sts |= 0x0100;
+        (self.pm1a_en & 0x0100) != 0
+    }
+
+    /// Fuerza la solicitud de apagado limpio.
+    pub fn request_shutdown(&mut self) {
+        self.sleep_requested = true;
     }
 
     /// Llamado por DeviceBus cuando SeaBIOS escribe al PCI config del PIIX3 ACPI.
@@ -720,10 +809,18 @@ impl IoDevice for AcpiPm {
                 0x03 => ((self.pm1a_en >> 8) & 0xFF) as u8,
                 0x04 => (self.pm1a_cnt & 0xFF) as u8,
                 0x05 => ((self.pm1a_cnt >> 8) & 0xFF) as u8,
-                0x08 => {
-                    // PM Timer: 24-bit counter, 4-byte read
+                0x08..=0x0B => {
+                    // PM Timer: 24-bit counter, 4-byte read or sub-byte reads
                     let val = self.pm_timer_value();
-                    return vec![val as u8, (val >> 8) as u8, (val >> 16) as u8, 0];
+                    let shift = (off - 0x08) * 8;
+                    if _count <= 1 {
+                        return vec![(val >> shift) as u8];
+                    }
+                    let mut bytes = Vec::with_capacity(_count);
+                    for i in 0.._count {
+                        bytes.push(((val >> ((off - 0x08 + i as u16) * 8)) & 0xFF) as u8);
+                    }
+                    return bytes;
                 }
                 _ => 0,
             };
@@ -809,6 +906,92 @@ mod tests {
         pm.write(0x604, &[0x01, 0x00]);
         assert!(!pm.sleep_requested());
     }
+
+    #[test]
+    fn test_cmos_dual_bank_and_crc() {
+        let mut cmos = CmosRtc::with_ram_size(1024 * 1024 * 1024);
+        // Ports 0x70 and 0x72 return 0xFF on read
+        assert_eq!(cmos.read(0x70, 1), vec![0xFF]);
+        assert_eq!(cmos.read(0x72, 1), vec![0xFF]);
+
+        // Century bytes in BCD (20 for 20xx)
+        cmos.write(0x70, &[0x32]);
+        assert_eq!(cmos.read(0x71, 1), vec![0x20]);
+        cmos.write(0x70, &[0x37]);
+        assert_eq!(cmos.read(0x71, 1), vec![0x20]);
+
+        // Verify checksum at 0x2E/0x2F is non-zero and updates
+        cmos.write(0x70, &[0x2E]);
+        let crc_hi_orig = cmos.read(0x71, 1)[0];
+        cmos.write(0x70, &[0x2F]);
+        let crc_lo_orig = cmos.read(0x71, 1)[0];
+        let orig_crc = ((crc_hi_orig as u16) << 8) | (crc_lo_orig as u16);
+        assert!(orig_crc > 0);
+
+        // Modifying register 0x12 modifies CRC
+        cmos.write(0x70, &[0x12]);
+        cmos.write(0x71, &[0x55]);
+        cmos.write(0x70, &[0x2E]);
+        let crc_hi_new = cmos.read(0x71, 1)[0];
+        cmos.write(0x70, &[0x2F]);
+        let crc_lo_new = cmos.read(0x71, 1)[0];
+        let new_crc = ((crc_hi_new as u16) << 8) | (crc_lo_new as u16);
+        assert_ne!(orig_crc, new_crc);
+
+        // Extended Bank 1 via ports 0x72/0x73
+        cmos.write(0x72, &[0x10]);
+        cmos.write(0x73, &[0xBE]);
+        cmos.write(0x72, &[0x10]);
+        assert_eq!(cmos.read(0x73, 1), vec![0xBE]);
+        assert_eq!(cmos.ram[128 + 0x10], 0xBE);
+    }
+
+    #[test]
+    fn test_cmos_ram_size_above_4gb_saturates() {
+        let cmos = CmosRtc::with_ram_size(8 * 1024 * 1024 * 1024);
+        assert_eq!(cmos.ram[0x34], 0xFF);
+        assert_eq!(cmos.ram[0x35], 0xFF);
+    }
+
+    #[test]
+    fn test_dma_controller_address_count_and_page_registers() {
+        let mut dma = I8237Dma::new();
+        // Page register 0x81 (Channel 2 Floppy)
+        dma.write(0x81, &[0x1F]);
+        assert_eq!(dma.read(0x81, 1), vec![0x1F]);
+        assert_eq!(dma.channels[2].page, 0x1F);
+
+        // Channel 2 Address write with flip-flop (low byte then high byte)
+        dma.write(0x0C, &[0]); // Clear flip-flop
+        dma.write(0x04, &[0x34]); // Low byte
+        dma.write(0x04, &[0x12]); // High byte
+        assert_eq!(dma.channels[2].base_addr, 0x1234);
+
+        // Readback Channel 2 Address
+        dma.write(0x0C, &[0]); // Clear flip-flop
+        assert_eq!(dma.read(0x04, 1), vec![0x34]);
+        assert_eq!(dma.read(0x04, 1), vec![0x12]);
+
+        // Channel 6 (16-bit DMA 2) at port 0xC8
+        dma.write(0xD8, &[0]); // Clear flip-flop DMA2
+        dma.write(0xC8, &[0x78]);
+        dma.write(0xC8, &[0x56]);
+        assert_eq!(dma.channels[6].base_addr, 0x5678);
+    }
+
+    #[test]
+    fn test_acpi_pm_timer_multibyte_read() {
+        let mut pm = configured_pm();
+        // 4-byte read of PM Timer at base+0x08
+        let bytes4 = pm.read(0x608, 4);
+        assert_eq!(bytes4.len(), 4);
+
+        // Single byte read at base+0x08 and base+0x09
+        let b0 = pm.read(0x608, 1);
+        let b1 = pm.read(0x609, 1);
+        assert_eq!(b0.len(), 1);
+        assert_eq!(b1.len(), 1);
+    }
 }
 
 impl IoDevice for FloppyStub {
@@ -864,8 +1047,11 @@ impl Default for PlatformStubs {
 impl IoDevice for PlatformStubs {
     fn matches_port(&self, port: u16) -> bool {
         matches!(port,
+            0x2E..=0x2F | 0x4E..=0x4F |      // Super I/O probe (ITE/Winbond)
+            0xF0..=0xF1 |                     // Math coprocessor / FPU status/reset
             0x378..=0x37A | 0x278..=0x27A |  // LPT1/LPT2
-            0x2F8..=0x2FF | 0x3E8..=0x3EF | 0x2E8..=0x2EF  // COM2/3/4
+            0x2F8..=0x2FF | 0x3E8..=0x3EF | 0x2E8..=0x2EF |  // COM2/3/4
+            0xCFB                             // PCI configuration BIOS access
         )
     }
 
@@ -874,12 +1060,18 @@ impl IoDevice for PlatformStubs {
         match port {
             0x378 => { self.lpt1_data = data[0]; }
             0x278 => { self.lpt2_data = data[0]; }
-            _ => {} // COM/LPT control: ignore
+            _ => {} // COM/LPT/SuperIO/FPU/CFB: ignore
         }
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
         match port {
+            // Super I/O probe: return 0xFF (device not present)
+            0x2E..=0x2F | 0x4E..=0x4F => vec![0xFF; count],
+            // FPU status / clear: return 0x00
+            0xF0..=0xF1 => vec![0x00; count],
+            // PCI config BIOS mechanism
+            0xCFB => vec![0x00; count],
             // LPT data readback (SeaBIOS escribe 0xAA y espera leer 0xAA)
             0x378 => vec![self.lpt1_data; count],
             0x278 => vec![self.lpt2_data; count],
@@ -986,4 +1178,262 @@ pub fn init_guest_tss(guest_mem: &mut [u8], tss_addr: usize, stack_addr: usize) 
     let iomap_base = 104u16.to_le_bytes();
     guest_mem[tss_addr + 102..tss_addr + 104].copy_from_slice(&iomap_base);
     true
+}
+
+// ─── Controlador DMA Intel 8237A (DMA1 + DMA2 + Registros de Página) ──
+/// Emula los dos controladores DMA Intel 8237A en cascada (DMA1 canales 0-3 en
+/// puertos 0x00..0x0F, DMA2 canales 4-7 en puertos 0xC0..0xDF) y los registros
+/// de página ISA en puertos 0x81..0x8F, idéntico a VirtualBox (`DevDMA.cpp`).
+#[derive(Debug, Clone)]
+pub struct DmaChannel {
+    pub base_addr: u16,
+    pub cur_addr: u16,
+    pub base_count: u16,
+    pub cur_count: u16,
+    pub mode: u8,
+    pub page: u8,
+}
+
+impl DmaChannel {
+    pub fn new() -> Self {
+        Self {
+            base_addr: 0,
+            cur_addr: 0,
+            base_count: 0,
+            cur_count: 0,
+            mode: 0,
+            page: 0,
+        }
+    }
+}
+
+pub struct I8237Dma {
+    pub channels: [DmaChannel; 8],
+    /// Byte pointer flip-flop: false = low byte, true = high byte
+    pub flip_flop: [bool; 2],
+    /// Command registers (DMA1, DMA2)
+    pub command: [u8; 2],
+    /// Status registers (DMA1, DMA2)
+    pub status: [u8; 2],
+    /// Channel mask registers (4 bits each, bit set = masked)
+    pub mask: [u8; 2],
+    /// Page registers for address lines A16..A23 (ports 0x80..0x8F)
+    pub page_regs: [u8; 16],
+}
+
+impl I8237Dma {
+    pub fn new() -> Self {
+        Self {
+            channels: [
+                DmaChannel::new(), DmaChannel::new(), DmaChannel::new(), DmaChannel::new(),
+                DmaChannel::new(), DmaChannel::new(), DmaChannel::new(), DmaChannel::new(),
+            ],
+            flip_flop: [false, false],
+            command: [0, 0],
+            status: [0, 0],
+            mask: [0x0F, 0x0F], // All channels masked on reset
+            page_regs: [0; 16],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.flip_flop = [false, false];
+        self.command = [0, 0];
+        self.status = [0, 0];
+        self.mask = [0x0F, 0x0F];
+        self.page_regs = [0; 16];
+    }
+}
+
+impl Default for I8237Dma {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IoDevice for I8237Dma {
+    fn matches_port(&self, port: u16) -> bool {
+        matches!(port, 0x00..=0x0F | 0x81..=0x8F | 0xC0..=0xDF)
+    }
+
+    fn write(&mut self, port: u16, data: &[u8]) {
+        if data.is_empty() { return; }
+        let val = data[0];
+
+        // 1. Registros de Página ISA (0x81..0x8F)
+        if (0x81..=0x8F).contains(&port) {
+            let p = (port & 0x0F) as usize;
+            self.page_regs[p] = val;
+            match port {
+                0x87 => self.channels[0].page = val,
+                0x83 => self.channels[1].page = val,
+                0x81 => self.channels[2].page = val,
+                0x82 => self.channels[3].page = val,
+                0x8B => self.channels[5].page = val,
+                0x89 => self.channels[6].page = val,
+                0x8A => self.channels[7].page = val,
+                _ => {}
+            }
+            return;
+        }
+
+        // 2. DMA 1 (8-bit: 0x00..0x0F)
+        if port <= 0x0F {
+            match port {
+                0x00..=0x07 => {
+                    let ch = (port >> 1) as usize;
+                    let is_count = (port & 1) != 0;
+                    if !self.flip_flop[0] {
+                        if is_count {
+                            self.channels[ch].base_count = (self.channels[ch].base_count & 0xFF00) | (val as u16);
+                            self.channels[ch].cur_count = self.channels[ch].base_count;
+                        } else {
+                            self.channels[ch].base_addr = (self.channels[ch].base_addr & 0xFF00) | (val as u16);
+                            self.channels[ch].cur_addr = self.channels[ch].base_addr;
+                        }
+                        self.flip_flop[0] = true;
+                    } else {
+                        if is_count {
+                            self.channels[ch].base_count = (self.channels[ch].base_count & 0x00FF) | ((val as u16) << 8);
+                            self.channels[ch].cur_count = self.channels[ch].base_count;
+                        } else {
+                            self.channels[ch].base_addr = (self.channels[ch].base_addr & 0x00FF) | ((val as u16) << 8);
+                            self.channels[ch].cur_addr = self.channels[ch].base_addr;
+                        }
+                        self.flip_flop[0] = false;
+                    }
+                }
+                0x08 => self.command[0] = val,
+                0x0A => {
+                    let ch = (val & 0x03) as usize;
+                    if val & 0x04 != 0 {
+                        self.mask[0] |= 1 << ch;
+                    } else {
+                        self.mask[0] &= !(1 << ch);
+                    }
+                }
+                0x0B => {
+                    let ch = (val & 0x03) as usize;
+                    self.channels[ch].mode = val;
+                }
+                0x0C => self.flip_flop[0] = false,
+                0x0D => {
+                    self.flip_flop[0] = false;
+                    self.command[0] = 0;
+                    self.status[0] = 0;
+                    self.mask[0] = 0x0F;
+                }
+                0x0E => self.mask[0] = 0,
+                0x0F => self.mask[0] = val & 0x0F,
+                _ => {}
+            }
+            return;
+        }
+
+        // 3. DMA 2 (16-bit: 0xC0..0xDF)
+        if (0xC0..=0xDF).contains(&port) {
+            let reg = ((port - 0xC0) >> 1) as u8;
+            match reg {
+                0x00..=0x07 => {
+                    let ch = 4 + (reg >> 1) as usize;
+                    let is_count = (reg & 1) != 0;
+                    if !self.flip_flop[1] {
+                        if is_count {
+                            self.channels[ch].base_count = (self.channels[ch].base_count & 0xFF00) | (val as u16);
+                            self.channels[ch].cur_count = self.channels[ch].base_count;
+                        } else {
+                            self.channels[ch].base_addr = (self.channels[ch].base_addr & 0xFF00) | (val as u16);
+                            self.channels[ch].cur_addr = self.channels[ch].base_addr;
+                        }
+                        self.flip_flop[1] = true;
+                    } else {
+                        if is_count {
+                            self.channels[ch].base_count = (self.channels[ch].base_count & 0x00FF) | ((val as u16) << 8);
+                            self.channels[ch].cur_count = self.channels[ch].base_count;
+                        } else {
+                            self.channels[ch].base_addr = (self.channels[ch].base_addr & 0x00FF) | ((val as u16) << 8);
+                            self.channels[ch].cur_addr = self.channels[ch].base_addr;
+                        }
+                        self.flip_flop[1] = false;
+                    }
+                }
+                0x08 => self.command[1] = val,
+                0x0A => {
+                    let ch = (val & 0x03) as usize;
+                    if val & 0x04 != 0 {
+                        self.mask[1] |= 1 << ch;
+                    } else {
+                        self.mask[1] &= !(1 << ch);
+                    }
+                }
+                0x0B => {
+                    let ch = 4 + (val & 0x03) as usize;
+                    self.channels[ch].mode = val;
+                }
+                0x0C => self.flip_flop[1] = false,
+                0x0D => {
+                    self.flip_flop[1] = false;
+                    self.command[1] = 0;
+                    self.status[1] = 0;
+                    self.mask[1] = 0x0F;
+                }
+                0x0E => self.mask[1] = 0,
+                0x0F => self.mask[1] = val & 0x0F,
+                _ => {}
+            }
+        }
+    }
+
+    fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        // 1. Registros de Página ISA (0x81..0x8F)
+        if (0x81..=0x8F).contains(&port) {
+            let p = (port & 0x0F) as usize;
+            return vec![self.page_regs[p]; count];
+        }
+
+        // 2. DMA 1 (8-bit: 0x00..0x0F)
+        if port <= 0x0F {
+            let val = match port {
+                0x00..=0x07 => {
+                    let ch = (port >> 1) as usize;
+                    let is_count = (port & 1) != 0;
+                    if !self.flip_flop[0] {
+                        self.flip_flop[0] = true;
+                        if is_count { self.channels[ch].cur_count as u8 } else { self.channels[ch].cur_addr as u8 }
+                    } else {
+                        self.flip_flop[0] = false;
+                        if is_count { (self.channels[ch].cur_count >> 8) as u8 } else { (self.channels[ch].cur_addr >> 8) as u8 }
+                    }
+                }
+                0x08 => self.status[0],
+                0x0F => self.mask[0],
+                _ => 0,
+            };
+            return vec![val; count];
+        }
+
+        // 3. DMA 2 (16-bit: 0xC0..0xDF)
+        if (0xC0..=0xDF).contains(&port) {
+            let reg = ((port - 0xC0) >> 1) as u8;
+            let val = match reg {
+                0x00..=0x07 => {
+                    let ch = 4 + (reg >> 1) as usize;
+                    let is_count = (reg & 1) != 0;
+                    if !self.flip_flop[1] {
+                        self.flip_flop[1] = true;
+                        if is_count { self.channels[ch].cur_count as u8 } else { self.channels[ch].cur_addr as u8 }
+                    } else {
+                        self.flip_flop[1] = false;
+                        if is_count { (self.channels[ch].cur_count >> 8) as u8 } else { (self.channels[ch].cur_addr >> 8) as u8 }
+                    }
+                }
+                0x08 => self.status[1],
+                0x0F => self.mask[1],
+                _ => 0,
+            };
+            return vec![val; count];
+        }
+
+        vec![0xFF; count]
+    }
 }

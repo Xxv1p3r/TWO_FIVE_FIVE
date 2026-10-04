@@ -68,11 +68,12 @@ fn acpi_header(sig: &[u8; 4], length: u32, oem_table: &[u8; 8]) -> Vec<u8> {
     t
 }
 
-/// RSDT con una sola entrada (el FADT). El valor de la entrada es el
-/// offset del FADT dentro del blob; el loader le suma la base del blob.
-fn build_rsdt(fadt_off: u32) -> Vec<u8> {
-    let mut t = acpi_header(b"RSDT", 40, b"MI-RSDT ");
+/// RSDT con dos entradas (FADT y MADT). Los valores de las entradas son los
+/// offsets dentro del blob; el loader les suma la base del blob.
+fn build_rsdt(fadt_off: u32, madt_off: u32) -> Vec<u8> {
+    let mut t = acpi_header(b"RSDT", 44, b"MI-RSDT ");
     t.extend_from_slice(&fadt_off.to_le_bytes());
+    t.extend_from_slice(&madt_off.to_le_bytes());
     t
 }
 
@@ -213,7 +214,7 @@ pub fn build_acpi_files(num_cpus: u32) -> AcpiFiles {
     let total = (facs_off + 64) as usize;
 
     let mut tables = Vec::with_capacity(total);
-    tables.extend_from_slice(&build_rsdt(FADT_OFF));
+    tables.extend_from_slice(&build_rsdt(FADT_OFF, MADT_OFF));
     tables.resize(FADT_OFF as usize, 0);
     tables.extend_from_slice(&build_fadt(facs_off, DSDT_OFF));
     tables.resize(DSDT_OFF as usize, 0);
@@ -239,13 +240,16 @@ pub fn build_acpi_files(num_cpus: u32) -> AcpiFiles {
         ACPI_TABLES_FILE, ACPI_TABLES_FILE, RSDT_OFF + 36, 4, // RSDT[0] → FADT
     ));
     loader.extend_from_slice(&entry_add_pointer(
+        ACPI_TABLES_FILE, ACPI_TABLES_FILE, RSDT_OFF + 40, 4, // RSDT[1] → MADT
+    ));
+    loader.extend_from_slice(&entry_add_pointer(
         ACPI_TABLES_FILE, ACPI_TABLES_FILE, FADT_OFF + 34, 4, // FADT → FACS
     ));
     loader.extend_from_slice(&entry_add_pointer(
         ACPI_TABLES_FILE, ACPI_TABLES_FILE, FADT_OFF + 38, 4, // FADT → DSDT
     ));
     // 3) Checksums de cada tabla y del RSDP (tras los punteros).
-    loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, RSDT_OFF + 9, RSDT_OFF, 40));
+    loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, RSDT_OFF + 9, RSDT_OFF, 44));
     loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, FADT_OFF + 9, FADT_OFF, 116));
     loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, DSDT_OFF + 9, DSDT_OFF, 36 + 11));
     loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, MADT_OFF + 9, MADT_OFF, madt_len));
@@ -350,13 +354,18 @@ mod tests {
         assert_eq!(checksum(&rsdp[..20]), 0, "checksum RSDP");
         assert_eq!(u32::from_le_bytes(rsdp[16..20].try_into().unwrap()), 0x0010_0000);
 
-        // RSDT: checksum y entrada[0] → FADT (base + 0x40).
+        // RSDT: checksum y entrada[0] → FADT (base + 0x40), entrada[1] → MADT (base + 0xF0).
         assert_eq!(sig(&tables, 0x00), *b"RSDT");
-        assert_eq!(checksum(&tables[0x00..0x00 + 40]), 0, "checksum RSDT");
+        assert_eq!(checksum(&tables[0x00..0x00 + 44]), 0, "checksum RSDT");
         assert_eq!(
             u32::from_le_bytes(tables[0x24..0x28].try_into().unwrap()),
             0x0010_0000 + 0x40,
             "RSDT[0] apunta al FADT"
+        );
+        assert_eq!(
+            u32::from_le_bytes(tables[0x28..0x2C].try_into().unwrap()),
+            0x0010_0000 + 0xF0,
+            "RSDT[1] apunta al MADT"
         );
 
         // FADT: checksum + punteros a DSDT y FACS.
@@ -406,8 +415,8 @@ mod tests {
     #[test]
     fn loader_entries_have_expected_layout() {
         let files = build_acpi_files(2);
-        // 2 ALLOCATE + 4 ADD_POINTER + 5 ADD_CHECKSUM = 11 entradas de 128.
-        assert_eq!(files.loader.len(), 11 * ENTRY_LEN);
+        // 2 ALLOCATE + 5 ADD_POINTER + 5 ADD_CHECKSUM = 12 entradas de 128.
+        assert_eq!(files.loader.len(), 12 * ENTRY_LEN);
         // Primera: ALLOCATE de las tablas en zona alta con alineación 0x1000.
         assert_eq!(u32::from_le_bytes(files.loader[0..4].try_into().unwrap()), CMD_ALLOCATE);
         assert_eq!(

@@ -37,7 +37,7 @@ const PRI_ALT_STATUS: u16 = 0x3F6; // Alternate Status (read) / Device Control (
 const ST_ERR: u8 = 1 << 0;   // 0x01 — Error/Check
 #[allow(dead_code)]
 const ST_DRQ: u8 = 1 << 3;   // 0x08 — Data Request
-const ST_DRDY: u8 = 1 << 6;  // 0x40 — Drive Ready
+pub const ST_DRDY: u8 = 1 << 6;  // 0x40 — Drive Ready
 const ST_BSY: u8 = 1 << 7;   // 0x80 — Busy
 #[allow(dead_code)]
 const ST_DSC: u8 = 1 << 4;   // 0x10 — Seek Complete / Service
@@ -50,24 +50,30 @@ const CMD_PACKET: u8 = 0xA0;          // ATAPI PACKET
 /// Sector CD-ROM = 2048 bytes.
 const CD_SECTOR_SIZE: usize = 2048;
 
-/// If DRQ is set and SeaBIOS hasn't read the data port after this many
-/// consecutive status reads, we consider it stuck and auto-clear.
-const DRQ_STUCK_THRESHOLD: u32 = 200;
-
-// ─── SCSI commands (inside ATAPI PACKET) ───────────────────────────
 const SCSI_TEST_READY: u8 = 0x00;
 const SCSI_REQ_SENSE: u8 = 0x03;
+const SCSI_READ_6: u8 = 0x08;
 const SCSI_INQUIRY: u8 = 0x12;
 const SCSI_MODE_SENSE_6: u8 = 0x1A;
 const SCSI_START_STOP: u8 = 0x1B;
 const SCSI_PREVENT_ALLOW: u8 = 0x1E;
+const SCSI_READ_FORMAT_CAPACITIES: u8 = 0x23;
 const SCSI_READ_CAP_10: u8 = 0x25;
 const SCSI_READ_10: u8 = 0x28;
-
+const SCSI_SEEK_10: u8 = 0x2B;
+const SCSI_SYNCHRONIZE_CACHE: u8 = 0x35;
+const SCSI_READ_TOC: u8 = 0x43;
+const SCSI_GET_CONFIGURATION: u8 = 0x46;
+const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
+const SCSI_READ_DISC_INFO: u8 = 0x51;
+const SCSI_MODE_SENSE_10: u8 = 0x5A;
+const SCSI_READ_12: u8 = 0xA8;
+const SCSI_MECHANISM_STATUS: u8 = 0xBD;
+const SCSI_READ_CD: u8 = 0xBE;
 
 // ─── Estado del CD-ROM ATAPI ───────────────────────────────────────
 #[derive(PartialEq, Clone, Copy, Debug)]
-enum AtapiPhase {
+pub enum AtapiPhase {
     Idle,
     CdbIn,      // Esperando CDB (12 bytes) del guest
     DataIn,     // Leyendo datos hacia el guest
@@ -93,20 +99,27 @@ struct CdromState {
     reg_sc: u8,
     reg_sn: u8,
     reg_dh: u8,
-    /// When true, next status read returns BSY, then ERR.
-    /// Used for ATA IDENTIFY (0xEC) on CD-ROM: tells SeaBIOS to try ATAPI.
-    pending_ata_error: bool,
-    /// When true, next status read returns BSY (device processing).
-    /// After BSY is seen, transitions to DataIn (DRQ). Simulates the
-    /// normal ATA command flow: BSY → clear → DRQ.
-    pending_identify: bool,
-    /// When true, next status read returns BSY (device processing PACKET command).
-    /// After BSY is seen, transitions to CdbIn (DRQ) so SeaBIOS can send the CDB.
-    pending_packet: bool,
+    /// Cylinder Low (0x174) y High (0x175): firma ATAPI 0x14 y 0xEB.
+    /// libata (Linux) exige que tras IDENTIFY (0xEC) o reset estos registros
+    /// valgan 0x14 y 0xEB; de lo contrario clasifica el canal como DEV_NONE y
+    /// no expone /dev/sr0 al sistema.
+    reg_cl: u8,
+    reg_ch: u8,
+    reg_error: u8,
+    irq_pending: bool,
+    nien: bool,
+    /// Límite de bytes por bloque DRQ establecido por el host en Cilindro Low/High (0x174/0x175).
+    byte_count_limit: usize,
+    /// Tamaño del bloque DRQ actual que se está transfiriendo.
+    current_chunk_len: usize,
+    /// Bytes ya transferidos del bloque DRQ actual.
+    chunk_offset: usize,
     /// Count of consecutive status reads where DRQ was set but data was not
     /// consumed from the data port. If this exceeds DRQ_STUCK_THRESHOLD,
     /// the DRQ state is cleared to prevent infinite loops in SeaBIOS.
     drq_unread_count: u32,
+    pub reg_feature: u8,
+    pub dma_active: bool,
 }
 
 impl Default for CdromState {
@@ -120,22 +133,30 @@ impl Default for CdromState {
             sense_key: 0,
             sense_asc: 0,
             sense_ascq: 0,
-            reg_sc: 0,
-            reg_sn: 0,
+            reg_sc: 0x01,
+            reg_sn: 0x01,
+            reg_cl: 0x14, // ATAPI signature low
+            reg_ch: 0xEB, // ATAPI signature high
             reg_dh: 0,
-            pending_ata_error: false,
-            pending_identify: false,
-            pending_packet: false,
+            reg_error: 0x01, // 0x01 = Device 0 passed diagnostics, Device 1 passed/absent
+            irq_pending: false,
+            nien: false,
+            byte_count_limit: 0xFFFE,
+            current_chunk_len: 0,
+            chunk_offset: 0,
             drq_unread_count: 0,
+            reg_feature: 0,
+            dma_active: false,
         }
     }
 }
 pub struct CdRom {
     iso_file: Option<File>,
-    iso_size: u64,
+    pub iso_size: u64,
     #[allow(dead_code)]
     sector_bytes: usize,
     state: CdromState,
+    pub sectors_read_total: u64,
 }
 
 impl CdRom {
@@ -183,6 +204,7 @@ impl CdRom {
             iso_size,
             sector_bytes: CD_SECTOR_SIZE,
             state: CdromState::default(),
+            sectors_read_total: 0,
         })
     }
 
@@ -193,7 +215,31 @@ impl CdRom {
             iso_size: 0,
             sector_bytes: CD_SECTOR_SIZE,
             state: CdromState::default(),
+            sectors_read_total: 0,
         }
+    }
+
+    pub fn is_inserted(&self) -> bool {
+        self.iso_file.is_some()
+    }
+
+    pub fn eject(&mut self) {
+        self.iso_file = None;
+        self.iso_size = 0;
+        self.state = CdromState::default();
+        self.state.sense_key = 0x02; // NOT READY
+        self.state.sense_asc = 0x3A; // MEDIUM NOT PRESENT
+    }
+
+    pub fn insert(&mut self, iso_path: &str) -> Result<u64, Box<dyn std::error::Error>> {
+        let f = File::open(iso_path)?;
+        let size = f.metadata()?.len();
+        self.iso_file = Some(f);
+        self.iso_size = size;
+        self.state = CdromState::default();
+        self.state.sense_key = 0x06; // UNIT ATTENTION
+        self.state.sense_asc = 0x28; // NOT READY TO READY CHANGE
+        Ok(size)
     }
 
     /// Reset del dispositivo (reset hardware del canal ATAPI): vuelve a la
@@ -202,51 +248,81 @@ impl CdRom {
         self.state = CdromState::default();
     }
 
+    pub fn raise_irq(&mut self) {
+        if !self.state.nien {
+            self.state.irq_pending = true;
+        }
+    }
+
+    pub fn take_irq(&mut self) -> bool {
+        let pending = self.state.irq_pending;
+        self.state.irq_pending = false;
+        pending
+    }
+
+    pub fn irq_pending(&self) -> bool {
+        self.state.irq_pending && !self.state.nien
+    }
+
+    pub fn has_dma_data(&self) -> bool {
+        !self.state.data_buf.is_empty()
+    }
+
+    pub fn get_data_offset(&self) -> usize {
+        self.state.data_offset
+    }
+
+    pub fn get_data_len(&self) -> usize {
+        self.state.data_buf.len()
+    }
+
+    pub fn get_data_byte(&self, idx: usize) -> u8 {
+        self.state.data_buf.get(idx).copied().unwrap_or(0)
+    }
+
+    pub fn set_data_offset(&mut self, off: usize) {
+        self.state.data_offset = off;
+    }
+
+    pub fn clear_data_buf(&mut self) {
+        self.state.data_buf.clear();
+    }
+
+    pub fn set_data_buf(&mut self, buf: Vec<u8>) {
+        self.state.data_buf = buf;
+    }
+
+    pub fn set_phase(&mut self, phase: AtapiPhase) {
+        self.state.phase = phase;
+    }
+
+    pub fn is_dma_active(&self) -> bool {
+        self.state.dma_active
+    }
+
+    pub fn set_dma_active(&mut self, active: bool) {
+        self.state.dma_active = active;
+    }
+
+    pub fn get_data_slice(&self, offset: usize, len: usize) -> &[u8] {
+        let end = (offset + len).min(self.state.data_buf.len());
+        if offset < end {
+            &self.state.data_buf[offset..end]
+        } else {
+            &[]
+        }
+    }
+
     /// Calcula el byte de status para devolver al guest.
     fn current_status(&mut self) -> u8 {
-        // ATA IDENTIFY on CD-ROM: first read returns ERR, then clears the flag
-        if self.state.pending_ata_error {
-            self.state.pending_ata_error = false;
-            return ST_DRDY | ST_ERR; // ERR tells SeaBIOS to try ATAPI IDENTIFY
-        }
-        // ATAPI IDENTIFY: first read returns BSY (device processing),
-        // then transitions to DataIn (DRQ). Simulates real ATA flow.
-        if self.state.pending_identify {
-            self.state.pending_identify = false;
-            self.state.phase = AtapiPhase::DataIn;
-            self.state.drq_unread_count = 0; // Reset stuck counter
-            return ST_DRDY | ST_BSY; // BSY = device is processing
-        }
-        // ATAPI PACKET (0xA0): first read returns BSY (device processing),
-        // then transitions to CdbIn (DRQ) so SeaBIOS can send the 12-byte CDB.
-        if self.state.pending_packet {
-            self.state.pending_packet = false;
-            self.state.phase = AtapiPhase::CdbIn;
-            self.state.cdb = [0u8; 12];
-            self.state.cdb_offset = 0;
-            self.state.drq_unread_count = 0;
-            return ST_DRDY | ST_BSY; // First read: BSY
-        }
-        let status = match self.state.phase {
+        let mut status = match self.state.phase {
             AtapiPhase::Idle => ST_DRDY,
             AtapiPhase::CdbIn => ST_DRDY | ST_DRQ,
             AtapiPhase::DataIn => ST_DRDY | ST_DRQ,
             AtapiPhase::StatusIn => ST_DRDY,
         };
-        // DRQ stuck detection: if DRQ is set, increment counter.
-        // If it exceeds threshold without data being consumed, clear the state.
-        if status & ST_DRQ != 0 && self.state.data_offset < self.state.data_buf.len() {
-            self.state.drq_unread_count += 1;
-            if self.state.drq_unread_count >= DRQ_STUCK_THRESHOLD {
-                eprintln!("[CDROM] DRQ stuck after {} status reads — clearing", self.state.drq_unread_count);
-                self.state.data_buf.clear();
-                self.state.data_offset = 0;
-                self.state.phase = AtapiPhase::StatusIn;
-                self.state.drq_unread_count = 0;
-                return ST_DRDY | ST_ERR; // Signal error so SeaBIOS retries
-            }
-        } else {
-            self.state.drq_unread_count = 0;
+        if self.state.sense_key != 0 || (self.state.reg_error != 0 && self.state.reg_error != 0x01) {
+            status |= ST_ERR;
         }
         status
     }
@@ -255,16 +331,18 @@ impl CdRom {
     fn do_identify_packet(&mut self) {
         let mut pkt = [0u8; 512];
 
-        // Word 0: ATAPI flag + removable
-        pkt[0] = 0x80; // bit 7 = removable device
-        pkt[1] = 0x05; // ATAPI device type = CD-ROM
-        //      SeaBIOS exige ((word0 >> 8) & 0x1f) == 0x05 para iscd=true,
-        //      de lo contrario no lo registra como CD bootable.
+        // Word 0: ATAPI flag + removable + CD-ROM device (0x8580)
+        // Bit 15=1 (ATAPI device: Linux ata_id_is_ata() comprueba bit 15 == 0; si es 0 falla con 'invalid type')
+        // Bits 12:8 = 0x05 (CD-ROM: SeaBIOS comprueba ((word0 >> 8) & 0x1f) == 0x05 para iscd=true)
+        // Bit 7 = 1 (removable device)
+        // Bits 1:0 = 0 (12-byte CDB)
+        pkt[0] = 0x80;
+        pkt[1] = 0x85;
 
         // Word 1: cylindros = 0 (ignored for ATAPI)
-        // Word 49-50: capabilities
-        pkt[98] = 0x00; // LBA supported
-        pkt[99] = 0x02; // IORDY supported
+        // Word 49: capabilities: Bit 9 = LBA (0x0200), Bit 11 = IORDY (0x0800) -> 0x0A00
+        pkt[98] = 0x00;
+        pkt[99] = 0x0A;
 
         // Word 53: fields valid
         pkt[106] = 0x06; // words 88 and 70 valid
@@ -278,10 +356,15 @@ impl CdRom {
         // Word 76-79: serial
         pkt[152..160].copy_from_slice(b"VMM0001 ");
 
+        // Word 80: Major version (bits 1..6 = ATA/ATAPI-1 a ATA/ATAPI-6)
+        pkt[160] = 0x7E;
+        pkt[161] = 0x00;
+
         // Word 82-84: command set (nop, atapi pkt, atapi mgr, generic)
         pkt[164] = 0x00;
         pkt[165] = 0x00;
         pkt[166] = 0x20; // ATAPI PACKET command
+        pkt[167] = 0x40; // Word 83 bit 14=1
 
         // Word 100-103: total LBA (48-bit, we use 32-bit)
         let total_lba = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
@@ -304,22 +387,47 @@ impl CdRom {
             slot[1] = get(i * 2);
         }
 
-        self.state.data_buf = pkt.to_vec();
-        self.state.data_offset = 0;
-        // Don't set DataIn yet — first status read returns BSY,
-        // then transitions to DataIn (DRQ) on second read.
-        self.state.pending_identify = true;
+        self.state.reg_sc = 0x02; // Interrupt reason: IO=1, CoD=0
+        self.state.byte_count_limit = 512;
+        self.start_data_in(pkt.to_vec());
 
         eprintln!("[CDROM] ATAPI IDENTIFY → CD-ROM ATAPI detectado");
     }
 
-    /// ATA IDENTIFY (cmd 0xEC) — on a CD-ROM, this should return BSY
-    /// so SeaBIOS knows to try ATAPI IDENTIFY (0xA1) instead.
-    /// We simulate: first read returns BSY, second read returns ERR.
+    /// Prepara una transferencia DataIn aplicando el byte_count_limit del host (fragmentación DRQ si aplica).
+    fn start_data_in(&mut self, buf: Vec<u8>) {
+        let total = buf.len();
+        self.state.data_buf = buf;
+        self.state.data_offset = 0;
+        self.state.chunk_offset = 0;
+        let limit = if self.state.byte_count_limit == 0 {
+            0xFFFE
+        } else {
+            self.state.byte_count_limit
+        };
+        let chunk = total.min(limit);
+        self.state.current_chunk_len = chunk;
+        self.state.reg_cl = (chunk & 0xFF) as u8;
+        self.state.reg_ch = ((chunk >> 8) & 0xFF) as u8;
+        self.state.phase = AtapiPhase::DataIn;
+        if (self.state.reg_feature & 0x01) != 0 {
+            self.state.dma_active = true;
+        } else {
+            self.raise_irq();
+        }
+    }
+
+    /// ATA IDENTIFY (cmd 0xEC) — en un CD-ROM ATAPI, este comando debe abortar (ABRT=0x04, ST_ERR)
+    /// y reportar en Cylinder Low/High la firma mágica ATAPI (0x14, 0xEB).
     fn do_identify(&mut self) {
-        self.state.pending_ata_error = true;
         self.state.phase = AtapiPhase::Idle;
-        eprintln!("[CDROM] ATA IDENTIFY → CD-ROM no es ATA, reportando error para ATAPI fallback");
+        self.state.reg_cl = 0x14; // ATAPI signature low
+        self.state.reg_ch = 0xEB; // ATAPI signature high
+        self.state.reg_error = 0x04; // ABRT
+        self.state.reg_sc = 0x01;
+        self.state.reg_sn = 0x01;
+        self.raise_irq();
+        eprintln!("[CDROM] ATA IDENTIFY → CD-ROM no es ATA, reportando firma ATAPI (0x14, 0xEB)");
     }
 
     /// Ejecuta un SCSI command recibido vía ATAPI PACKET.
@@ -330,6 +438,7 @@ impl CdRom {
                 // TEST UNIT READY: always ready
                 self.state.phase = AtapiPhase::StatusIn;
                 self.state.sense_key = 0;
+                self.raise_irq();
             }
             SCSI_REQ_SENSE => {
                 // REQUEST SENSE: return sense data
@@ -341,13 +450,11 @@ impl CdRom {
                 sense[7] = 10; // additional sense length
                 sense[12] = self.state.sense_asc;
                 sense[13] = self.state.sense_ascq;
-                self.state.data_buf = sense[..len].to_vec();
-                self.state.data_offset = 0;
-                self.state.phase = AtapiPhase::DataIn;
                 // Clear sense after reporting
                 self.state.sense_key = 0;
                 self.state.sense_asc = 0;
                 self.state.sense_ascq = 0;
+                self.start_data_in(sense[..len].to_vec());
             }
             SCSI_INQUIRY => {
                 let alloc = self.state.cdb[4] as usize;
@@ -369,9 +476,7 @@ impl CdRom {
                 // Product revision (4 bytes)
                 inq[32..36].copy_from_slice(b"1.0 ");
                 let len = alloc.min(96);
-                self.state.data_buf = inq[..len].to_vec();
-                self.state.data_offset = 0;
-                self.state.phase = AtapiPhase::DataIn;
+                self.start_data_in(inq[..len].to_vec());
                 eprintln!("[CDROM] SCSI INQUIRY → CD-ROM, 96 bytes");
             }
             SCSI_MODE_SENSE_6 => {
@@ -387,31 +492,18 @@ impl CdRom {
                 ms[6] = 0x1E; // page length = 30 bytes
                 // Multiple session: 1, Audio play: 1, CD-RW: 0
                 ms[7] = 0x00;
-                // Read speeds supported
-                ms[8] = 0x00;
-                ms[9] = 0x00;
-                // Number of volume levels (0 = audio not supported)
-                ms[10] = 0x00;
-                ms[11] = 0x00;
-                // Buffer size (in 512-byte units): 0
-                ms[12] = 0x00;
-                ms[13] = 0x00;
-                // Current read speed
-                ms[14] = 0x00;
-                ms[15] = 0x00;
-
                 let len = alloc.min(36);
-                self.state.data_buf = ms[..len].to_vec();
-                self.state.data_offset = 0;
-                self.state.phase = AtapiPhase::DataIn;
+                self.start_data_in(ms[..len].to_vec());
             }
             SCSI_START_STOP => {
                 // START/STOP UNIT (for media eject/load)
                 self.state.phase = AtapiPhase::StatusIn;
+                self.raise_irq();
             }
             SCSI_PREVENT_ALLOW => {
                 // PREVENT/ALLOW MEDIUM REMOVAL
                 self.state.phase = AtapiPhase::StatusIn;
+                self.raise_irq();
             }
             SCSI_READ_CAP_10 => {
                 // READ CAPACITY(10): returns 8 bytes
@@ -421,9 +513,7 @@ impl CdRom {
                 let mut cap = [0u8; 8];
                 cap[0..4].copy_from_slice(&last_lba.to_be_bytes());
                 cap[4..8].copy_from_slice(&block_size.to_be_bytes());
-                self.state.data_buf = cap.to_vec();
-                self.state.data_offset = 0;
-                self.state.phase = AtapiPhase::DataIn;
+                self.start_data_in(cap.to_vec());
                 eprintln!(
                     "[CDROM] SCSI READ CAPACITY → last_lba={} block_size={}",
                     last_lba, block_size
@@ -448,7 +538,9 @@ impl CdRom {
                     );
                     self.state.sense_key = 0x05; // ILLEGAL REQUEST
                     self.state.sense_asc = 0x21; // LBA out of range
+                    self.state.reg_error = (self.state.sense_key << 4) | 0x04;
                     self.state.phase = AtapiPhase::StatusIn;
+                    self.raise_irq();
                     return;
                 }
 
@@ -458,13 +550,271 @@ impl CdRom {
                         let _ = f.read_exact(&mut buf);
                     }
                 }
-                self.state.data_buf = buf;
-                self.state.data_offset = 0;
-                self.state.phase = AtapiPhase::DataIn;
-                eprintln!(
-                    "[CDROM] SCSI READ(10) LBA={} len={} ({} bytes)",
-                    lba, transfer_len, byte_count
-                );
+                self.sectors_read_total += transfer_len as u64;
+                self.start_data_in(buf);
+            }
+            SCSI_READ_TOC => {
+                let msf = (self.state.cdb[1] & 0x02) != 0;
+                let format = self.state.cdb[2] & 0x0F;
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
+
+                let lba_to_msf = |lba: u32| -> [u8; 4] {
+                    let f = (lba % 75) as u8;
+                    let s = ((lba / 75) % 60) as u8;
+                    let m = (lba / (75 * 60)) as u8;
+                    [0x00, m, s, f]
+                };
+
+                let buf = match format {
+                    0 => {
+                        // Standard TOC: Header (4 bytes) + Track 1 (8 bytes) + Lead-out (8 bytes) = 20 bytes
+                        let mut toc = vec![0u8; 20];
+                        let len: u16 = 18;
+                        toc[0..2].copy_from_slice(&len.to_be_bytes());
+                        toc[2] = 1; // first track
+                        toc[3] = 1; // last track
+
+                        // Track 1
+                        toc[4] = 0;
+                        toc[5] = 0x14; // ADR=1, Control=4 (data track)
+                        toc[6] = 1;
+                        toc[7] = 0;
+                        if msf {
+                            toc[8..12].copy_from_slice(&lba_to_msf(150));
+                        } else {
+                            toc[8..12].copy_from_slice(&0u32.to_be_bytes());
+                        }
+
+                        // Lead-out (track 0xAA)
+                        toc[12] = 0;
+                        toc[13] = 0x14;
+                        toc[14] = 0xAA;
+                        toc[15] = 0;
+                        if msf {
+                            toc[16..20].copy_from_slice(&lba_to_msf(total_sectors + 150));
+                        } else {
+                            toc[16..20].copy_from_slice(&total_sectors.to_be_bytes());
+                        }
+                        toc
+                    }
+                    1 => {
+                        // Multi-session info: Header (4 bytes) + Track descriptor (8 bytes) = 12 bytes
+                        let mut toc = vec![0u8; 12];
+                        let len: u16 = 10;
+                        toc[0..2].copy_from_slice(&len.to_be_bytes());
+                        toc[2] = 1;
+                        toc[3] = 1;
+
+                        toc[4] = 0;
+                        toc[5] = 0x14;
+                        toc[6] = 1;
+                        toc[7] = 0;
+                        if msf {
+                            toc[8..12].copy_from_slice(&lba_to_msf(150));
+                        } else {
+                            toc[8..12].copy_from_slice(&0u32.to_be_bytes());
+                        }
+                        toc
+                    }
+                    _ => vec![0u8; 4],
+                };
+                let send_len = alloc.min(buf.len());
+                self.start_data_in(buf[..send_len].to_vec());
+            }
+            0x52 => {
+                // READ TRACK INFORMATION (MMC)
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
+                let mut info = [0u8; 36];
+                let len: u16 = 34;
+                info[0..2].copy_from_slice(&len.to_be_bytes());
+                info[2] = 1; // track number LSB
+                info[3] = 1; // session number LSB
+                info[5] = 0x04; // data track
+                info[6] = 0x01; // mode 1
+                info[8..12].copy_from_slice(&0u32.to_be_bytes());
+                info[24..28].copy_from_slice(&total_sectors.to_be_bytes());
+                let send_len = alloc.min(36);
+                self.start_data_in(info[..send_len].to_vec());
+            }
+            SCSI_MODE_SENSE_10 => {
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let page_code = self.state.cdb[2] & 0x3F;
+                let mut ms = vec![0u8; 44];
+                let mode_len: u16 = 42;
+                ms[0..2].copy_from_slice(&mode_len.to_be_bytes());
+                ms[2] = 0x00; // medium type
+                ms[3] = 0x80; // write protected
+                ms[4..8].copy_from_slice(&[0u8; 4]);
+
+                // Mode page 0x2A (CD-ROM capabilities)
+                ms[8] = 0x2A;
+                ms[9] = 0x1E;
+                ms[10] = 0x00;
+                ms[11] = 0x00;
+                ms[16] = 0x02; ms[17] = 0xC0; // max read speed (4x)
+                ms[22] = 0x02; ms[23] = 0xC0; // cur read speed
+
+                let len = alloc.min(if page_code == 0x2A || page_code == 0x3F { 44 } else { 8 });
+                self.start_data_in(ms[..len].to_vec());
+                eprintln!("[CDROM] SCSI MODE SENSE(10) page={:#x} alloc={} -> {} bytes", page_code, alloc, len);
+            }
+            SCSI_GET_EVENT_STATUS => {
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let mut ev = [0u8; 8];
+                let len: u16 = 4;
+                ev[0..2].copy_from_slice(&len.to_be_bytes());
+                ev[2] = 0x84; // NEA | class 4 (Media)
+                ev[3] = 0x00;
+                ev[4] = 0x02; // Media present
+                let send_len = alloc.min(8);
+                self.start_data_in(ev[..send_len].to_vec());
+            }
+            SCSI_GET_CONFIGURATION => {
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let mut conf = [0u8; 8];
+                let len: u32 = 4;
+                conf[0..4].copy_from_slice(&len.to_be_bytes());
+                conf[6] = 0x00;
+                conf[7] = 0x08; // Profile 0x08: CD-ROM
+                let send_len = alloc.min(8);
+                self.start_data_in(conf[..send_len].to_vec());
+            }
+            SCSI_READ_DISC_INFO => {
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let mut info = [0u8; 34];
+                let len: u16 = 32;
+                info[0..2].copy_from_slice(&len.to_be_bytes());
+                info[2] = 0x0E;
+                info[3] = 1;
+                info[4] = 1;
+                info[5] = 1;
+                info[6] = 1;
+                info[7] = 0x20;
+                info[8] = 0x00;
+                let send_len = alloc.min(34);
+                self.start_data_in(info[..send_len].to_vec());
+            }
+            SCSI_READ_12 => {
+                let lba = u32::from_be_bytes([
+                    self.state.cdb[2],
+                    self.state.cdb[3],
+                    self.state.cdb[4],
+                    self.state.cdb[5],
+                ]);
+                let transfer_len = u32::from_be_bytes([
+                    self.state.cdb[6],
+                    self.state.cdb[7],
+                    self.state.cdb[8],
+                    self.state.cdb[9],
+                ]);
+                let byte_count = transfer_len as u64 * CD_SECTOR_SIZE as u64;
+                let offset = lba as u64 * CD_SECTOR_SIZE as u64;
+
+                if offset + byte_count > self.iso_size {
+                    eprintln!(
+                        "[CDROM] READ(12) LBA={} len={} fuera de rango",
+                        lba, transfer_len
+                    );
+                    self.state.sense_key = 0x05; // ILLEGAL REQUEST
+                    self.state.sense_asc = 0x21; // LBA out of range
+                    self.state.reg_error = (self.state.sense_key << 4) | 0x04;
+                    self.state.phase = AtapiPhase::StatusIn;
+                    self.raise_irq();
+                    return;
+                }
+
+                let mut buf = vec![0u8; byte_count as usize];
+                if let Some(ref mut f) = self.iso_file {
+                    if f.seek(SeekFrom::Start(offset)).is_ok() {
+                        let _ = f.read_exact(&mut buf);
+                    }
+                }
+                self.sectors_read_total += transfer_len as u64;
+                self.start_data_in(buf);
+            }
+            SCSI_READ_6 => {
+                let lba = (((self.state.cdb[1] & 0x1F) as u32) << 16)
+                    | ((self.state.cdb[2] as u32) << 8)
+                    | (self.state.cdb[3] as u32);
+                let mut transfer_len = self.state.cdb[4] as u32;
+                if transfer_len == 0 {
+                    transfer_len = 256;
+                }
+                let byte_count = transfer_len as u64 * CD_SECTOR_SIZE as u64;
+                let offset = lba as u64 * CD_SECTOR_SIZE as u64;
+
+                if offset + byte_count > self.iso_size {
+                    self.state.sense_key = 0x05;
+                    self.state.sense_asc = 0x21;
+                    self.state.reg_error = (self.state.sense_key << 4) | 0x04;
+                    self.state.phase = AtapiPhase::StatusIn;
+                    self.raise_irq();
+                    return;
+                }
+
+                let mut buf = vec![0u8; byte_count as usize];
+                if let Some(ref mut f) = self.iso_file {
+                    if f.seek(SeekFrom::Start(offset)).is_ok() {
+                        let _ = f.read_exact(&mut buf);
+                    }
+                }
+                self.sectors_read_total += transfer_len as u64;
+                self.start_data_in(buf);
+            }
+            SCSI_READ_FORMAT_CAPACITIES => {
+                let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
+                let mut cap = vec![0u8; 12];
+                cap[3] = 8; // capacity list length
+                cap[4..8].copy_from_slice(&total_sectors.to_be_bytes());
+                cap[8] = 0x02; // formatted media
+                cap[9..12].copy_from_slice(&[0x00, 0x08, 0x00]); // 2048 bytes block length
+                let len = alloc.min(12);
+                self.start_data_in(cap[..len].to_vec());
+            }
+            SCSI_SEEK_10 | SCSI_SYNCHRONIZE_CACHE => {
+                self.state.phase = AtapiPhase::StatusIn;
+                self.raise_irq();
+            }
+            SCSI_READ_CD => {
+                let lba = u32::from_be_bytes([
+                    self.state.cdb[2],
+                    self.state.cdb[3],
+                    self.state.cdb[4],
+                    self.state.cdb[5],
+                ]);
+                let transfer_len = ((self.state.cdb[6] as u32) << 16)
+                    | ((self.state.cdb[7] as u32) << 8)
+                    | (self.state.cdb[8] as u32);
+                let byte_count = transfer_len as u64 * CD_SECTOR_SIZE as u64;
+                let offset = lba as u64 * CD_SECTOR_SIZE as u64;
+
+                if offset + byte_count > self.iso_size {
+                    self.state.sense_key = 0x05;
+                    self.state.sense_asc = 0x21;
+                    self.state.reg_error = (self.state.sense_key << 4) | 0x04;
+                    self.state.phase = AtapiPhase::StatusIn;
+                    self.raise_irq();
+                    return;
+                }
+
+                let mut buf = vec![0u8; byte_count as usize];
+                if let Some(ref mut f) = self.iso_file {
+                    if f.seek(SeekFrom::Start(offset)).is_ok() {
+                        let _ = f.read_exact(&mut buf);
+                    }
+                }
+                self.sectors_read_total += transfer_len as u64;
+                self.start_data_in(buf);
+            }
+            SCSI_MECHANISM_STATUS => {
+                let alloc = u16::from_be_bytes([self.state.cdb[8], self.state.cdb[9]]) as usize;
+                let mut resp = vec![0u8; 8];
+                resp[5] = 1; // 1 slot
+                let len = alloc.min(8);
+                self.start_data_in(resp[..len].to_vec());
             }
             _ => {
                 eprintln!(
@@ -474,7 +824,9 @@ impl CdRom {
                 );
                 self.state.sense_key = 0x05; // ILLEGAL REQUEST
                 self.state.sense_asc = 0x20; // INVALID COMMAND OPERATION CODE
+                self.state.reg_error = (self.state.sense_key << 4) | 0x04;
                 self.state.phase = AtapiPhase::StatusIn;
+                self.raise_irq();
             }
         }
     }
@@ -502,6 +854,11 @@ pub struct PrimaryIde {
     drive_select: u8,
     /// Último comando ATA recibido (para diagnóstico)
     last_cmd: u8,
+    pub dma_active: bool,
+    pub dma_is_write: bool,
+    pub irq_pending: bool,
+    pub sectors_read_total: u64,
+    pub sectors_written_total: u64,
 }
 
 impl PrimaryIde {
@@ -516,8 +873,29 @@ impl PrimaryIde {
             data_offset: 0,
             drive_select: 0,
             last_cmd: 0,
+            dma_active: false,
+            dma_is_write: false,
+            irq_pending: false,
+            sectors_read_total: 0,
+            sectors_written_total: 0,
         }
+    }
+
+    pub fn get_lba(&self) -> u64 {
+        self.lba
+    }
+
+    pub fn get_sector_count(&self) -> u16 {
+        if self.sector_count == 0 {
+            256
+        } else {
+            self.sector_count
         }
+    }
+
+    pub fn set_status(&mut self, s: u8) {
+        self.status = s;
+    }
 
     /// Carga un disco duro raw (.img) para el canal primario.
     ///
@@ -548,12 +926,23 @@ impl PrimaryIde {
             data_offset: 0,
             drive_select: 0,
             last_cmd: 0,
+            dma_active: false,
+            dma_is_write: false,
+            irq_pending: false,
+            sectors_read_total: 0,
+            sectors_written_total: 0,
         })
     }
 
     /// Indica si hay un disco conectado
     pub fn has_disk(&self) -> bool {
         self.disk_file.is_some()
+    }
+
+    pub fn take_irq(&mut self) -> bool {
+        let p = self.irq_pending;
+        self.irq_pending = false;
+        p
     }
 
     /// Reset del dispositivo ATA: borra el estado de la transferencia actual.
@@ -565,67 +954,77 @@ impl PrimaryIde {
         self.data_offset = 0;
         self.drive_select = 0;
         self.last_cmd = 0;
+        self.dma_active = false;
+        self.dma_is_write = false;
+        self.irq_pending = false;
     }
 
     /// Construye un IDENTIFY DEVICE response (512 bytes) para un disco duro ATA
     fn build_identify(&self) -> Vec<u8> {
         let mut buf = vec![0u8; 512];
 
-        // Word 0: general configuration
-        let mut word0: u16 = 0;
-        if self.drive_select & 0x40 != 0 { word0 |= 0x01; } // LBA
-        buf[0] = (word0 & 0xFF) as u8;
-        buf[1] = ((word0 >> 8) & 0xFF) as u8;
+        // Word 0: general configuration (0x0040: non-removable ATA device)
+        buf[0] = 0x40;
+        buf[1] = 0x00;
 
         // Word 1: cylinders (16383)
         buf[2] = 0x3F; buf[3] = 0x3F;
-        buf[4] = 0x00; buf[5] = 0x00;
-        buf[8] = 0x03; buf[9] = 0x00;
-        buf[14] = 0; buf[15] = 0;
-        // Word 8-10: serial number (20 bytes)
-        let serial = b"MI-VMM-HDD      ";
+        // Word 3: heads (16)
+        buf[6] = 16;   buf[7] = 0;
+        // Word 6: sectors per track (63)
+        buf[12] = 63;  buf[13] = 0;
+
+        // Word 10-19: serial number (20 bytes)
+        let serial = b"MI-VMM-HDD0     ";
         for (i, &b) in serial.iter().take(20).enumerate() {
-            buf[16 + i] = b;
+            buf[20 + i] = b;
         }
-        buf[24] = 3; buf[25] = 0;
-        buf[26] = 0; buf[27] = 0;
-        buf[28] = 0x3F; buf[29] = 0x3F;
-        buf[30] = 16; buf[31] = 0;
-        buf[32] = 63; buf[33] = 0;
-        buf[34] = 63; buf[35] = 0;
-        buf[36] = 63; buf[37] = 0;
-        let total_sectors = (self.disk_size / 512).max(1) as u32;
-        buf[40..44].copy_from_slice(&total_sectors.to_le_bytes());
-        // Firmware revision at word 23 (offset 46-53)
+
+        // Word 23-26: firmware revision (8 bytes)
         buf[46..54].copy_from_slice(b"01.00   ");
-        // Model name at word 27 (offset 54-93), 40 chars, byte-swapped per ATA spec
-        let model = b"MI-VMM Virtual HDD ";
+
+        // Word 27-46: model name (40 chars, byte-swapped per ATA spec)
+        let model = b"MI-VMM Virtual HDD                      ";
         for (i, slot) in buf[54..94].chunks_mut(2).enumerate() {
             let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
             slot[0] = get(i * 2 + 1);
             slot[1] = get(i * 2);
         }
-        buf[98] = 0x00; buf[99] = 0x02; // LBA
+
+        // Word 49: capabilities (LBA supported = 0x0200)
+        buf[98] = 0x00; buf[99] = 0x02;
+
+        // Word 53: fields valid
         buf[106] = 0x06; buf[107] = 0x00;
-        buf[108] = 0x3F; buf[109] = 0x3F;
-        buf[112] = 0x10; buf[113] = 0x00;
-        buf[116] = 0x3F; buf[117] = 0x3F;
-        buf[126] = 0x07; buf[127] = 0x00;
-        buf[128] = 0x03; buf[129] = 0x00;
-        buf[172] = 0x00; buf[173] = 0x00;
-        buf[174] = 0x00; buf[175] = 0x00;
-        let lba_total = self.disk_size / 512;
-        buf[200..204].copy_from_slice(&lba_total.to_le_bytes());
+
+        // Word 59: Ultra DMA modes supported
+        buf[118] = 0x70; buf[119] = 0x00;
+
+        let total_sectors = (self.disk_size / 512).max(1);
+        let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
+        // Word 60-61 (offset 120-123): Total LBA28 sectors
+        buf[120..124].copy_from_slice(&lba28.to_le_bytes());
+
+        // Word 83 (offset 166-167): LBA48 feature set supported
+        buf[166] = 0x00; buf[167] = 0x44;
+        // Word 86 (offset 172-173): LBA48 feature set enabled
+        buf[172] = 0x00; buf[173] = 0x04;
+        // Word 93 (offset 186-187): Hardware reset result
+        buf[186] = 0x40; buf[187] = 0x41;
+
+        // Word 100-103 (offset 200-207): Total LBA48 sectors (64-bit LE)
+        buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
 
         buf
     }
 
     /// Lee n sectores del disco a partir del LBA
-    fn read_sectors(&mut self, lba: u64, count: u16) -> Vec<u8> {
+    pub fn read_sectors(&mut self, lba: u64, count: u16) -> Vec<u8> {
         let mut buf = vec![0u8; (count as usize) * 512];
         if let Some(ref mut f) = self.disk_file {
             if let Ok(_) = f.seek(SeekFrom::Start(lba * 512)) {
                 let _ = f.read_exact(&mut buf);
+                self.sectors_read_total += count as u64;
             }
         }
         buf
@@ -635,7 +1034,7 @@ impl PrimaryIde {
     /// datos queden persistidos en el archivo antes de devolver status OK.
     /// Devuelve false si el archivo no está abierto, los datos no cubren
     /// `count*512` bytes o la escritura/fsync falla (el guest verá ST_ERR).
-    fn write_sectors(&mut self, lba: u64, count: u16, data: &[u8]) -> bool {
+    pub fn write_sectors(&mut self, lba: u64, count: u16, data: &[u8]) -> bool {
         let Some(file) = self.disk_file.as_mut() else {
             eprintln!("[ATA] WRITE sin archivo de disco (LBA={:#x})", lba);
             return false;
@@ -654,6 +1053,7 @@ impl PrimaryIde {
             eprintln!("[ATA] ERROR escribiendo LBA={:#x} count={}: {}", lba, count, e);
             return false;
         }
+        self.sectors_written_total += count as u64;
         true
     }
 }
@@ -667,6 +1067,18 @@ impl IoDevice for PrimaryIde {
     fn write(&mut self, port: u16, data: &[u8]) {
         if data.is_empty() { return; }
         let val = data[0];
+
+        if port == PRI_DRIVE {
+            self.drive_select = val;
+            let lba_ext = (val & 0x0F) as u64;
+            self.lba = (self.lba & 0x0000000000FFFFFF) | (lba_ext << 24);
+            return;
+        }
+
+        // Si se selecciona el esclavo (bit 4 = 1), no hay dispositivo esclavo en el canal primario.
+        if (self.drive_select & 0x10) != 0 && port != PRI_ALT_STATUS {
+            return;
+        }
 
         match port {
             PRI_DATA => {
@@ -690,9 +1102,11 @@ impl IoDevice for PrimaryIde {
                     self.data_offset = 0;
                     if self.write_sectors(self.lba, count, &buf) {
                         self.status = ST_DRDY;
+                        self.irq_pending = true;
                         eprintln!("[ATA] WRITE SECTORS LBA={:#x} count={} (fsync ok)", self.lba, count);
                     } else {
                         self.status = ST_DRDY | ST_ERR;
+                        self.irq_pending = true;
                     }
                 }
             }
@@ -726,9 +1140,11 @@ impl IoDevice for PrimaryIde {
                             self.data_buf = self.build_identify();
                             self.data_offset = 0;
                             self.status = ST_DRDY | ST_DRQ;
+                            self.irq_pending = true;
                             eprintln!("[ATA] IDENTIFY DEVICE (sector_count={})", self.sector_count);
                         } else {
                             self.status = ST_DRDY | ST_ERR;
+                            self.irq_pending = true;
                         }
                     }
                     0x20 => { // READ SECTORS (LBA28)
@@ -737,9 +1153,11 @@ impl IoDevice for PrimaryIde {
                             self.data_buf = self.read_sectors(self.lba, count);
                             self.data_offset = 0;
                             self.status = ST_DRDY | ST_DRQ;
+                            self.irq_pending = true;
                             eprintln!("[ATA] READ SECTORS LBA={:#x} count={}", self.lba, count);
                         } else {
                             self.status = ST_DRDY | ST_ERR;
+                            self.irq_pending = true;
                         }
                     }
                     0x24 => { // READ SECTORS EXT (LBA48)
@@ -748,6 +1166,7 @@ impl IoDevice for PrimaryIde {
                             self.data_buf = self.read_sectors(self.lba, count);
                             self.data_offset = 0;
                             self.status = ST_DRDY | ST_DRQ;
+                            self.irq_pending = true;
                         }
                     }
                     0x30 => { // WRITE SECTORS
@@ -765,8 +1184,43 @@ impl IoDevice for PrimaryIde {
                             self.status = ST_DRDY | ST_DRQ;
                         }
                     }
-                    0x90 => { self.status = ST_DRDY; }
-                    _ => { self.status = ST_DRDY | ST_ERR; }
+                    0xC8 | 0x25 => { // READ DMA (LBA28) / READ DMA EXT (LBA48)
+                        if self.has_disk() {
+                            self.dma_active = true;
+                            self.dma_is_write = false;
+                            self.status = ST_DRDY;
+                        } else {
+                            self.status = ST_DRDY | ST_ERR;
+                            self.irq_pending = true;
+                        }
+                    }
+                    0xCA | 0x35 => { // WRITE DMA (LBA28) / WRITE DMA EXT (LBA48)
+                        if self.has_disk() {
+                            self.dma_active = true;
+                            self.dma_is_write = true;
+                            self.status = ST_DRDY;
+                        } else {
+                            self.status = ST_DRDY | ST_ERR;
+                            self.irq_pending = true;
+                        }
+                    }
+                    0x90 => {
+                        self.status = ST_DRDY;
+                        self.irq_pending = true;
+                    }
+                    0xEF => {
+                        // SET FEATURES
+                        self.status = ST_DRDY;
+                        self.irq_pending = true;
+                    }
+                    0x00 => {
+                        self.status = ST_DRDY;
+                        self.irq_pending = true;
+                    }
+                    _ => {
+                        self.status = ST_DRDY | ST_ERR;
+                        self.irq_pending = true;
+                    }
                 }
 
                 self.status &= !ST_BSY;
@@ -781,6 +1235,12 @@ impl IoDevice for PrimaryIde {
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        // Si el host tiene seleccionado el esclavo (bit 4 de drive_select = 1),
+        // no hay dispositivo esclavo en el canal primario: reportamos 0x00.
+        if (self.drive_select & 0x10) != 0 && port != PRI_DRIVE && port != PRI_ALT_STATUS {
+            return vec![0x00; count];
+        }
+
         match port {
             PRI_DATA => {
                 // PIO rápido multisector: KVM entrega un REP INSW coalescido
@@ -807,7 +1267,11 @@ impl IoDevice for PrimaryIde {
             PRI_LBA1 => vec![((self.lba >> 8) & 0xFF) as u8],
             PRI_LBA2 => vec![((self.lba >> 16) & 0xFF) as u8],
             PRI_DRIVE => vec![self.drive_select],
-            PRI_ALT_STATUS | PRI_CMD => vec![self.status],
+            PRI_CMD => {
+                self.irq_pending = false;
+                vec![self.status]
+            }
+            PRI_ALT_STATUS => vec![self.status],
             _ => vec![0xFF],
         }
     }
@@ -822,6 +1286,19 @@ impl IoDevice for CdRom {
     fn write(&mut self, port: u16, data: &[u8]) {
         if data.is_empty() { return; }
         let val = data[0];
+
+        if port == SEC_DRIVE {
+            self.state.reg_dh = val;
+            if self.state.phase == AtapiPhase::StatusIn {
+                self.state.phase = AtapiPhase::Idle;
+            }
+            return;
+        }
+
+        // Si se selecciona el esclavo (bit 4 = 1), no hay dispositivo esclavo en el canal secundario.
+        if (self.state.reg_dh & 0x10) != 0 && port != SEC_ALT_STATUS {
+            return;
+        }
 
         match port {
             SEC_DATA => {
@@ -841,17 +1318,41 @@ impl IoDevice for CdRom {
                     }
                 }
             }
-            SEC_LBA1 | SEC_LBA2 | SEC_ERROR => {
-                // Registers used during PACKET: irrelevant
+            SEC_ERROR => {
+                self.state.reg_error = val;
+                self.state.reg_feature = val;
             }
-            SEC_SECTORS => { self.state.reg_sc = val; }
-            SEC_LBA0 => { self.state.reg_sn = val; }
-            SEC_DRIVE => { self.state.reg_dh = val; }
+            SEC_SECTORS => {
+                self.state.reg_sc = val;
+                if self.state.phase == AtapiPhase::StatusIn {
+                    self.state.phase = AtapiPhase::Idle;
+                }
+            }
+            SEC_LBA0 => {
+                self.state.reg_sn = val;
+                if self.state.phase == AtapiPhase::StatusIn {
+                    self.state.phase = AtapiPhase::Idle;
+                }
+            }
+            SEC_LBA1 => {
+                self.state.reg_cl = val;
+                if self.state.phase == AtapiPhase::StatusIn {
+                    self.state.phase = AtapiPhase::Idle;
+                }
+            }
+            SEC_LBA2 => {
+                self.state.reg_ch = val;
+                if self.state.phase == AtapiPhase::StatusIn {
+                    self.state.phase = AtapiPhase::Idle;
+                }
+            }
             SEC_CMD => {
                 // Command register (write): ATA commands go here
+                self.state.phase = AtapiPhase::Idle;
                 self.state.sense_key = 0;
                 self.state.sense_asc = 0;
                 self.state.sense_ascq = 0;
+                self.state.reg_error = 0;
 
                 match val {
                     CMD_IDENTIFY_PACKET => {
@@ -861,28 +1362,83 @@ impl IoDevice for CdRom {
                         self.do_identify();
                     }
                     CMD_PACKET => {
-                        // Don't set CdbIn yet — first status read returns BSY,
-                        // then transitions to CdbIn (DRQ) on second read.
-                        self.state.pending_packet = true;
+                        self.state.phase = AtapiPhase::CdbIn;
+                        self.state.cdb = [0u8; 12];
+                        self.state.cdb_offset = 0;
+                        self.state.drq_unread_count = 0;
+                        let limit = ((self.state.reg_ch as usize) << 8) | (self.state.reg_cl as usize);
+                        self.state.byte_count_limit = if limit == 0 { 0xFFFE } else { limit };
                     }
-                    0x08 => {} // READ SECTORS (legacy)
-                    0x20 => {} // READ SECTORS
-                    0x00 => {} // NOP
-                    _ => {}
+                    0xEF => {
+                        // SET FEATURES (e.g. transfer mode 0x03)
+                        self.state.phase = AtapiPhase::Idle;
+                        self.state.reg_error = 0;
+                        self.raise_irq();
+                    }
+                    0x90 => {
+                        // EXECUTE DEVICE DIAGNOSTIC
+                        self.state.phase = AtapiPhase::Idle;
+                        self.state.reg_error = 0x01;
+                        self.raise_irq();
+                    }
+                    0x08 => {
+                        // ATAPI DEVICE RESET
+                        self.reset();
+                        self.raise_irq();
+                    }
+                    0xE0..=0xE6 => {
+                        // Power management: STANDBY, IDLE, CHECK POWER
+                        self.state.phase = AtapiPhase::Idle;
+                        self.state.reg_error = 0;
+                        self.raise_irq();
+                    }
+                    0x00 => {
+                        // NOP
+                        self.state.phase = AtapiPhase::Idle;
+                        self.state.reg_error = 0;
+                        self.raise_irq();
+                    }
+                    _ => {
+                        // Any other command: abort with ABRT and assert IRQ
+                        self.state.phase = AtapiPhase::Idle;
+                        self.state.reg_error = 0x04; // ABRT
+                        self.raise_irq();
+                    }
                 }
             }
             SEC_ALT_STATUS => {
                 // Device Control register write (SRST, nIEN, etc.)
+                let nien = (val & 0x02) != 0;
+                self.state.nien = nien;
+                if nien {
+                    self.state.irq_pending = false;
+                }
+                if val & 0x04 != 0 {
+                    self.reset();
+                }
             }
             _ => {}
         }
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        // Si el host tiene seleccionado el esclavo (bit 4 de reg_dh = 1),
+        // no hay dispositivo esclavo: reportamos 0x00.
+        if (self.state.reg_dh & 0x10) != 0 && port != SEC_DRIVE {
+            return vec![0x00; count];
+        }
+
         match port {
             SEC_CMD => {
-                // Status register (read)
-                vec![self.current_status()]
+                // Status register (read) - clears IRQ and transitions StatusIn -> Idle
+                self.state.irq_pending = false;
+                let st = self.current_status();
+                if self.state.phase == AtapiPhase::StatusIn {
+                    self.state.phase = AtapiPhase::Idle;
+                    self.state.reg_cl = 0x14;
+                    self.state.reg_ch = 0xEB;
+                }
+                vec![st]
             }
             SEC_DATA => {
                 match self.state.phase {
@@ -897,13 +1453,29 @@ impl IoDevice for CdRom {
                             if self.state.data_offset < self.state.data_buf.len() {
                                 result.push(self.state.data_buf[self.state.data_offset]);
                                 self.state.data_offset += 1;
+                                self.state.chunk_offset += 1;
                             } else {
                                 result.push(0x00);
                             }
                         }
-                        // Si se terminaron los datos, cambiar a fase StatusIn
-                        if self.state.data_offset >= self.state.data_buf.len() {
-                            self.state.phase = AtapiPhase::StatusIn;
+                        // Si se terminó el chunk actual:
+                        if self.state.chunk_offset >= self.state.current_chunk_len {
+                            if self.state.data_offset >= self.state.data_buf.len() {
+                                // Todos los datos transferidos: pasar a StatusIn y avisar con IRQ
+                                self.state.phase = AtapiPhase::StatusIn;
+                                self.raise_irq();
+                            } else {
+                                // Quedan más datos: armar siguiente bloque DRQ y avisar con IRQ
+                                let remaining = self.state.data_buf.len() - self.state.data_offset;
+                                let limit = self.state.byte_count_limit;
+                                let next_chunk = remaining.min(limit);
+                                self.state.current_chunk_len = next_chunk;
+                                self.state.chunk_offset = 0;
+                                self.state.reg_cl = (next_chunk & 0xFF) as u8;
+                                self.state.reg_ch = ((next_chunk >> 8) & 0xFF) as u8;
+                                self.state.phase = AtapiPhase::DataIn;
+                                self.raise_irq();
+                            }
                         }
                         result
                     }
@@ -916,9 +1488,18 @@ impl IoDevice for CdRom {
                 // the same status so SeaBIOS can probe via either port.
                 vec![self.current_status()]
             }
-            SEC_ERROR => vec![0x00],
-            SEC_SECTORS => vec![self.state.reg_sc],
+            SEC_ERROR => vec![self.state.reg_error],
+            SEC_SECTORS => {
+                match self.state.phase {
+                    AtapiPhase::Idle => vec![self.state.reg_sc],
+                    AtapiPhase::CdbIn => vec![0x01],
+                    AtapiPhase::DataIn => vec![0x02],
+                    AtapiPhase::StatusIn => vec![0x03],
+                }
+            }
             SEC_LBA0 => vec![self.state.reg_sn],
+            SEC_LBA1 => vec![self.state.reg_cl],
+            SEC_LBA2 => vec![self.state.reg_ch],
             SEC_DRIVE => vec![self.state.reg_dh],
             _ => vec![0x00],
         }
@@ -955,18 +1536,18 @@ mod tests {
         let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
         // Send IDENTIFY PACKET DEVICE (0xA1)
         cd.write(SEC_CMD, &[CMD_IDENTIFY_PACKET]);
-        // First status read: BSY (device processing)
-        let st1 = cd.read(SEC_CMD, 1)[0];
-        assert_ne!(st1 & ST_BSY, 0, "BSY must be set first (device processing)");
-        // Second status read: DRQ (data ready)
-        let st2 = cd.read(SEC_CMD, 1)[0];
-        assert_ne!(st2 & ST_DRQ, 0, "DRQ must be set after BSY clears");
+        assert!(cd.irq_pending(), "IDENTIFY PACKET must signal IRQ");
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ must be set for data transfer");
+        assert!(!cd.irq_pending(), "Reading status clears IRQ");
         // Read all 512 bytes
         let mut all = Vec::new();
         while cd.read(SEC_CMD, 1)[0] & ST_DRQ != 0 && all.len() < 600 {
             all.extend_from_slice(&cd.read(SEC_DATA, 1));
         }
         assert_eq!(all.len(), 512);
+        assert_eq!(all[0], 0x80);
+        assert_eq!(all[1], 0x85, "Word 0 bit 15 must be 1 (ATAPI device)");
     }
 
     #[test]
@@ -975,18 +1556,14 @@ mod tests {
         let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
         // Send PACKET command (0xA0)
         cd.write(SEC_CMD, &[CMD_PACKET]);
-        // First status read: BSY (pending_packet)
         let st1 = cd.read(SEC_CMD, 1)[0];
-        assert!(st1 & ST_BSY != 0, "BSY should be set after PACKET command");
-        // Second status read: DRQ (CdbIn phase)
-        let st2 = cd.read(SEC_CMD, 1)[0];
-        assert!(st2 & ST_DRQ != 0, "DRQ should be set in CdbIn phase");
+        assert!(st1 & ST_DRQ != 0, "DRQ should be set in CdbIn phase");
         // Send 12-byte CDB via data port
         let cdb: [u8; 12] = [SCSI_INQUIRY, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0];
         cd.write(SEC_DATA, &cdb);
         // After CDB, should be DataIn with DRQ
-        let st3 = cd.read(SEC_CMD, 1)[0];
-        assert!(st3 & ST_DRQ != 0, "DRQ should be set after SCSI INQUIRY data ready");
+        let st2 = cd.read(SEC_CMD, 1)[0];
+        assert!(st2 & ST_DRQ != 0, "DRQ should be set after SCSI INQUIRY data ready");
         // Read inquiry data
         let mut all = Vec::new();
         while cd.read(SEC_CMD, 1)[0] & ST_DRQ != 0 && all.len() < 200 {
@@ -1003,8 +1580,8 @@ mod tests {
         let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
         // Send PACKET + READ(10) for 2 sectors starting at LBA 0
         cd.write(SEC_CMD, &[CMD_PACKET]);
-        let _ = cd.read(SEC_CMD, 1); // BSY
-        let _ = cd.read(SEC_CMD, 1); // DRQ → CdbIn
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ should be set in CdbIn phase");
         let mut cdb = [0u8; 12];
         cdb[0] = SCSI_READ_10; // READ(10)
         // LBA = 0 in bytes 2-5 (big-endian)
@@ -1026,13 +1603,59 @@ mod tests {
     }
 
     #[test]
+    fn atapi_chunked_drq_transfer() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+
+        // Host fija límite de byte count a 2048 bytes (0x0800)
+        cd.write(SEC_LBA1, &[0x00]);
+        cd.write(SEC_LBA2, &[0x08]);
+
+        // Envía CMD_PACKET
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let mut cdb = [0u8; 12];
+        cdb[0] = SCSI_READ_10;
+        cdb[7] = 0;
+        cdb[8] = 2; // 2 sectores = 4096 bytes
+        cd.write(SEC_DATA, &cdb);
+
+        // Primer chunk: debe reportar exactamente 2048 bytes en cilindros
+        assert!(cd.take_irq(), "IRQ raised for chunk 1");
+        let cl1 = cd.read(SEC_LBA1, 1)[0];
+        let ch1 = cd.read(SEC_LBA2, 1)[0];
+        let chunk1_len = ((ch1 as usize) << 8) | (cl1 as usize);
+        assert_eq!(chunk1_len, 2048, "Chunk 1 debe ser 2048 bytes");
+
+        // Leer los 2048 bytes del primer chunk
+        let data1 = cd.read(SEC_DATA, 2048);
+        assert_eq!(data1.len(), 2048);
+        assert_eq!(&data1[..8], b"SECTOR-0");
+
+        // Tras leer chunk 1, debe dispararse el segundo chunk con su IRQ
+        assert!(cd.take_irq(), "IRQ raised for chunk 2");
+        let cl2 = cd.read(SEC_LBA1, 1)[0];
+        let ch2 = cd.read(SEC_LBA2, 1)[0];
+        let chunk2_len = ((ch2 as usize) << 8) | (cl2 as usize);
+        assert_eq!(chunk2_len, 2048, "Chunk 2 debe ser 2048 bytes");
+
+        // Leer los 2048 bytes del segundo chunk
+        let data2 = cd.read(SEC_DATA, 2048);
+        assert_eq!(data2.len(), 2048);
+        assert_eq!(&data2[..8], b"SECTOR-1");
+
+        // Tras leer todo, debe pasar a StatusIn y levantar IRQ final de completación
+        assert!(cd.take_irq(), "IRQ raised for command completion");
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_eq!(st & ST_DRQ, 0, "DRQ cleared in StatusIn");
+        assert_ne!(st & ST_DRDY, 0, "DRDY set");
+    }
+
+    #[test]
     fn reset_returns_to_idle_phase() {
         let path = make_test_iso();
         let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
         // Dejar el dispositivo a mitad de una transferencia INQUIRY
         cd.write(SEC_CMD, &[CMD_PACKET]);
-        let _ = cd.read(SEC_CMD, 1); // BSY
-        let _ = cd.read(SEC_CMD, 1); // DRQ → CdbIn
         let cdb: [u8; 12] = [SCSI_INQUIRY, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0];
         cd.write(SEC_DATA, &cdb);
         assert_ne!(cd.read(SEC_CMD, 1)[0] & ST_DRQ, 0, "DRQ set after INQUIRY");
@@ -1046,7 +1669,7 @@ mod tests {
         // Y el medio sigue presente: IDENTIFY PACKET vuelve a funcionar
         cd.write(SEC_CMD, &[CMD_IDENTIFY_PACKET]);
         let st1 = cd.read(SEC_CMD, 1)[0];
-        assert_ne!(st1 & ST_BSY, 0, "BSY on fresh IDENTIFY after reset");
+        assert_ne!(st1 & ST_DRQ, 0, "DRQ on fresh IDENTIFY after reset");
     }
 
     // ─── Canal primario (disco ATA) ───────────────────────────────
@@ -1130,5 +1753,174 @@ mod tests {
         f.seek(SeekFrom::Start(512)).unwrap();
         f.read_exact(&mut buf).unwrap();
         assert_eq!(buf, payload, "sector escrito en el archivo");
+    }
+
+    #[test]
+    fn atapi_signature_and_identify_fallback() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+
+        // Inicialmente (o tras reset), LBA1=0x14 y LBA2=0xEB
+        assert_eq!(cd.read(SEC_LBA1, 1)[0], 0x14, "Initial LBA1 must be 0x14");
+        assert_eq!(cd.read(SEC_LBA2, 1)[0], 0xEB, "Initial LBA2 must be 0xEB");
+
+        // Enviar ATA IDENTIFY (0xEC): debe fallar con ERR y mantener 0x14/0xEB
+        cd.write(SEC_CMD, &[CMD_IDENTIFY]);
+        assert!(cd.irq_pending(), "ATA IDENTIFY completion must signal IRQ before status read");
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_ERR, 0, "ATA IDENTIFY must report error on CD-ROM");
+        assert!(!cd.irq_pending(), "Reading SEC_CMD must clear IRQ");
+        assert_eq!(cd.read(SEC_ERROR, 1)[0], 0x04, "Error register must be ABRT (0x04)");
+        assert_eq!(cd.read(SEC_LBA1, 1)[0], 0x14, "LBA1 must be 0x14 (ATAPI signature)");
+        assert_eq!(cd.read(SEC_LBA2, 1)[0], 0xEB, "LBA2 must be 0xEB (ATAPI signature)");
+    }
+
+    #[test]
+    fn scsi_read_toc_works() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set for CdbIn");
+
+        let mut cdb = [0u8; 12];
+        cdb[0] = SCSI_READ_TOC; // 0x43
+        cdb[7] = 0;
+        cdb[8] = 20; // alloc 20 bytes
+        cd.write(SEC_DATA, &cdb);
+
+        assert!(cd.irq_pending(), "READ TOC completion must signal IRQ before status read");
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set after READ TOC");
+        assert!(!cd.irq_pending(), "Reading SEC_CMD must clear IRQ");
+
+        // Bytes disponibles en DataIn reportados en LBA1/LBA2
+        let low = cd.read(SEC_LBA1, 1)[0] as u16;
+        let high = cd.read(SEC_LBA2, 1)[0] as u16;
+        let count = (high << 8) | low;
+        assert_eq!(count, 20, "LBA1/LBA2 report 20 bytes available");
+
+        let toc = cd.read(SEC_DATA, 20);
+        assert_eq!(toc.len(), 20);
+        assert_eq!(toc[2], 1, "First track = 1");
+        assert_eq!(toc[3], 1, "Last track = 1");
+        assert_eq!(toc[6], 1, "Track 1 descriptor track number");
+        assert_eq!(toc[14], 0xAA, "Lead-out track number 0xAA");
+    }
+
+    #[test]
+    fn scsi_mode_sense_10_works() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set for CdbIn");
+
+        let mut cdb = [0u8; 12];
+        cdb[0] = SCSI_MODE_SENSE_10; // 0x5A
+        cdb[2] = 0x2A; // capabilities page
+        cdb[7] = 0;
+        cdb[8] = 44; // alloc 44 bytes
+        cd.write(SEC_DATA, &cdb);
+
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set after MODE SENSE 10");
+        let ms = cd.read(SEC_DATA, 44);
+        assert_eq!(ms.len(), 44);
+        assert_eq!(ms[2], 0x00); // medium type
+        assert_eq!(ms[3], 0x80); // write protected
+        assert_eq!(ms[8], 0x2A); // page code 0x2A
+    }
+
+    #[test]
+    fn scsi_read_12_and_read_6_works() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+
+        // 1. SCSI_READ_12 (0xA8)
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let mut cdb = [0u8; 12];
+        cdb[0] = SCSI_READ_12; // 0xA8
+        cdb[2..6].copy_from_slice(&0u32.to_be_bytes()); // LBA 0
+        cdb[6..10].copy_from_slice(&1u32.to_be_bytes()); // 1 sector
+        cd.write(SEC_DATA, &cdb);
+
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set after READ 12");
+        let data = cd.read(SEC_DATA, CD_SECTOR_SIZE);
+        assert_eq!(data.len(), CD_SECTOR_SIZE);
+        assert_eq!(&data[..8], b"SECTOR-0");
+
+        // 2. SCSI_READ_6 (0x08)
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let mut cdb6 = [0u8; 12];
+        cdb6[0] = SCSI_READ_6; // 0x08
+        cdb6[1] = 0; // LBA high
+        cdb6[2] = 0; // LBA mid
+        cdb6[3] = 0; // LBA low
+        cdb6[4] = 1; // 1 sector
+        cd.write(SEC_DATA, &cdb6);
+
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set after READ 6");
+        let data6 = cd.read(SEC_DATA, CD_SECTOR_SIZE);
+        assert_eq!(data6.len(), CD_SECTOR_SIZE);
+        assert_eq!(&data6[..8], b"SECTOR-0");
+    }
+
+    #[test]
+    fn scsi_read_format_capacities_works() {
+        let path = make_test_iso();
+        let mut cd = CdRom::new(path.to_str().unwrap()).unwrap();
+
+        cd.write(SEC_CMD, &[CMD_PACKET]);
+        let mut cdb = [0u8; 12];
+        cdb[0] = SCSI_READ_FORMAT_CAPACITIES; // 0x23
+        cdb[7] = 0;
+        cdb[8] = 12; // 12 bytes
+        cd.write(SEC_DATA, &cdb);
+
+        let st = cd.read(SEC_CMD, 1)[0];
+        assert_ne!(st & ST_DRQ, 0, "DRQ set after READ FORMAT CAPACITIES");
+        let cap = cd.read(SEC_DATA, 12);
+        assert_eq!(cap.len(), 12);
+        assert_eq!(cap[3], 8, "Capacity list length = 8");
+        assert_eq!(cap[8], 0x02, "Formatted media descriptor");
+    }
+
+    #[test]
+    fn primary_ide_slave_isolation_and_geometry() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("vmm_test_slave_{}.img", std::process::id()));
+        {
+            let f = File::create(&path).unwrap();
+            f.set_len(10 * 1024 * 1024).unwrap(); // 10 MB = 20480 sectors
+        }
+        let mut ide = PrimaryIde::with_disk(path.to_str().unwrap()).unwrap();
+
+        // Verificar IDENTIFY DEVICE con Master seleccionado (drive_select = 0x00 / 0xA0)
+        ide.write(PRI_DRIVE, &[0xA0]);
+        ide.write(PRI_CMD, &[0xEC]);
+        assert_ne!(ide.read(PRI_CMD, 1)[0] & ST_DRQ, 0);
+        let id_data = ide.read(PRI_DATA, 512);
+        let lba28_sectors = u32::from_le_bytes(id_data[120..124].try_into().unwrap());
+        assert_eq!(lba28_sectors, 20480, "LBA28 sectors in Word 60-61 must match disk size");
+        assert_ne!(id_data[167] & 0x04, 0, "LBA48 supported bit 10 must be set");
+        assert_ne!(id_data[173] & 0x04, 0, "LBA48 enabled bit 10 must be set");
+
+        // Seleccionar Slave (drive_select = 0xB0)
+        ide.write(PRI_DRIVE, &[0xB0]);
+        // Intentar escribir un comando en el esclavo: debe ignorarse
+        ide.write(PRI_CMD, &[0xEC]);
+        // Leer status o data del esclavo: debe retornar 0x00 (no hay esclavo)
+        assert_eq!(ide.read(PRI_CMD, 1), vec![0x00], "Slave read must return 0x00 (no drive)");
+        assert_eq!(ide.read(PRI_DATA, 1), vec![0x00], "Slave data read must return 0x00");
+
+        // Volver a seleccionar Master (0xA0)
+        ide.write(PRI_DRIVE, &[0xA0]);
+        assert_eq!(ide.read(PRI_DRIVE, 1), vec![0xA0]);
+        let _ = std::fs::remove_file(path);
     }
 }

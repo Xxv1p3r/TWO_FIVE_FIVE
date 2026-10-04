@@ -36,6 +36,10 @@ pub const VBE_DISPI_LFB_ENABLED: u16 = 0x40;
 #[allow(dead_code)]
 pub const VBE_DISPI_NOCLEARMEM: u16 = 0x80;
 
+pub const VBE_DISPI_MAX_XRES: u16 = 2560;
+pub const VBE_DISPI_MAX_YRES: u16 = 1600;
+pub const VBE_DISPI_MAX_BPP: u16 = 32;
+
 #[allow(dead_code)]
 pub const VRAM_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 #[allow(dead_code)]
@@ -64,14 +68,15 @@ pub struct VgaState {
     pub dac_palette: [u8; 768],
     pub misc_output: u8,
     pub status1_toggle: u8,
-    // VRAM pointer
     pub vram_ptr: *mut u8,
     pub vram_size: usize,
+    pub fallback_vram_ptr: *mut u8,
     // (tarea 1) Direcciones GPA asignadas por el guest vía config space PCI:
     // BAR0 = framebuffer lineal (16 MiB), BAR2 = registros dispi MMIO (4 KiB).
     // El LFB arranca apuntando a la VRAM que mapea main.rs en el slot 2.
     pub lfb_base: Option<u64>,
     pub mmio_base: Option<u64>,
+    pub vbe_active: bool,
 }
 
 // Safety: VgaState pointer is managed and accessed with synchronization
@@ -112,6 +117,8 @@ impl VgaState {
             mmio_base: None, // BAR2 sin asignar hasta el POST del BIOS
             vram_ptr,
             vram_size,
+            fallback_vram_ptr: std::ptr::null_mut(),
+            vbe_active: false,
         }
     }
 
@@ -139,7 +146,14 @@ impl VgaState {
     /// (bit 3 de 0x3C5/idx 4) como señal inequívoca de modo gráfico. Con
     /// registros sin tocar (a cero) devolvemos false y el renderizador
     /// asume el modo texto 80x25 clásico.
+    ///
+    /// Si VBE ya estuvo activo o configurado en alta resolución, NO se
+    /// interpreta como gráfico VGA estándar (evita decodificar VRAM linear
+    /// como planos CGA/planar durante un cambio de resolución KMS con ENABLE=0).
     pub fn is_standard_vga_graphics(&self) -> bool {
+        if self.vbe_active {
+            return false;
+        }
         self.attr_regs[0x10] & 0x01 != 0 || self.seq_regs[0x04] & 0x08 != 0
     }
 
@@ -206,6 +220,19 @@ impl VgaState {
                 }
                 VBE_DISPI_INDEX_ENABLE => {
                     self.dispi_regs[idx as usize] = val;
+                    if (val & VBE_DISPI_ENABLED) != 0 {
+                        self.vbe_active = true;
+                    }
+                    // Según especificación Bochs VBE: si VBE_DISPI_NOCLEARMEM (0x80)
+                    // NO está activo al habilitar VBE, la memoria de vídeo se limpia a 0
+                    // para evitar mostrar artefactos visuales de modos previos o memoria residual.
+                    if (val & VBE_DISPI_ENABLED) != 0 && (val & VBE_DISPI_NOCLEARMEM) == 0 {
+                        if !self.vram_ptr.is_null() && self.vram_size > 0 {
+                            unsafe {
+                                std::ptr::write_bytes(self.vram_ptr, 0, self.vram_size);
+                            }
+                        }
+                    }
                     eprintln!(
                         "[VGA] VBE Enable=0x{:02X}: {}x{}@{}bpp",
                         val,
@@ -223,10 +250,146 @@ impl VgaState {
 
     /// (tarea 1) Lee un registro dispi por índice (0xFFFF si no existe).
     pub fn dispi_read_reg(&self, idx: u16) -> u16 {
-        if (idx as usize) < self.dispi_regs.len() {
-            self.dispi_regs[idx as usize]
-        } else {
-            0xFFFF
+        let getcaps = (self.dispi_regs[VBE_DISPI_INDEX_ENABLE as usize] & VBE_DISPI_GETCAPS) != 0;
+        match idx {
+            VBE_DISPI_INDEX_XRES if getcaps => VBE_DISPI_MAX_XRES,
+            VBE_DISPI_INDEX_YRES if getcaps => VBE_DISPI_MAX_YRES,
+            VBE_DISPI_INDEX_BPP if getcaps => VBE_DISPI_MAX_BPP,
+            _ => {
+                if (idx as usize) < self.dispi_regs.len() {
+                    self.dispi_regs[idx as usize]
+                } else {
+                    0xFFFF
+                }
+            }
+        }
+    }
+
+    /// Escritura en puertos de E/S VGA / VBE. Compartida entre el despachador
+    /// de puertos (IN/OUT) y el acceso MMIO a registros VGA (BAR2 + 0x400).
+    pub fn port_write(&mut self, port: u16, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        match port {
+            // Bochs Dispi Index (0x1CE)
+            0x1CE => {
+                let idx = if data.len() >= 2 {
+                    u16::from_le_bytes([data[0], data[1]])
+                } else {
+                    data[0] as u16
+                };
+                self.dispi_index = idx;
+            }
+            // Bochs Dispi Data (0x1CF)
+            0x1CF => {
+                let val = if data.len() >= 2 {
+                    u16::from_le_bytes([data[0], data[1]])
+                } else {
+                    data[0] as u16
+                };
+                let idx = self.dispi_index;
+                self.dispi_write_reg(idx, val);
+            }
+            // VGA Standard Registers
+            0x3C0 => {
+                if !self.attr_flipflop {
+                    self.attr_index = data[0] & 0x1F;
+                } else {
+                    let idx = self.attr_index as usize;
+                    self.attr_regs[idx] = data[0];
+                }
+                self.attr_flipflop = !self.attr_flipflop;
+            }
+            0x3C2 => self.misc_output = data[0],
+            0x3C4 => self.seq_index = data[0],
+            0x3C5 => {
+                let idx = self.seq_index as usize;
+                self.seq_regs[idx] = data[0];
+            }
+            0x3C7 => {
+                self.dac_read_index = data[0];
+                self.dac_sub_index = 0;
+            }
+            0x3C8 => {
+                self.dac_write_index = data[0];
+                self.dac_sub_index = 0;
+            }
+            0x3C9 => {
+                let idx = (self.dac_write_index as usize) * 3 + (self.dac_sub_index as usize);
+                if idx < self.dac_palette.len() {
+                    self.dac_palette[idx] = data[0];
+                }
+                self.dac_sub_index += 1;
+                if self.dac_sub_index >= 3 {
+                    self.dac_sub_index = 0;
+                    self.dac_write_index = self.dac_write_index.wrapping_add(1);
+                }
+            }
+            0x3CE => self.grc_index = data[0],
+            0x3CF => {
+                let idx = self.grc_index as usize;
+                self.grc_regs[idx] = data[0];
+            }
+            0x3D4 => self.crtc_index = data[0],
+            0x3D5 => {
+                let idx = self.crtc_index as usize;
+                self.crtc_regs[idx] = data[0];
+            }
+            _ => {}
+        }
+    }
+
+    /// Lectura en puertos de E/S VGA / VBE. Compartida entre el despachador
+    /// de puertos (IN/OUT) y el acceso MMIO a registros VGA (BAR2 + 0x400).
+    pub fn port_read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        match port {
+            0x1CE => {
+                let idx = self.dispi_index;
+                if count >= 2 {
+                    idx.to_le_bytes().to_vec()
+                } else {
+                    vec![idx as u8]
+                }
+            }
+            0x1CF => {
+                let idx = self.dispi_index;
+                let val = self.dispi_read_reg(idx);
+                if count >= 2 {
+                    val.to_le_bytes().to_vec()
+                } else {
+                    vec![val as u8]
+                }
+            }
+            0x3C0 => vec![self.attr_index],
+            0x3C1 => vec![self.attr_regs[self.attr_index as usize]],
+            0x3C2 | 0x3CC => vec![self.misc_output],
+            0x3C4 => vec![self.seq_index],
+            0x3C5 => vec![self.seq_regs[self.seq_index as usize]],
+            0x3C9 => {
+                let idx = (self.dac_read_index as usize) * 3 + (self.dac_sub_index as usize);
+                let val = if idx < self.dac_palette.len() {
+                    self.dac_palette[idx]
+                } else {
+                    0
+                };
+                self.dac_sub_index += 1;
+                if self.dac_sub_index >= 3 {
+                    self.dac_sub_index = 0;
+                    self.dac_read_index = self.dac_read_index.wrapping_add(1);
+                }
+                vec![val]
+            }
+            0x3CE => vec![self.grc_index],
+            0x3CF => vec![self.grc_regs[self.grc_index as usize]],
+            0x3D4 => vec![self.crtc_index],
+            0x3D5 => vec![self.crtc_regs[self.crtc_index as usize]],
+            0x3DA | 0x3BA => {
+                self.attr_flipflop = false;
+                self.status1_toggle ^= 0x09; // Toggle bit 3 (VSync) and bit 0 (display enable)
+                vec![self.status1_toggle]
+            }
+            _ => vec![0x00; count],
         }
     }
 }
@@ -276,24 +439,90 @@ impl VgaDevice {
         self.state.lock().unwrap().vram_ptr = ptr;
     }
 
+    /// Guarda un puntero fallback (ej. GPA 0xE0000000) por si el guest
+    /// o software legacy escribe en la dirección histórica fija de VBE.
+    pub fn set_fallback_vram_ptr(&self, ptr: *mut u8) {
+        self.state.lock().unwrap().fallback_vram_ptr = ptr;
+    }
+
     /// (tarea 1) Escritura MMIO del guest. Devuelve true si la dirección
     /// pertenece a una ventana VGA (BAR2 dispi o BAR0 framebuffer).
+    ///
+    /// Soporta el layout PCI estándar de Bochs/QEMU:
+    ///   - BAR2 + 0x500..0x520: registros Bochs Dispi (usados por `bochs-drm` en Linux)
+    ///   - BAR2 + 0x400..0x420: registros VGA estándar (0x400 + port - 0x3C0)
+    ///   - BAR2 + 0x600..0x610: registros de extensión QEMU
+    ///   - BAR2 + 0x000..0x020: offset directo Dispi legacy (compatibilidad retroactiva)
     pub fn mmio_write(&self, addr: u64, data: &[u8]) -> bool {
         let mut state = self.state.lock().unwrap();
-        // BAR2: registros dispi accesibles directamente por offset
-        // (offset i → registro dispi i, 16 bits little-endian, layout Bochs).
         if let Some(base) = state.mmio_base {
             if addr >= base && addr + data.len() as u64 <= base + VGA_MMIO_BAR_SIZE {
                 let off = (addr - base) as usize;
-                let mut i = 0;
-                while i + 1 < data.len() {
-                    let pos = off + i;
-                    if pos % 2 == 0 {
-                        let reg = (pos / 2) as u16;
-                        let val = u16::from_le_bytes([data[i], data[i + 1]]);
-                        state.dispi_write_reg(reg, val);
+                // Dispi registers en 0x500..0x520 (layout bochs-drm del kernel Linux)
+                if off >= 0x500 && off < 0x520 {
+                    let dispi_off = off - 0x500;
+                    let mut i = 0;
+                    while i < data.len() {
+                        let pos = dispi_off + i;
+                        if pos % 2 == 0 && i + 1 < data.len() {
+                            let reg = (pos / 2) as u16;
+                            let val = u16::from_le_bytes([data[i], data[i + 1]]);
+                            state.dispi_write_reg(reg, val);
+                            i += 2;
+                        } else if pos % 2 == 0 {
+                            let reg = (pos / 2) as u16;
+                            let cur = state.dispi_read_reg(reg);
+                            let val = (cur & 0xFF00) | (data[i] as u16);
+                            state.dispi_write_reg(reg, val);
+                            i += 1;
+                        } else {
+                            let reg = (pos / 2) as u16;
+                            let cur = state.dispi_read_reg(reg);
+                            let val = (cur & 0x00FF) | ((data[i] as u16) << 8);
+                            state.dispi_write_reg(reg, val);
+                            i += 1;
+                        }
                     }
-                    i += 2;
+                    return true;
+                }
+                // Puertos VGA estándar en 0x400..0x420 (0x400 + port - 0x3C0)
+                if off >= 0x400 && off < 0x420 {
+                    let port_base = 0x3C0 + (off - 0x400) as u16;
+                    for (i, &byte) in data.iter().enumerate() {
+                        let port = port_base + i as u16;
+                        state.port_write(port, &[byte]);
+                    }
+                    return true;
+                }
+                // Extensión QEMU en 0x600..0x610 (ignorar escrituras)
+                if off >= 0x600 && off < 0x610 {
+                    return true;
+                }
+                // Offset directo legacy en 0x000..0x020 (para compatibilidad de tests previos)
+                if off < 0x20 {
+                    let mut i = 0;
+                    while i < data.len() {
+                        let pos = off + i;
+                        if pos % 2 == 0 && i + 1 < data.len() {
+                            let reg = (pos / 2) as u16;
+                            let val = u16::from_le_bytes([data[i], data[i + 1]]);
+                            state.dispi_write_reg(reg, val);
+                            i += 2;
+                        } else if pos % 2 == 0 {
+                            let reg = (pos / 2) as u16;
+                            let cur = state.dispi_read_reg(reg);
+                            let val = (cur & 0xFF00) | (data[i] as u16);
+                            state.dispi_write_reg(reg, val);
+                            i += 1;
+                        } else {
+                            let reg = (pos / 2) as u16;
+                            let cur = state.dispi_read_reg(reg);
+                            let val = (cur & 0x00FF) | ((data[i] as u16) << 8);
+                            state.dispi_write_reg(reg, val);
+                            i += 1;
+                        }
+                    }
+                    return true;
                 }
                 return true;
             }
@@ -319,23 +548,64 @@ impl VgaDevice {
 
     /// (tarea 1) Lectura MMIO del guest: Some(bytes) si la dirección cae en
     /// una ventana VGA (exactamente `size` bytes); None si no es nuestra.
+    ///
+    /// Soporta el layout PCI estándar de Bochs/QEMU:
+    ///   - BAR2 + 0x500..0x520: registros Bochs Dispi (usados por `bochs-drm` en Linux)
+    ///   - BAR2 + 0x400..0x420: registros VGA estándar (0x400 + port - 0x3C0)
+    ///   - BAR2 + 0x600..0x610: registros de extensión QEMU (0 = no extensión)
+    ///   - BAR2 + 0x000..0x020: offset directo Dispi legacy (compatibilidad retroactiva)
     pub fn mmio_read(&self, addr: u64, size: usize) -> Option<Vec<u8>> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if let Some(base) = state.mmio_base {
             if addr >= base && addr + size as u64 <= base + VGA_MMIO_BAR_SIZE {
                 let off = (addr - base) as usize;
-                let mut out = vec![0u8; size];
-                for (i, b) in out.iter_mut().enumerate() {
-                    let pos = off + i;
-                    let reg = pos / 2;
-                    let byte = pos % 2;
-                    *b = if reg < state.dispi_regs.len() {
-                        (state.dispi_regs[reg] >> (byte * 8)) as u8
-                    } else {
-                        0xFF
-                    };
+                // Dispi registers en 0x500..0x520 (layout bochs-drm del kernel Linux)
+                if off >= 0x500 && off < 0x520 {
+                    let dispi_off = off - 0x500;
+                    let mut out = vec![0u8; size];
+                    for (i, b) in out.iter_mut().enumerate() {
+                        let pos = dispi_off + i;
+                        let reg = pos / 2;
+                        let byte = pos % 2;
+                        *b = if reg < state.dispi_regs.len() {
+                            (state.dispi_regs[reg] >> (byte * 8)) as u8
+                        } else {
+                            0xFF
+                        };
+                    }
+                    return Some(out);
                 }
-                return Some(out);
+                // Puertos VGA estándar en 0x400..0x420
+                if off >= 0x400 && off < 0x420 {
+                    let port_base = 0x3C0 + (off - 0x400) as u16;
+                    let mut out = Vec::with_capacity(size);
+                    for i in 0..size {
+                        let port = port_base + i as u16;
+                        let bytes = state.port_read(port, 1);
+                        out.push(bytes.first().copied().unwrap_or(0xFF));
+                    }
+                    return Some(out);
+                }
+                // Extensión QEMU en 0x600..0x610 (retorna 0 para indicar que no hay extensión)
+                if off >= 0x600 && off < 0x610 {
+                    return Some(vec![0u8; size]);
+                }
+                // Offset directo legacy en 0x000..0x020 (para compatibilidad de tests previos)
+                if off < 0x20 {
+                    let mut out = vec![0u8; size];
+                    for (i, b) in out.iter_mut().enumerate() {
+                        let pos = off + i;
+                        let reg = pos / 2;
+                        let byte = pos % 2;
+                        *b = if reg < state.dispi_regs.len() {
+                            (state.dispi_regs[reg] >> (byte * 8)) as u8
+                        } else {
+                            0xFF
+                        };
+                    }
+                    return Some(out);
+                }
+                return Some(vec![0xFF; size]);
             }
         }
         if let Some(base) = state.lfb_base {
@@ -361,130 +631,11 @@ impl IoDevice for VgaDevice {
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-
-        match port {
-            // Bochs Dispi Index (0x1CE)
-            0x1CE => {
-                let idx = if data.len() >= 2 {
-                    u16::from_le_bytes([data[0], data[1]])
-                } else {
-                    data[0] as u16
-                };
-                state.dispi_index = idx;
-            }
-            // Bochs Dispi Data (0x1CF)
-            0x1CF => {
-                let val = if data.len() >= 2 {
-                    u16::from_le_bytes([data[0], data[1]])
-                } else {
-                    data[0] as u16
-                };
-                let idx = state.dispi_index;
-                state.dispi_write_reg(idx, val);
-            }
-            // VGA Standard Registers
-            0x3C0 => {
-                if !state.attr_flipflop {
-                    state.attr_index = data[0] & 0x1F;
-                } else {
-                    let idx = state.attr_index as usize;
-                    state.attr_regs[idx] = data[0];
-                }
-                state.attr_flipflop = !state.attr_flipflop;
-            }
-            0x3C2 => state.misc_output = data[0],
-            0x3C4 => state.seq_index = data[0],
-            0x3C5 => {
-                let idx = state.seq_index as usize;
-                state.seq_regs[idx] = data[0];
-            }
-            0x3C7 => {
-                state.dac_read_index = data[0];
-                state.dac_sub_index = 0;
-            }
-            0x3C8 => {
-                state.dac_write_index = data[0];
-                state.dac_sub_index = 0;
-            }
-            0x3C9 => {
-                let idx = (state.dac_write_index as usize) * 3 + (state.dac_sub_index as usize);
-                if idx < state.dac_palette.len() {
-                    state.dac_palette[idx] = data[0];
-                }
-                state.dac_sub_index += 1;
-                if state.dac_sub_index >= 3 {
-                    state.dac_sub_index = 0;
-                    state.dac_write_index = state.dac_write_index.wrapping_add(1);
-                }
-            }
-            0x3CE => state.grc_index = data[0],
-            0x3CF => {
-                let idx = state.grc_index as usize;
-                state.grc_regs[idx] = data[0];
-            }
-            0x3D4 => state.crtc_index = data[0],
-            0x3D5 => {
-                let idx = state.crtc_index as usize;
-                state.crtc_regs[idx] = data[0];
-            }
-            _ => {}
-        }
+        self.state.lock().unwrap().port_write(port, data);
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
-        let mut state = self.state.lock().unwrap();
-        match port {
-            0x1CE => {
-                let idx = state.dispi_index;
-                if count >= 2 {
-                    idx.to_le_bytes().to_vec()
-                } else {
-                    vec![idx as u8]
-                }
-            }
-            0x1CF => {
-                let idx = state.dispi_index;
-                let val = state.dispi_read_reg(idx);
-                if count >= 2 {
-                    val.to_le_bytes().to_vec()
-                } else {
-                    vec![val as u8]
-                }
-            }
-            0x3C0 => vec![state.attr_index],
-            0x3C1 => vec![state.attr_regs[state.attr_index as usize]],
-            0x3C2 | 0x3CC => vec![state.misc_output],
-            0x3C4 => vec![state.seq_index],
-            0x3C5 => vec![state.seq_regs[state.seq_index as usize]],
-            0x3C9 => {
-                let idx = (state.dac_read_index as usize) * 3 + (state.dac_sub_index as usize);
-                let val = if idx < state.dac_palette.len() {
-                    state.dac_palette[idx]
-                } else {
-                    0
-                };
-                state.dac_sub_index += 1;
-                if state.dac_sub_index >= 3 {
-                    state.dac_sub_index = 0;
-                    state.dac_read_index = state.dac_read_index.wrapping_add(1);
-                }
-                vec![val]
-            }
-            0x3CE => vec![state.grc_index],
-            0x3CF => vec![state.grc_regs[state.grc_index as usize]],
-            0x3D4 => vec![state.crtc_index],
-            0x3D5 => vec![state.crtc_regs[state.crtc_index as usize]],
-            0x3DA | 0x3BA => {
-                state.attr_flipflop = false;
-                state.status1_toggle ^= 0x09; // Toggle bit 3 (VSync) and bit 0 (display enable)
-                vec![state.status1_toggle]
-            }
-            _ => vec![0x00; count],
-        }
+        self.state.lock().unwrap().port_read(port, count)
     }
 }
 
@@ -632,5 +783,68 @@ mod tests {
 
         // Fuera de la ventana del LFB → None
         assert!(vga.mmio_read(0xC100_0000, 4).is_none());
+    }
+
+    #[test]
+    fn vbe_mmio_bochs_offset_access() {
+        // Acceso MMIO con el layout Bochs / QEMU usado por el kernel Linux (bochs-drm)
+        let mut buf = vec![0u8; 1024];
+        let (vga, state) = VgaDevice::new(buf.as_mut_ptr(), buf.len());
+        vga.set_mmio_bar(0xFE01_F000);
+
+        // 1. Lectura del ID en offset 0x500 (bochs-drm probe)
+        let id_bytes = vga.mmio_read(0xFE01_F000 + 0x500, 2).unwrap();
+        let id = u16::from_le_bytes([id_bytes[0], id_bytes[1]]);
+        assert_eq!(id, VBE_DISPI_ID5);
+
+        // 2. Escritura de XRES (1024) en offset 0x502
+        vga.mmio_write(0xFE01_F000 + 0x502, &1024u16.to_le_bytes());
+        let xres_bytes = vga.mmio_read(0xFE01_F000 + 0x502, 2).unwrap();
+        assert_eq!(u16::from_le_bytes([xres_bytes[0], xres_bytes[1]]), 1024);
+
+        // 3. Escritura de YRES (768) en offset 0x504
+        vga.mmio_write(0xFE01_F000 + 0x504, &768u16.to_le_bytes());
+
+        // 4. Habilitar VBE en offset 0x508
+        vga.mmio_write(0xFE01_F000 + 0x508, &[VBE_DISPI_ENABLED as u8, 0]);
+        {
+            let st = state.lock().unwrap();
+            assert!(st.is_vbe_enabled());
+            assert!(st.vbe_active);
+            // Cuando VBE está activo, is_standard_vga_graphics DEBE ser false
+            // incluso si el Sequencer tiene chain-4 activo (evita artefactos durante modeset)
+            assert!(!st.is_standard_vga_graphics());
+        }
+
+        // 5. Lectura de extensión QEMU en offset 0x600 (debe devolver 0 = no extensión)
+        let qext = vga.mmio_read(0xFE01_F000 + 0x600, 4).unwrap();
+        assert_eq!(qext, vec![0, 0, 0, 0]);
+
+        // 6. Escritura y lectura de registro VGA vía MMIO en 0x400 (0x400 + port - 0x3c0)
+        // CRTC index (port 0x3D4) = 0x400 + 0x3D4 - 0x3C0 = 0x414
+        vga.mmio_write(0xFE01_F000 + 0x414, &[0x13]);
+        let crtc_idx = vga.mmio_read(0xFE01_F000 + 0x414, 1).unwrap();
+        assert_eq!(crtc_idx[0], 0x13);
+    }
+
+    #[test]
+    fn test_vbe_dispi_getcaps() {
+        let mut buf = vec![0u8; 1024];
+        let mut vga = VgaState::new(buf.as_mut_ptr(), buf.len());
+
+        // Normal mode: reading XRES/YRES/BPP returns configured values (640, 480, 32)
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_XRES), 640);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_YRES), 480);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_BPP), 32);
+
+        // Enable GETCAPS flag
+        vga.dispi_write_reg(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_GETCAPS);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_XRES), VBE_DISPI_MAX_XRES);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_YRES), VBE_DISPI_MAX_YRES);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_BPP), VBE_DISPI_MAX_BPP);
+
+        // Clearing GETCAPS restores configured resolution
+        vga.dispi_write_reg(VBE_DISPI_INDEX_ENABLE, 0);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_XRES), 640);
     }
 }
