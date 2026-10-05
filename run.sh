@@ -155,18 +155,17 @@ echo ""
 check_kvm
 check_binary
 
-ARG1="${1:-}"
-ARG2="${2:-}"
-ARG3="${3:-}"
-
+FLAGS=()
 BIOS=""
 ISO=""
 DISK=""
 
-# Categorizar los argumentos pasados (BIOS, ISO o DISK)
-for arg in "$ARG1" "$ARG2" "$ARG3"; do
+# Categorizar los argumentos pasados (Flags, BIOS, ISO o DISK)
+for arg in "$@"; do
     [ -z "$arg" ] && continue
-    if [ -z "$BIOS" ] && ([[ "$arg" == *.bin ]] || [[ "$arg" == *.fd ]] || [[ "$arg" == *seabios* ]] || [[ "$arg" == *ovmf* ]]); then
+    if [ "$arg" = "-u" ] || [ "$arg" = "--unattended" ] || [[ "$arg" == --unattended-* ]]; then
+        FLAGS+=("$arg")
+    elif [ -z "$BIOS" ] && ([[ "$arg" == *.bin ]] || [[ "$arg" == *.fd ]] || [[ "$arg" == *seabios* ]] || [[ "$arg" == *ovmf* ]]); then
         BIOS=$(find_bios "$arg")
     elif [ -z "$DISK" ] && ([[ "$arg" == *.img ]] || [[ "$arg" == *.raw ]] || [[ "$arg" == *.vdi ]] || [[ "$arg" == *.qcow2 ]]); then
         [ -f "$arg" ] || error "Disco no encontrado: $arg"
@@ -221,7 +220,9 @@ info "Arrancando VM..."
 echo ""
 
 # Build argument list (BIOS is always present; ISO/DISK only if provided)
-ARGS=("$BIOS")
+ARGS=()
+[ ${#FLAGS[@]} -gt 0 ] && ARGS+=("${FLAGS[@]}")
+ARGS+=("$BIOS")
 [ -n "$ISO" ]  && ARGS+=("$ISO")
 [ -n "$DISK" ] && ARGS+=("$DISK")
 exec "$BINARY" "${ARGS[@]}"

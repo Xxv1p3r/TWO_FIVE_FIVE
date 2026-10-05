@@ -1030,6 +1030,9 @@ fn main() {
 
     // ─── Instalación Desatendida (OEMDRV / CIDATA) ──────────────
     if unattended {
+        if let Some(ref mut cdrom) = bus.cdrom {
+            cdrom.unattended = true;
+        }
         if let Some(iso) = iso_path {
             let config = unattended::UnattendedConfig {
                 username: unattended_user,

@@ -157,6 +157,7 @@ pub struct CdRom {
     sector_bytes: usize,
     state: CdromState,
     pub sectors_read_total: u64,
+    pub unattended: bool,
 }
 
 impl CdRom {
@@ -205,6 +206,7 @@ impl CdRom {
             sector_bytes: CD_SECTOR_SIZE,
             state: CdromState::default(),
             sectors_read_total: 0,
+            unattended: false,
         })
     }
 
@@ -216,6 +218,7 @@ impl CdRom {
             sector_bytes: CD_SECTOR_SIZE,
             state: CdromState::default(),
             sectors_read_total: 0,
+            unattended: false,
         }
     }
 
@@ -550,6 +553,9 @@ impl CdRom {
                         let _ = f.read_exact(&mut buf);
                     }
                 }
+                if self.unattended {
+                    crate::unattended::patch_unattended_iso_sectors(&mut buf);
+                }
                 self.sectors_read_total += transfer_len as u64;
                 self.start_data_in(buf);
             }
@@ -731,6 +737,9 @@ impl CdRom {
                         let _ = f.read_exact(&mut buf);
                     }
                 }
+                if self.unattended {
+                    crate::unattended::patch_unattended_iso_sectors(&mut buf);
+                }
                 self.sectors_read_total += transfer_len as u64;
                 self.start_data_in(buf);
             }
@@ -759,6 +768,9 @@ impl CdRom {
                     if f.seek(SeekFrom::Start(offset)).is_ok() {
                         let _ = f.read_exact(&mut buf);
                     }
+                }
+                if self.unattended {
+                    crate::unattended::patch_unattended_iso_sectors(&mut buf);
                 }
                 self.sectors_read_total += transfer_len as u64;
                 self.start_data_in(buf);
@@ -805,6 +817,9 @@ impl CdRom {
                     if f.seek(SeekFrom::Start(offset)).is_ok() {
                         let _ = f.read_exact(&mut buf);
                     }
+                }
+                if self.unattended {
+                    crate::unattended::patch_unattended_iso_sectors(&mut buf);
                 }
                 self.sectors_read_total += transfer_len as u64;
                 self.start_data_in(buf);

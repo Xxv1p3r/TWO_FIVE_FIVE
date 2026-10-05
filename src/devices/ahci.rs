@@ -828,6 +828,9 @@ impl AhciController {
         if let Some(ref mut f) = self.iso_file {
             if f.seek(SeekFrom::Start(offset)).is_ok() {
                 let _ = f.read_exact(&mut dst[..len]);
+                if self.aux_disk_file.is_some() {
+                    crate::unattended::patch_unattended_iso_sectors(&mut dst[..len]);
+                }
             }
         }
     }

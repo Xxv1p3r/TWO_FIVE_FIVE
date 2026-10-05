@@ -49,6 +49,44 @@ pub fn prepare_unattended_media(
     }
 }
 
+/// Aplica parches al vuelo en los sectores de arranque leídos desde la ISO para activar
+/// el modo 100% desatendido (Debian, Kali, Ubuntu) sin modificar el archivo ISO en disco.
+pub fn patch_unattended_iso_sectors(buf: &mut [u8]) {
+    // 1. ISOLINUX: Cambiar la opción por defecto a la etiqueta de instalación automatizada
+    patch_slice(buf, b"default installgui", b"default autogui   ");
+    patch_slice(buf, b"default install\n", b"default auto   \n");
+    patch_slice(buf, b"default install\r\n", b"default auto   \r\n");
+
+    // 2. Redirigir el preseed hacia el medio auxiliar /media/preseed.cfg (OEMDRV)
+    patch_slice(
+        buf,
+        b"preseed/file=/cdrom/simple-cdd/default.preseed",
+        b"preseed/file=/media/preseed.cfg               ",
+    );
+
+    // 3. Forzar auto=true y priority=critical en la línea append de installgui por si se elige directamente
+    patch_slice(
+        buf,
+        b"simple-cdd/profiles=kali,offline desktop=xfce vga=788",
+        b"desktop=xfce auto=true priority=critical vga=788     ",
+    );
+}
+
+fn patch_slice(buf: &mut [u8], from: &[u8], to: &[u8]) {
+    if buf.len() < from.len() || from.len() != to.len() {
+        return;
+    }
+    let mut i = 0;
+    while i + from.len() <= buf.len() {
+        if &buf[i..i + from.len()] == from {
+            buf[i..i + to.len()].copy_from_slice(to);
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +159,15 @@ mod tests {
 
         // Limpiar
         let _ = std::fs::remove_file(&media_path);
+    }
+
+    #[test]
+    fn test_patch_unattended_iso_sectors() {
+        let mut sample = b"default installgui\nappend net.ifnames=0 preseed/file=/cdrom/simple-cdd/default.preseed simple-cdd/profiles=kali,offline desktop=xfce vga=788 initrd=/install.amd/gtk/initrd.gz".to_vec();
+        patch_unattended_iso_sectors(&mut sample);
+        let s = String::from_utf8_lossy(&sample);
+        assert!(s.contains("default autogui   "));
+        assert!(s.contains("preseed/file=/media/preseed.cfg               "));
+        assert!(s.contains("auto=true priority=critical vga=788"));
     }
 }
