@@ -126,9 +126,19 @@ d-i passwd/user-password-again password {password}
 d-i passwd/user-default-groups string audio cdrom video sudo adm
 
 #### 6. Particionamiento de disco no interactivo
+d-i partman/early_command string \
+    for d in $(list-devices disk); do \
+        size=$(cat /sys/block/$(basename $d)/size 2>/dev/null || echo 0); \
+        if [ "$size" -gt 2097152 ]; then \
+            debconf-set partman-auto/disk "$d"; \
+            debconf-set grub-installer/bootdev "$d"; \
+            break; \
+        fi; \
+    done
 d-i partman-auto/disk string /dev/sda
 d-i partman-auto/method string regular
 d-i partman-auto/choose_recipe select atomic
+d-i partman-auto/purge_lvm_from_device boolean true
 d-i partman-partitioning/confirm_write_new_label boolean true
 d-i partman-partitioning/confirm_new_label boolean true
 d-i partman-partitioning/confirm_resize boolean true

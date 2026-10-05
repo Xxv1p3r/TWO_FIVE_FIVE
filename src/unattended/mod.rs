@@ -112,9 +112,11 @@ d-i passwd/username string kali\n\
 d-i passwd/user-password password kali\n\
 d-i passwd/user-password-again password kali\n\
 d-i passwd/user-default-groups string audio cdrom video sudo adm\n\
+d-i partman/early_command string for d in $(list-devices disk); do size=$(cat /sys/block/$(basename $d)/size 2>/dev/null || echo 0); if [ \"$size\" -gt 2097152 ]; then debconf-set partman-auto/disk \"$d\"; debconf-set grub-installer/bootdev \"$d\"; break; fi; done\n\
 d-i partman-auto/disk string /dev/sda\n\
 d-i partman-auto/method string regular\n\
 d-i partman-auto/choose_recipe select atomic\n\
+d-i partman-auto/purge_lvm_from_device boolean true\n\
 d-i partman-partitioning/confirm_write_new_label boolean true\n\
 d-i partman-partitioning/confirm_new_label boolean true\n\
 d-i partman/choose_partition select finish\n\
@@ -128,7 +130,7 @@ d-i partman-md/device_remove_md boolean true\n\
 d-i partman-md/confirm boolean true\n\
 d-i partman-md/confirm_nochanges boolean true\n\
 d-i grub-installer/only_debian boolean true\n\
-d-i grub-installer/bootdev string /dev/sda\n\
+d-i grub-installer/bootdev string default\n\
 d-i finish-install/reboot_in_progress note\n";
             let copy_len = base_preseed.len().min(buf.len() - tail_start);
             buf[tail_start..tail_start + copy_len].copy_from_slice(&base_preseed[..copy_len]);

@@ -169,10 +169,9 @@ impl DeviceBus {
             Some(p) => Some(cdrom::CdRom::new(p)?),
             None => Some(cdrom::CdRom::stub()), // stub: responde "no media"
         };
-        let primary_ide = match disk_path {
-            Some(p) => cdrom::PrimaryIde::with_disk(p)?,
-            None => cdrom::PrimaryIde::new(),
-        };
+        // El disco duro principal se conecta exclusivamente al controlador SATA AHCI (Puerto 0)
+        // para evitar dispositivos duplicados (/dev/sda vs /dev/sdb) y conflictos de concurrencia.
+        let primary_ide = cdrom::PrimaryIde::new();
         let (vga_device, vga_state) = VgaDevice::new(vram_ptr, vram_size);
         let usb = UsbUhci::new();
         let virtio_serial_state = std::sync::Arc::new(std::sync::Mutex::new(VirtioSerialState::new()));
