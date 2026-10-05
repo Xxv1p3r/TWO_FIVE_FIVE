@@ -6,6 +6,7 @@ mod guest_mem;
 mod metrics;
 mod snapshot;
 pub mod tui;
+pub mod unattended;
 
 use devices::DeviceBus;
 use guest_mem::GuestMemory;
@@ -61,10 +62,17 @@ fn bios_load_addr(bios_len: usize) -> u64 {
 }
 
 fn usage() -> ! {
-    eprintln!("Uso: two-five-five [bios.bin] [imagen.iso] [disco.img]");
+    eprintln!("Uso: two-five-five [opciones] [bios.bin] [imagen.iso] [disco.img]");
     eprintln!("O simplemente: two-five-five <imagen.iso>");
+    eprintln!("Opciones de instalación desatendida:");
+    eprintln!("  -u, --unattended              Activar instalación desatendida");
+    eprintln!("  --unattended-user <usuario>   Usuario para el sistema (def: two55)");
+    eprintln!("  --unattended-pass <password>  Contraseña de usuario y root (def: two55)");
+    eprintln!("  --unattended-host <hostname>  Hostname de la máquina virtual (def: two55-vm)");
+    eprintln!("  --cdrom, --iso <archivo.iso>  Especificar imagen de instalación ISO");
     eprintln!("Ejemplos:");
     eprintln!("  two-five-five CorePlus-current.iso");
+    eprintln!("  two-five-five -u debian-12.iso disk.img");
     eprintln!("  two-five-five /usr/share/seabios/bios-256k.bin CorePlus-current.iso");
     exit(1);
 }
@@ -743,19 +751,81 @@ fn main() {
     BSP_TID.store(unsafe { libc::syscall(libc::SYS_gettid) } as i32, Ordering::Relaxed);
 
     let args: Vec<String> = std::env::args().collect();
-    let positional_args: Vec<String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).cloned().collect();
+
+    // ─── Opciones de Instalación Desatendida (CLI y Entorno) ───
+    let mut unattended = false;
+    let mut unattended_user = String::from("two55");
+    let mut unattended_pass = String::from("two55");
+    let mut unattended_host = String::from("two55-vm");
+    let mut cli_cdrom: Option<PathBuf> = None;
+
+    // Variables de entorno: TWO_FIVE_FIVE_UNATTENDED=1, TFF_UNATTENDED=1, etc.
+    if let Ok(val) = get_vmm_env("UNATTENDED") {
+        if val == "1" || val.eq_ignore_ascii_case("true") || val.eq_ignore_ascii_case("yes") {
+            unattended = true;
+        }
+    }
+    if let Ok(val) = get_vmm_env("UNATTENDED_USER") {
+        unattended_user = val;
+    }
+    if let Ok(val) = get_vmm_env("UNATTENDED_PASS") {
+        unattended_pass = val;
+    }
+    if let Ok(val) = get_vmm_env("UNATTENDED_HOST") {
+        unattended_host = val;
+    }
+
+    let mut positional_args: Vec<String> = Vec::new();
+    let mut iter = args.iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "-u" || arg == "--unattended" {
+            unattended = true;
+        } else if arg == "--unattended-user" {
+            if let Some(val) = iter.next() {
+                unattended_user = val.clone();
+            }
+        } else if let Some(val) = arg.strip_prefix("--unattended-user=") {
+            unattended_user = val.to_string();
+        } else if arg == "--unattended-pass" {
+            if let Some(val) = iter.next() {
+                unattended_pass = val.clone();
+            }
+        } else if let Some(val) = arg.strip_prefix("--unattended-pass=") {
+            unattended_pass = val.to_string();
+        } else if arg == "--unattended-host" {
+            if let Some(val) = iter.next() {
+                unattended_host = val.clone();
+            }
+        } else if let Some(val) = arg.strip_prefix("--unattended-host=") {
+            unattended_host = val.to_string();
+        } else if arg == "--cdrom" || arg == "--iso" {
+            if let Some(val) = iter.next() {
+                cli_cdrom = Some(PathBuf::from(val));
+            }
+        } else if let Some(val) = arg.strip_prefix("--cdrom=") {
+            cli_cdrom = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--iso=") {
+            cli_cdrom = Some(PathBuf::from(val));
+        } else if arg == "-h" || arg == "--help" {
+            usage();
+        } else if arg.starts_with("--") {
+            // Otras banderas de configuración (ej. --no-iso, --no-cdrom, --tui, etc.)
+        } else {
+            positional_args.push(arg.clone());
+        }
+    }
 
     let (bios_path_buf, mut iso_path_buf, disk_path_buf) = if positional_args.is_empty() {
         let bios = find_default_bios().unwrap_or_else(|| {
             eprintln!("[VMM] ERROR: No se especificó BIOS ni se encontró SeaBIOS en rutas estándar.");
             usage();
         });
-        let iso = auto_detect_iso();
+        let iso = cli_cdrom.or_else(auto_detect_iso);
         let disk = auto_detect_disk();
         (bios, iso, disk)
     } else {
         let mut bios = None;
-        let mut iso = None;
+        let mut iso = cli_cdrom;
         let mut disk = None;
 
         for arg in &positional_args {
@@ -956,6 +1026,30 @@ fn main() {
     bus.set_guest_mem(guest_mem_handle.clone());
     if !bus.debugcon.mirror_enabled() {
         eprintln!("[VMM] Espejo BIOS→0xB8000 desactivado (MI_VMM_MIRROR_BIOS=1 para activarlo)");
+    }
+
+    // ─── Instalación Desatendida (OEMDRV / CIDATA) ──────────────
+    if unattended {
+        if let Some(iso) = iso_path {
+            let config = unattended::UnattendedConfig {
+                username: unattended_user,
+                password: unattended_pass,
+                hostname: unattended_host,
+                timezone: "UTC".to_string(),
+            };
+            match unattended::prepare_unattended_media(Path::new(iso), &config) {
+                Ok(aux_path) => {
+                    let path_str = aux_path.to_string_lossy().to_string();
+                    bus.ahci.attach_aux_disk(&path_str);
+                    eprintln!("[two-five-five] Instalación desatendida activada (OEMDRV montado)");
+                }
+                Err(e) => {
+                    eprintln!("[two-five-five] Error preparando medio desatendido: {}", e);
+                }
+            }
+        } else {
+            eprintln!("[two-five-five] Advertencia: --unattended activado pero no hay ISO/CD-ROM disponible.");
+        }
     }
 
     // ─── (tarea 6) Compartir el bus entre todos los vCPUs ──────
@@ -2184,5 +2278,29 @@ mod tests {
         for w in r.windows(2) {
             assert!(w[0].1 <= w[1].0, "regiones solapadas: {:?}", w);
         }
+    }
+
+    #[test]
+    fn test_unattended_env_variables() {
+        std::env::set_var("TFF_UNATTENDED", "1");
+        assert_eq!(get_vmm_env("UNATTENDED").unwrap(), "1");
+        std::env::remove_var("TFF_UNATTENDED");
+
+        std::env::set_var("TWO_FIVE_FIVE_UNATTENDED", "1");
+        assert_eq!(get_vmm_env("UNATTENDED").unwrap(), "1");
+        std::env::remove_var("TWO_FIVE_FIVE_UNATTENDED");
+
+        std::env::set_var("TFF_UNATTENDED_USER", "custom_admin");
+        assert_eq!(get_vmm_env("UNATTENDED_USER").unwrap(), "custom_admin");
+        std::env::remove_var("TFF_UNATTENDED_USER");
+    }
+
+    #[test]
+    fn test_unattended_config_defaults() {
+        let cfg = unattended::UnattendedConfig::default();
+        assert_eq!(cfg.username, "two55");
+        assert_eq!(cfg.password, "two55");
+        assert_eq!(cfg.hostname, "two55-vm");
+        assert_eq!(cfg.timezone, "UTC");
     }
 }

@@ -208,13 +208,15 @@ pub struct AhciController {
     pub vs: u32,
     pub cap2: u32,
     pub bohc: u32,
-    pub ports: [AhciPort; 2],
+    pub ports: [AhciPort; 3],
 
     // Archivos y almacenamiento de respaldo
     pub disk_file: Option<File>,
     pub disk_size: u64,
     pub iso_file: Option<File>,
     pub iso_size: u64,
+    pub aux_disk_file: Option<File>,
+    pub aux_disk_size: u64,
 
     // Buffer de disco en RAM simulado para tests o ejecución sin imagen en disco
     pub ram_disk: Option<Vec<u8>>,
@@ -227,18 +229,21 @@ impl AhciController {
             cap: AHCI_CAP_DEFAULT,
             ghc: GHC_AE, // AHCI Enable activado por defecto
             is: 0,
-            pi: 0x03, // Puertos 0 y 1 implementados
+            pi: 0x03, // Puertos 0 y 1 implementados inicialmente (0x07 con aux_disk)
             vs: 0x0001_0300, // AHCI 1.3.0
             cap2: 1, // BOHC soportado
             bohc: 0,
             ports: [
-                AhciPort::new(0, false, true), // Port 0: Disco duro
-                AhciPort::new(1, true, true),  // Port 1: CD-ROM ATAPI
+                AhciPort::new(0, false, true),  // Port 0: Disco duro
+                AhciPort::new(1, true, true),   // Port 1: CD-ROM ATAPI
+                AhciPort::new(2, false, false), // Port 2: HDD Auxiliar OEMDRV (presente si hay aux_disk)
             ],
             disk_file: None,
             disk_size: 0,
             iso_file: None,
             iso_size: 0,
+            aux_disk_file: None,
+            aux_disk_size: 0,
             ram_disk: None,
         }
     }
@@ -266,16 +271,51 @@ impl AhciController {
         ctrl
     }
 
+    /// Adjunta un disco auxiliar (ej. imagen OEMDRV para instalación desatendida) en el Puerto 2.
+    pub fn attach_aux_disk(&mut self, path: &str) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .or_else(|_| OpenOptions::new().read(true).open(path));
+
+        match file {
+            Ok(mut f) => {
+                let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
+                let _ = f.seek(SeekFrom::Start(0));
+                self.aux_disk_file = Some(f);
+                self.aux_disk_size = size;
+                self.pi |= 0x04; // 0x07 con puertos 0, 1 y 2
+                self.ports[2].present = true;
+                self.ports[2].ssts = PORT_SSTS_PRESENT_GEN3;
+                self.ports[2].tfd = 0x170; // DRDY | DSC
+                self.ports[2].sig = PORT_SIG_ATA;
+                self.ports[2].is |= PORT_IS_PCS;
+                self.update_irq();
+                eprintln!("[AHCI] Puerto 2: Disco auxiliar OEMDRV montado ('{}', {} KiB)", path, size / 1024);
+            }
+            Err(e) => {
+                eprintln!("[AHCI] Error al abrir disco auxiliar '{}': {}", path, e);
+            }
+        }
+    }
+
     pub fn reset(&mut self) {
         self.cap = AHCI_CAP_DEFAULT;
         self.ghc = GHC_AE;
         self.is = 0;
-        self.pi = 0x03;
+        self.pi = if self.aux_disk_file.is_some() { 0x07 } else { 0x03 };
         self.vs = 0x0001_0300;
         self.cap2 = 1;
         self.bohc = 0;
         for p in &mut self.ports {
             p.reset();
+        }
+        if self.aux_disk_file.is_some() {
+            self.ports[2].present = true;
+            self.ports[2].ssts = PORT_SSTS_PRESENT_GEN3;
+            self.ports[2].tfd = 0x170;
+            self.ports[2].sig = PORT_SIG_ATA;
         }
     }
 
@@ -550,12 +590,12 @@ impl AhciController {
             if fis_type == 0x27 { // Register FIS - Host to Device
                 let command = cfis[2];
                 if !is_atapi {
-                    // ─── Comandos ATA para Disco Duro (Puerto 0) ───
+                    // ─── Comandos ATA para Disco Duro (Puerto 0 y Puerto 2) ───
                     match command {
                         0xEC => {
                             // IDENTIFY DEVICE (PIO)
                             is_pio = true;
-                            let id_data = self.generate_ata_identify();
+                            let id_data = self.identify_device(port_idx);
                             bytes_transferred = copy_to_prd(mem, &prd_entries, &id_data);
                         }
                         0xC8 | 0x25 => {
@@ -564,7 +604,7 @@ impl AhciController {
                             let count = parse_sector_count(&cfis, command == 0x25);
                             let total_bytes = (count as usize) * 512;
                             let mut data = vec![0u8; total_bytes];
-                            self.read_disk_sectors(lba, count, &mut data);
+                            self.read_sectors(port_idx, lba, count, &mut data);
                             bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
                         }
                         0xCA | 0x35 => {
@@ -574,7 +614,7 @@ impl AhciController {
                             let total_bytes = (count as usize) * 512;
                             let mut data = vec![0u8; total_bytes];
                             bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
-                            self.write_disk_sectors(lba, count, &data[..bytes_transferred]);
+                            self.write_sectors(port_idx, lba, count, &data[..bytes_transferred]);
                         }
                         0x60 => {
                             // READ FPDMA QUEUED (NCQ Read)
@@ -583,7 +623,7 @@ impl AhciController {
                             let count = parse_ncq_sector_count(&cfis);
                             let total_bytes = (count as usize) * 512;
                             let mut data = vec![0u8; total_bytes];
-                            self.read_disk_sectors(lba, count, &mut data);
+                            self.read_sectors(port_idx, lba, count, &mut data);
                             bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
                         }
                         0x61 => {
@@ -594,11 +634,11 @@ impl AhciController {
                             let total_bytes = (count as usize) * 512;
                             let mut data = vec![0u8; total_bytes];
                             bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
-                            self.write_disk_sectors(lba, count, &data[..bytes_transferred]);
+                            self.write_sectors(port_idx, lba, count, &data[..bytes_transferred]);
                         }
                         0xE7 | 0xEA => {
                             // FLUSH CACHE / FLUSH CACHE EXT
-                            self.flush_disk();
+                            self.flush_sectors(port_idx);
                         }
                         0xEF | 0x00 | 0x10..=0x1F => {
                             // SET FEATURES, NOP, RECALIBRATE
@@ -696,9 +736,20 @@ impl AhciController {
 
     // ─── Helpers de Almacenamiento ──────────────────────────────────
 
-    fn read_disk_sectors(&mut self, lba: u64, count: u32, dst: &mut [u8]) {
+    /// Lee sectores de 512 bytes del puerto indicado (Puerto 0: disco principal, Puerto 2: aux_disk).
+    pub fn read_sectors(&mut self, port: usize, lba: u64, count: u32, dst: &mut [u8]) {
         let total = (count as usize) * 512;
         let len = dst.len().min(total);
+        if port == 2 {
+            if let Some(ref mut f) = self.aux_disk_file {
+                if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
+                    let _ = f.read_exact(&mut dst[..len]);
+                }
+            }
+            return;
+        }
+
+        // Puerto 0 (disco principal o RAM)
         if let Some(ref mut f) = self.disk_file {
             if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
                 let _ = f.read_exact(&mut dst[..len]);
@@ -714,9 +765,21 @@ impl AhciController {
         }
     }
 
-    fn write_disk_sectors(&mut self, lba: u64, count: u32, src: &[u8]) {
+    /// Escribe sectores de 512 bytes en el puerto indicado (Puerto 0: disco principal, Puerto 2: aux_disk).
+    pub fn write_sectors(&mut self, port: usize, lba: u64, count: u32, src: &[u8]) {
         let total = (count as usize) * 512;
         let len = src.len().min(total);
+        if port == 2 {
+            if let Some(ref mut f) = self.aux_disk_file {
+                if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
+                    let _ = f.write_all(&src[..len]);
+                    let _ = f.sync_data();
+                }
+            }
+            return;
+        }
+
+        // Puerto 0 (disco principal o RAM)
         if let Some(ref mut f) = self.disk_file {
             if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
                 let _ = f.write_all(&src[..len]);
@@ -733,10 +796,29 @@ impl AhciController {
         }
     }
 
-    fn flush_disk(&mut self) {
+    /// Sincroniza escrituras en disco para el puerto especificado.
+    pub fn flush_sectors(&mut self, port: usize) {
+        if port == 2 {
+            if let Some(ref mut f) = self.aux_disk_file {
+                let _ = f.sync_data();
+            }
+            return;
+        }
         if let Some(ref mut f) = self.disk_file {
             let _ = f.sync_data();
         }
+    }
+
+    pub fn read_disk_sectors(&mut self, lba: u64, count: u32, dst: &mut [u8]) {
+        self.read_sectors(0, lba, count, dst);
+    }
+
+    pub fn write_disk_sectors(&mut self, lba: u64, count: u32, src: &[u8]) {
+        self.write_sectors(0, lba, count, src);
+    }
+
+    pub fn flush_disk(&mut self) {
+        self.flush_sectors(0);
     }
 
     fn read_iso_sectors(&mut self, lba: u32, count: u16, dst: &mut [u8]) {
@@ -751,6 +833,49 @@ impl AhciController {
     }
 
     // ─── Generación de Datos IDENTIFY ──────────────────────────────
+
+    /// Genera la respuesta ATA IDENTIFY para el puerto especificado (Puerto 0: disco principal, Puerto 2: aux_disk).
+    pub fn identify_device(&self, port: usize) -> [u8; 512] {
+        if port == 2 {
+            let mut buf = [0u8; 512];
+            buf[0] = 0x40; // Non-removable, ATA device
+            buf[1] = 0x00;
+            buf[2] = 0x3F; buf[3] = 0x3F; // Cylinders (16383)
+            buf[6] = 16;   buf[7] = 0;    // Heads
+            buf[8] = 0x03; buf[9] = 0x00;
+            buf[12] = 63;  buf[13] = 0;   // Sectors per track
+
+            let serial = b"TWO555-SATA2    ";
+            for (i, &b) in serial.iter().take(20).enumerate() {
+                buf[20 + i] = b;
+            }
+
+            buf[46..54].copy_from_slice(b"01.00   "); // Firmware rev
+            let model = b"Two Five Five Virtual OEMDRV Disk       ";
+            for (i, slot) in buf[54..94].chunks_mut(2).enumerate() {
+                let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
+                slot[0] = get(i * 2 + 1);
+                slot[1] = get(i * 2);
+            }
+
+            buf[98] = 0x00; buf[99] = 0x02; // LBA supported
+            buf[106] = 0x06; buf[107] = 0x00;
+            buf[118] = 0x70; buf[119] = 0x00; // Ultra DMA modes supported
+
+            let total_sectors = (self.aux_disk_size / 512).max(1);
+            let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
+            buf[120..124].copy_from_slice(&lba28.to_le_bytes());
+
+            // LBA48 support
+            buf[166] = 0x00; buf[167] = 0x04; // 48-bit address feature set supported
+            buf[172] = 0x00; buf[173] = 0x04;
+            buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
+
+            buf
+        } else {
+            self.generate_ata_identify()
+        }
+    }
 
     pub fn generate_ata_identify(&self) -> [u8; 512] {
         let mut buf = [0u8; 512];
@@ -1467,5 +1592,128 @@ mod tests {
         let p_is_dma = ctrl.read_reg_u32(0x100 + PORT_IS);
         assert_ne!(p_is_dma & PORT_IS_DHRS, 0, "PORT_IS_DHRS DEBE activarse para READ DMA EXT");
         assert_eq!(p_is_dma & PORT_IS_PSS, 0, "PORT_IS_PSS NO DEBE activarse para transferencia DMA pura");
+    }
+
+    #[test]
+    fn test_ahci_aux_disk_attach_and_pi() {
+        let mut ctrl = AhciController::new();
+        assert_eq!(ctrl.pi, 0x03);
+        assert!(!ctrl.ports[2].present);
+
+        let temp_dir = std::env::temp_dir();
+        let aux_path = temp_dir.join(format!("test_aux_disk_{}.img", std::process::id()));
+        {
+            let mut f = File::create(&aux_path).expect("Error creando archivo temporal");
+            f.write_all(&vec![0xAAu8; 1024 * 1024]).expect("Error escribiendo aux disk");
+        }
+
+        ctrl.attach_aux_disk(&aux_path.to_string_lossy());
+        assert_eq!(ctrl.pi, 0x07, "PI debe ser 0x07 al montar disco auxiliar");
+        assert!(ctrl.ports[2].present, "Puerto 2 debe estar presente");
+        assert_eq!(ctrl.ports[2].sig, PORT_SIG_ATA);
+        assert_eq!(ctrl.ports[2].ssts, PORT_SSTS_PRESENT_GEN3);
+
+        // Reset debe conservar PI=0x07 si hay aux_disk
+        ctrl.reset();
+        assert_eq!(ctrl.pi, 0x07);
+        assert!(ctrl.ports[2].present);
+
+        let _ = std::fs::remove_file(&aux_path);
+    }
+
+    #[test]
+    fn test_ahci_aux_disk_read_write_and_identify() {
+        let mut ctrl = AhciController::new();
+        let temp_dir = std::env::temp_dir();
+        let aux_path = temp_dir.join(format!("test_aux_rw_{}.img", std::process::id()));
+        {
+            let mut f = File::create(&aux_path).expect("Error creando archivo temporal");
+            f.write_all(&vec![0x00u8; 64 * 1024]).expect("Error inicializando");
+        }
+
+        ctrl.attach_aux_disk(&aux_path.to_string_lossy());
+
+        // Probar IDENTIFY en puerto 2
+        let id = ctrl.identify_device(2);
+        let serial = &id[20..36];
+        assert_eq!(serial, b"TWO555-SATA2    ");
+
+        // Probar escritura en puerto 2
+        let write_data = vec![0x77u8; 512];
+        ctrl.write_sectors(2, 0, 1, &write_data);
+
+        // Probar lectura en puerto 2
+        let mut read_data = vec![0u8; 512];
+        ctrl.read_sectors(2, 0, 1, &mut read_data);
+        assert_eq!(read_data, write_data);
+
+        // Verificar que puerto 0 no se vio afectado
+        let id0 = ctrl.identify_device(0);
+        assert_eq!(&id0[20..36], b"TWO555-SATA0    ");
+
+        let _ = std::fs::remove_file(&aux_path);
+    }
+
+    #[test]
+    fn test_ahci_port2_command_issue() {
+        let mut ctrl = AhciController::new();
+        let temp_dir = std::env::temp_dir();
+        let aux_path = temp_dir.join(format!("test_aux_ci_{}.img", std::process::id()));
+        {
+            let mut f = File::create(&aux_path).expect("Error creando archivo temporal");
+            let mut initial = vec![0x00u8; 128 * 1024];
+            initial[..512].fill(0x55);
+            f.write_all(&initial).expect("Error escribiendo archivo");
+        }
+
+        ctrl.attach_aux_disk(&aux_path.to_string_lossy());
+
+        let mut raw_mem = vec![0u8; 64 * 1024];
+        let guest_mem = GuestMemory::new(raw_mem.as_mut_ptr(), raw_mem.len());
+
+        let clb = 0x1000u64;
+        let ctba = 0x2000u64;
+        let prd_data_buf = 0x3000u64;
+        let fb = 0x4000u64;
+
+        // Base del Puerto 2 = 0x100 + 2 * 0x80 = 0x200
+        let p2_base = 0x200;
+        ctrl.write_reg_u32(p2_base + PORT_CLB, clb as u32, Some(&guest_mem));
+        ctrl.write_reg_u32(p2_base + PORT_FB, fb as u32, Some(&guest_mem));
+
+        // 1. IDENTIFY DEVICE (0xEC) en Puerto 2
+        let dw0: u32 = 5 | (1 << 16);
+        guest_mem.write_u32(clb as usize, dw0);
+        guest_mem.write_u32((clb + 4) as usize, 0);
+        guest_mem.write_u32((clb + 8) as usize, ctba as u32);
+        guest_mem.write_u32((clb + 12) as usize, 0);
+
+        guest_mem.write_u8(ctba as usize, 0x27);
+        guest_mem.write_u8((ctba + 1) as usize, 0x80);
+        guest_mem.write_u8((ctba + 2) as usize, 0xEC);
+
+        guest_mem.write_u32((ctba + 0x80) as usize, prd_data_buf as u32);
+        guest_mem.write_u32((ctba + 0x84) as usize, 0);
+        guest_mem.write_u32((ctba + 0x8C) as usize, 511);
+
+        ctrl.write_reg_u32(p2_base + PORT_CI, 1, Some(&guest_mem));
+
+        let mut id_buf = [0u8; 512];
+        guest_mem.copy_from(prd_data_buf as usize, &mut id_buf);
+        assert_eq!(&id_buf[20..36], b"TWO555-SATA2    ");
+
+        // 2. READ DMA (0xC8) en Puerto 2
+        guest_mem.write_u8((ctba + 2) as usize, 0xC8);
+        guest_mem.write_u8((ctba + 4) as usize, 0);  // LBA 0
+        guest_mem.write_u8((ctba + 12) as usize, 1); // 1 sector
+
+        ctrl.write_reg_u32(p2_base + PORT_CI, 1, Some(&guest_mem));
+
+        let mut read_buf = [0u8; 512];
+        guest_mem.copy_from(prd_data_buf as usize, &mut read_buf);
+        assert_eq!(read_buf[0], 0x55);
+        assert_eq!(read_buf[511], 0x55);
+
+        let _ = std::fs::remove_file(&aux_path);
     }
 }

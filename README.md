@@ -65,12 +65,34 @@ O ejecutar directamente el binario:
 ./target/release/two-five-five bios/bios-256k.bin imagen.iso disco.img
 ```
 
+### Instalación Desatendida (*Unattended Installation*)
+
+Two Five Five (255) soporta instalación desatendida automática sin intervención humana:
+
+```bash
+# Instalación desatendida automática de Kali Linux en disk.img
+./target/release/two-five-five -u kali.iso disk.img
+
+# O personalizando usuario, contraseña y nombre de host
+./target/release/two-five-five -u --unattended-user hacker --unattended-pass toor --unattended-host kali-box kali.iso disk.img
+```
+
+**¿Cómo funciona?**
+1. Inspecciona la ISO para detectar el sistema operativo (Debian/Kali, Ubuntu Cloud, RHEL/Fedora, Windows).
+2. Genera las plantillas de automatización (`preseed.cfg`, `user-data`/`meta-data`, `autounattend.xml`).
+3. Construye un disco auxiliar en memoria formateado en **FAT16** con la etiqueta de volumen **`OEMDRV`** (reconocida automáticamente por `debian-installer` y `Anaconda`) y lo conecta dinámicamente al **Puerto 2 del controlador SATA AHCI**.
+4. La máquina virtual inicia el instalador y completa todo el particionado y configuración sin preguntas.
+
 ### Variables de Entorno de Configuración
 
 | Variable | Descripción | Valor por Defecto |
 |----------|-------------|-------------------|
 | `TWO_FIVE_FIVE_RAM` (o `TFF_RAM`) | Memoria RAM en MiB | `4096` |
 | `TWO_FIVE_FIVE_CPUS` (o `TFF_CPUS`) | Número de núcleos vCPU | `4` |
+| `TWO_FIVE_FIVE_UNATTENDED` (o `TFF_UNATTENDED`) | Activa la instalación desatendida (`1` o `true`) | Desactivado |
+| `TWO_FIVE_FIVE_USER` | Nombre de usuario creado en la VM | `two55` |
+| `TWO_FIVE_FIVE_PASSWORD` | Contraseña del usuario y root | `two55` |
+| `TWO_FIVE_FIVE_HOSTNAME` | Hostname de la máquina virtual | `two55-vm` |
 | `TWO_FIVE_FIVE_NO_TUI` | Desactiva el dashboard TUI interactivo | Desactivado |
 | `TWO_FIVE_FIVE_TAP` | Nombre de la interfaz TAP de red | No configurada (usa stack DHCP interno) |
 | `TWO_FIVE_FIVE_AUTO_ENTER` | Inyección automática de Enter para bootloaders | `1` (activo) |
@@ -88,7 +110,7 @@ El proyecto cuenta con una amplia suite de pruebas que valida cada componente co
 cargo test
 ```
 
-Actualmente: **149 tests pasando (0 fallos)**.
+Actualmente: **188 tests pasando (0 fallos)**.
 
 ---
 
