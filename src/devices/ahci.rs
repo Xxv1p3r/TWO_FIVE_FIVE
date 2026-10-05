@@ -58,7 +58,7 @@ pub const CAP_SAM: u32 = 1 << 18;      // Supports AHCI mode only
 pub const CAP_SSC: u32 = 1 << 14;      // Slumber State Capable
 pub const CAP_PSC: u32 = 1 << 13;      // Partial State Capable
 pub const CAP_NCS_32: u32 = 31 << 8;   // 32 command slots (0-based)
-pub const CAP_NP_2: u32 = 1;           // 2 ports (0-based: 1)
+pub const CAP_NP_6: u32 = 5;           // 6 ports (0-based: 5, Intel ICH8M standard)
 
 pub const AHCI_CAP_DEFAULT: u32 = CAP_S64A
     | CAP_SNCQ
@@ -68,7 +68,7 @@ pub const AHCI_CAP_DEFAULT: u32 = CAP_S64A
     | CAP_SSC
     | CAP_PSC
     | CAP_NCS_32
-    | CAP_NP_2;
+    | CAP_NP_6;
 
 pub const GHC_HR: u32 = 1 << 0;  // HBA Reset
 pub const GHC_IE: u32 = 1 << 1;  // Global Interrupt Enable
@@ -158,7 +158,7 @@ impl AhciPort {
             port.cmd |= PORT_CMD_ATAPI;
         }
         if present {
-            port.tfd = 0x170; // Unidad lista con bits DRDY y DSC
+            port.tfd = 0x150; // Unidad lista: Status = 0x50 (DRDY | DSC), Error = 0x01
         }
         port
     }
@@ -176,7 +176,7 @@ impl AhciPort {
         }
         self.tfd = 0x7F; // Estado inicial reset/busy
         if self.present {
-            self.tfd = 0x170; // Unidad lista con bits DRDY y DSC
+            self.tfd = 0x150; // Unidad lista: Status = 0x50 (DRDY | DSC), Error = 0x01
         }
         self.sig = if self.is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA };
         self.ssts = if self.present { PORT_SSTS_PRESENT_GEN3 } else { 0 };
@@ -220,6 +220,17 @@ pub struct AhciController {
 
     // Buffer de disco en RAM simulado para tests o ejecución sin imagen en disco
     pub ram_disk: Option<Vec<u8>>,
+    /// Modo de instalación desatendida activado
+    pub unattended: bool,
+}
+
+/// Copia una cadena de texto en formato ATA (intercambiando bytes en cada palabra de 16 bits).
+fn copy_ata_string(dst: &mut [u8], src: &[u8]) {
+    for (i, slot) in dst.chunks_mut(2).enumerate() {
+        let get = |k: usize| -> u8 { src.get(k).copied().unwrap_or(b' ') };
+        slot[0] = get(i * 2 + 1);
+        slot[1] = get(i * 2);
+    }
 }
 
 impl AhciController {
@@ -245,6 +256,7 @@ impl AhciController {
             aux_disk_file: None,
             aux_disk_size: 0,
             ram_disk: None,
+            unattended: false,
         }
     }
 
@@ -288,7 +300,7 @@ impl AhciController {
                 self.pi |= 0x04; // 0x07 con puertos 0, 1 y 2
                 self.ports[2].present = true;
                 self.ports[2].ssts = PORT_SSTS_PRESENT_GEN3;
-                self.ports[2].tfd = 0x170; // DRDY | DSC
+                self.ports[2].tfd = 0x150; // DRDY | DSC
                 self.ports[2].sig = PORT_SIG_ATA;
                 self.ports[2].is |= PORT_IS_PCS;
                 self.update_irq();
@@ -314,7 +326,7 @@ impl AhciController {
         if self.aux_disk_file.is_some() {
             self.ports[2].present = true;
             self.ports[2].ssts = PORT_SSTS_PRESENT_GEN3;
-            self.ports[2].tfd = 0x170;
+            self.ports[2].tfd = 0x150;
             self.ports[2].sig = PORT_SIG_ATA;
         }
     }
@@ -480,7 +492,7 @@ impl AhciController {
                                 port.ssts = 0x123;
                                 port.serr = 0;
                                 port.sig = if port.is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA };
-                                port.tfd = 0x170;
+                                port.tfd = 0x150;
 
                                 if (port.cmd & PORT_CMD_FRE) != 0 {
                                     let fb_addr = port.fis_base_address();
@@ -489,7 +501,7 @@ impl AhciController {
                                             let mut d2h = [0u8; 20];
                                             d2h[0] = 0x34; // FIS Type: Register D2H
                                             d2h[1] = 0x00; // Interrupt bit (I)
-                                            d2h[2] = 0x70; // Status (DRDY | DSC)
+                                            d2h[2] = 0x50; // Status (DRDY | DSC, bit 5 ATA_DF apagado)
                                             d2h[3] = 0x01; // Error
                                             d2h[4] = 0x01; // LBA low
                                             d2h[5] = if port.is_atapi { 0x14 } else { 0x00 };
@@ -607,10 +619,30 @@ impl AhciController {
                             self.read_sectors(port_idx, lba, count, &mut data);
                             bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
                         }
+                        0x20 | 0x24 => {
+                            // READ SECTORS (PIO, LBA28 / LBA48)
+                            is_pio = true;
+                            let lba = parse_lba(&cfis, command == 0x24);
+                            let count = parse_sector_count(&cfis, command == 0x24);
+                            let total_bytes = (count as usize) * 512;
+                            let mut data = vec![0u8; total_bytes];
+                            self.read_sectors(port_idx, lba, count, &mut data);
+                            bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
+                        }
                         0xCA | 0x35 => {
                             // WRITE DMA (LBA28) / WRITE DMA EXT (LBA48)
                             let lba = parse_lba(&cfis, command == 0x35);
                             let count = parse_sector_count(&cfis, command == 0x35);
+                            let total_bytes = (count as usize) * 512;
+                            let mut data = vec![0u8; total_bytes];
+                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
+                            self.write_sectors(port_idx, lba, count, &data[..bytes_transferred]);
+                        }
+                        0x30 | 0x34 => {
+                            // WRITE SECTORS (PIO, LBA28 / LBA48)
+                            is_pio = true;
+                            let lba = parse_lba(&cfis, command == 0x34);
+                            let count = parse_sector_count(&cfis, command == 0x34);
                             let total_bytes = (count as usize) * 512;
                             let mut data = vec![0u8; total_bytes];
                             bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
@@ -828,7 +860,7 @@ impl AhciController {
         if let Some(ref mut f) = self.iso_file {
             if f.seek(SeekFrom::Start(offset)).is_ok() {
                 let _ = f.read_exact(&mut dst[..len]);
-                if self.aux_disk_file.is_some() {
+                if self.unattended || self.aux_disk_file.is_some() {
                     crate::unattended::patch_unattended_iso_sectors(&mut dst[..len]);
                 }
             }
@@ -848,30 +880,33 @@ impl AhciController {
             buf[8] = 0x03; buf[9] = 0x00;
             buf[12] = 63;  buf[13] = 0;   // Sectors per track
 
-            let serial = b"TWO555-SATA2    ";
-            for (i, &b) in serial.iter().take(20).enumerate() {
-                buf[20 + i] = b;
-            }
+            copy_ata_string(&mut buf[20..40], b"TWO555-SATA2    ");
+            copy_ata_string(&mut buf[46..54], b"01.00   ");
+            copy_ata_string(&mut buf[54..94], b"Two Five Five Virtual OEMDRV Disk       ");
 
-            buf[46..54].copy_from_slice(b"01.00   "); // Firmware rev
-            let model = b"Two Five Five Virtual OEMDRV Disk       ";
-            for (i, slot) in buf[54..94].chunks_mut(2).enumerate() {
-                let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
-                slot[0] = get(i * 2 + 1);
-                slot[1] = get(i * 2);
-            }
-
-            buf[98] = 0x00; buf[99] = 0x02; // LBA supported
-            buf[106] = 0x06; buf[107] = 0x00;
-            buf[118] = 0x70; buf[119] = 0x00; // Ultra DMA modes supported
+            // Word 49: DMA (bit 8), LBA (bit 9), IORDY (bit 11) -> 0x0F00
+            buf[98] = 0x00; buf[99] = 0x0F;
+            // Word 53: Words 54-58, 64-70, 88 son válidos
+            buf[106] = 0x07; buf[107] = 0x00;
+            // Word 63: Multiword DMA modos 0, 1, 2 soportados y activos
+            buf[126] = 0x07; buf[127] = 0x07;
 
             let total_sectors = (self.aux_disk_size / 512).max(1);
             let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
             buf[120..124].copy_from_slice(&lba28.to_le_bytes());
 
-            // LBA48 support
-            buf[166] = 0x00; buf[167] = 0x04; // 48-bit address feature set supported
+            // Word 80: Versión mayor ATA/ATAPI-4..8 (0x01F0)
+            buf[160] = 0xF0; buf[161] = 0x01;
+            // Word 82: Conjuntos de comandos soportados
+            buf[164] = 0x00; buf[165] = 0x74;
+            // Word 83: Soporte LBA48 (bit 10=1, bit 14=1) -> 0x4400
+            buf[166] = 0x00; buf[167] = 0x44;
+            // Word 86: LBA48 habilitado (bit 10=1) -> 0x0400
             buf[172] = 0x00; buf[173] = 0x04;
+            // Word 88: Ultra DMA modos 0..6 soportados y activos
+            buf[176] = 0x7F; buf[177] = 0x7F;
+
+            // LBA48 total de sectores
             buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
 
             buf
@@ -889,30 +924,33 @@ impl AhciController {
         buf[8] = 0x03; buf[9] = 0x00;
         buf[12] = 63;  buf[13] = 0;   // Sectors per track
 
-        let serial = b"TWO555-SATA0    ";
-        for (i, &b) in serial.iter().take(20).enumerate() {
-            buf[20 + i] = b;
-        }
+        copy_ata_string(&mut buf[20..40], b"TWO555-SATA0    ");
+        copy_ata_string(&mut buf[46..54], b"01.00   ");
+        copy_ata_string(&mut buf[54..94], b"Two Five Five Virtual SATA HDD          ");
 
-        buf[46..54].copy_from_slice(b"01.00   "); // Firmware rev
-        let model = b"Two Five Five Virtual SATA HDD          ";
-        for (i, slot) in buf[54..94].chunks_mut(2).enumerate() {
-            let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
-            slot[0] = get(i * 2 + 1);
-            slot[1] = get(i * 2);
-        }
-
-        buf[98] = 0x00; buf[99] = 0x02; // LBA supported
-        buf[106] = 0x06; buf[107] = 0x00;
-        buf[118] = 0x70; buf[119] = 0x00; // Ultra DMA modes supported
+        // Word 49: DMA (bit 8), LBA (bit 9), IORDY (bit 11) -> 0x0F00
+        buf[98] = 0x00; buf[99] = 0x0F;
+        // Word 53: Words 54-58, 64-70, 88 son válidos
+        buf[106] = 0x07; buf[107] = 0x00;
+        // Word 63: Multiword DMA modos 0, 1, 2 soportados y activos
+        buf[126] = 0x07; buf[127] = 0x07;
 
         let total_sectors = (self.disk_size / 512).max(1);
         let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
         buf[120..124].copy_from_slice(&lba28.to_le_bytes());
 
-        // LBA48 support
-        buf[166] = 0x00; buf[167] = 0x04; // 48-bit address feature set supported
+        // Word 80: Versión mayor ATA/ATAPI-4..8 (0x01F0)
+        buf[160] = 0xF0; buf[161] = 0x01;
+        // Word 82: Conjuntos de comandos soportados
+        buf[164] = 0x00; buf[165] = 0x74;
+        // Word 83: Soporte LBA48 (bit 10=1, bit 14=1) -> 0x4400
+        buf[166] = 0x00; buf[167] = 0x44;
+        // Word 86: LBA48 habilitado (bit 10=1) -> 0x0400
         buf[172] = 0x00; buf[173] = 0x04;
+        // Word 88: Ultra DMA modos 0..6 soportados y activos
+        buf[176] = 0x7F; buf[177] = 0x7F;
+
+        // LBA48 total de sectores
         buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
 
         buf
@@ -924,20 +962,12 @@ impl AhciController {
         pkt[0] = 0x05;
         pkt[1] = 0x85;
 
-        let serial = b"TWO555-SATA1    ";
-        for (i, &b) in serial.iter().take(20).enumerate() {
-            pkt[20 + i] = b;
-        }
+        copy_ata_string(&mut pkt[20..40], b"TWO555-SATA1    ");
+        copy_ata_string(&mut pkt[46..54], b"01.00   ");
+        copy_ata_string(&mut pkt[54..94], b"Two Five Five Virtual SATA CD-ROM       ");
 
-        pkt[46..54].copy_from_slice(b"01.00   ");
-        let model = b"Two Five Five Virtual SATA CD-ROM       ";
-        for (i, slot) in pkt[54..94].chunks_mut(2).enumerate() {
-            let get = |k: usize| -> u8 { model.get(k).copied().unwrap_or(b' ') };
-            slot[0] = get(i * 2 + 1);
-            slot[1] = get(i * 2);
-        }
-
-        pkt[98] = 0x00; pkt[99] = 0x02; // LBA supported
+        // Word 49: DMA, LBA, IORDY soportados (0x0F00)
+        pkt[98] = 0x00; pkt[99] = 0x0F;
         pkt[124] = 0x07; pkt[125] = 0x00;
         pkt[160] = 0x7E; pkt[161] = 0x00; // ATA/ATAPI-6
 
@@ -1139,8 +1169,8 @@ fn parse_ncq_lba(cfis: &[u8]) -> u64 {
 }
 
 fn parse_ncq_sector_count(cfis: &[u8]) -> u32 {
-    let low = cfis[12] as u32;
-    let high = cfis[13] as u32;
+    let low = cfis[3] as u32;
+    let high = cfis[11] as u32;
     let cnt = low | (high << 8);
     if cnt == 0 { 65536 } else { cnt }
 }
@@ -1381,7 +1411,7 @@ mod tests {
         assert_eq!(ctrl.read_reg_u32(0x100 + PORT_SSTS), 0x123);
         assert_eq!(ctrl.read_reg_u32(0x100 + PORT_SERR), 0);
         assert_eq!(ctrl.read_reg_u32(0x100 + PORT_SIG), PORT_SIG_ATA);
-        assert_eq!(ctrl.read_reg_u32(0x100 + PORT_TFD), 0x170);
+        assert_eq!(ctrl.read_reg_u32(0x100 + PORT_TFD), 0x150);
 
         // Verificar FIS D2H inicial posteado en fb + 0x40
         let fis_type = guest_mem.read_u8((fb0 + 0x40) as usize);
@@ -1389,7 +1419,7 @@ mod tests {
         let fis_error = guest_mem.read_u8((fb0 + 0x43) as usize);
         let fis_lba_low = guest_mem.read_u8((fb0 + 0x44) as usize);
         assert_eq!(fis_type, 0x34);
-        assert_eq!(fis_status, 0x70);
+        assert_eq!(fis_status, 0x50);
         assert_eq!(fis_error, 0x01);
         assert_eq!(fis_lba_low, 0x01);
 
@@ -1410,7 +1440,7 @@ mod tests {
 
         assert_eq!(ctrl.read_reg_u32(0x180 + PORT_SSTS), 0x123);
         assert_eq!(ctrl.read_reg_u32(0x180 + PORT_SIG), PORT_SIG_ATAPI);
-        assert_eq!(ctrl.read_reg_u32(0x180 + PORT_TFD), 0x170);
+        assert_eq!(ctrl.read_reg_u32(0x180 + PORT_TFD), 0x150);
 
         let p1_fis_lba_mid = guest_mem.read_u8((fb1 + 0x45) as usize);
         let p1_fis_lba_high = guest_mem.read_u8((fb1 + 0x46) as usize);
@@ -1427,7 +1457,7 @@ mod tests {
     #[test]
     fn test_ahci_initial_and_reset_tfd_values() {
         let p_present = AhciPort::new(0, false, true);
-        assert_eq!(p_present.tfd, 0x170);
+        assert_eq!(p_present.tfd, 0x150);
 
         let p_not_present = AhciPort::new(0, false, false);
         assert_eq!(p_not_present.tfd, 0x7F);
@@ -1435,7 +1465,7 @@ mod tests {
         let mut p = AhciPort::new(0, false, true);
         p.tfd = 0x50;
         p.reset();
-        assert_eq!(p.tfd, 0x170);
+        assert_eq!(p.tfd, 0x150);
 
         let mut p_none = AhciPort::new(0, false, false);
         p_none.reset();
@@ -1444,7 +1474,7 @@ mod tests {
         let mut ctrl = AhciController::new();
         ctrl.ports[0].tfd = 0x50;
         ctrl.reset();
-        assert_eq!(ctrl.ports[0].tfd, 0x170);
+        assert_eq!(ctrl.ports[0].tfd, 0x150);
     }
 
     #[test]
@@ -1461,6 +1491,10 @@ mod tests {
         cfis[12] = 10;
         cfis[13] = 0;
         assert_eq!(parse_sector_count(&cfis, true), 10u32);
+
+        // NCQ: Sector Count se ubica en Features (cfis[3] low, cfis[11] high)
+        cfis[3] = 10;
+        cfis[11] = 0;
         assert_eq!(parse_ncq_sector_count(&cfis), 10u32);
 
         // LBA28: count = 0 -> 256 sectores
@@ -1636,10 +1670,10 @@ mod tests {
 
         ctrl.attach_aux_disk(&aux_path.to_string_lossy());
 
-        // Probar IDENTIFY en puerto 2
+        // Probar IDENTIFY en puerto 2 (con word-swapping estándar de ATA)
         let id = ctrl.identify_device(2);
         let serial = &id[20..36];
-        assert_eq!(serial, b"TWO555-SATA2    ");
+        assert_eq!(serial, b"WT5O55S-TA2A    ");
 
         // Probar escritura en puerto 2
         let write_data = vec![0x77u8; 512];
@@ -1652,7 +1686,7 @@ mod tests {
 
         // Verificar que puerto 0 no se vio afectado
         let id0 = ctrl.identify_device(0);
-        assert_eq!(&id0[20..36], b"TWO555-SATA0    ");
+        assert_eq!(&id0[20..36], b"WT5O55S-TA0A    ");
 
         let _ = std::fs::remove_file(&aux_path);
     }
@@ -1703,7 +1737,7 @@ mod tests {
 
         let mut id_buf = [0u8; 512];
         guest_mem.copy_from(prd_data_buf as usize, &mut id_buf);
-        assert_eq!(&id_buf[20..36], b"TWO555-SATA2    ");
+        assert_eq!(&id_buf[20..36], b"WT5O55S-TA2A    ");
 
         // 2. READ DMA (0xC8) en Puerto 2
         guest_mem.write_u8((ctba + 2) as usize, 0xC8);

@@ -91,12 +91,15 @@ d-i netcfg/get_hostname string {hostname}
 d-i netcfg/get_domain string local
 d-i netcfg/wireless_wep string
 
-#### 3. Configuracion de espejos / repositorios
+#### 3. Configuracion de espejos / repositorios y simple-cdd
+d-i simple-cdd/profiles multiselect kali, offline
 d-i mirror/country string manual
 d-i mirror/http/directory string /debian
 d-i mirror/http/proxy string
 d-i apt-setup/use_mirror boolean false
 d-i apt-setup/cdrom/set-first boolean false
+d-i apt-setup/cdrom/set-next boolean false
+d-i apt-setup/cdrom/set-failed boolean false
 d-i apt-setup/services-select multiselect
 d-i apt-setup/non-free boolean true
 d-i apt-setup/non-free-firmware boolean true
@@ -127,19 +130,44 @@ d-i partman-auto/disk string /dev/sda
 d-i partman-auto/method string regular
 d-i partman-auto/choose_recipe select atomic
 d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman-partitioning/confirm_new_label boolean true
+d-i partman-partitioning/confirm_resize boolean true
 d-i partman/choose_partition select finish
 d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
-d-i partman-md/confirm boolean true
-d-i partman-partitioning/confirm_resize boolean true
-d-i partman/confirm_write_new_label boolean true
 d-i partman-basicfilesystems/no_swap boolean false
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nochanges boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-md/confirm boolean true
+d-i partman-md/confirm_nochanges boolean true
+d-i partman/confirm_write_new_label boolean true
 
 #### 7. Seleccion e instalacion de paquetes del sistema base
+d-i preseed/early_command string anna-install eatmydata-udeb
 tasksel tasksel/first multiselect standard, ssh-server
 d-i pkgsel/include string sudo openssh-server curl
 d-i pkgsel/upgrade select none
+d-i pkgsel/update-policy select none
 popularity-contest popularity-contest/participate boolean false
+
+#### 7.1 Preguntas de paquetes especificos de Debian y Kali
+encfs encfs/security-information boolean true
+encfs encfs/security-information seen true
+samba-common samba-common/dhcp boolean false
+macchanger macchanger/automatically_run boolean false
+wireshark-common wireshark-common/install-setuid boolean true
+kismet-capture-common kismet-capture-common/install-users string
+kismet-capture-common kismet-capture-common/install-setuid boolean true
+sslh sslh/inetd_or_standalone select standalone
+atftpd atftpd/use_inetd boolean false
+tripwire tripwire/installed boolean true
+tripwire tripwire/installed seen true
+tripwire tripwire/rebuild-config boolean false
+tripwire tripwire/rebuild-policy boolean false
+tripwire tripwire/use-localkey boolean false
+tripwire tripwire/use-sitekey boolean false
 
 #### 8. Instalacion automatica del cargador de arranque GRUB en MBR (/dev/sda)
 d-i grub-installer/only_debian boolean true

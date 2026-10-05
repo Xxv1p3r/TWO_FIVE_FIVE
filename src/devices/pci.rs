@@ -323,7 +323,7 @@ impl PciBus {
                 return irq;
             }
         }
-        10 // Default IRQ 10
+        5 // Default IRQ 5 (Standard PC Audio IRQ)
     }
 
     /// Registra un dispositivo en un slot/función específicos.
@@ -857,7 +857,7 @@ impl PciBus {
         ac97.config_regs[0x2E] = 0x00; // Subsystem Device ID low
         ac97.config_regs[0x2F] = 0x00; // Subsystem Device ID high
         ac97.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
-        ac97.config_regs[0x3C] = 10;   // Default IRQ line 10
+        ac97.config_regs[0x3C] = 5;    // Default IRQ line 5 (Audio)
         // BAR0 (reg 0x10): NAMBAR 256 bytes I/O space -> mask 0xFFFF_FF01
         ac97.set_bar_mask(0x10, 0xFFFF_FF01);
         // BAR1 (reg 0x14): NABMBAR 64 bytes I/O space -> mask 0xFFFF_FFC1

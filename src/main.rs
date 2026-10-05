@@ -550,71 +550,13 @@ fn pit_timer_thread(
                 bus.lock().unwrap_or_else(|p| p.into_inner()).request_resolution(w, h);
             }
         }
-        // USB UHCI: avanzar el scheduler de DMA cada 1 ms (Frame List, QHs, TDs)
+        // Dispositivos PCI (UHCI, VirtIO, AHCI, VMMDev, AC'97): sincronizar con lógica wired-OR
         {
             let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
             b.step_usb(&guest_mem);
-            let irq = b.usb_irq_line() as u32;
-            if b.take_usb_irq_pulse() {
-                vm.set_irq_line(irq, false).ok();
-                vm.set_irq_line(irq, true).ok();
-            } else if !b.is_usb_irq_asserted() {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // VirtIO-Serial: procesar virtqueues y mensajes de control/display SPICE
-        {
-            let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
             b.step_virtio_serial(&guest_mem);
-            let irq = b.virtio_serial_irq_line() as u32;
-            if b.take_virtio_serial_irq_pulse() {
-                vm.set_irq_line(irq, false).ok();
-                vm.set_irq_line(irq, true).ok();
-            } else if !b.is_virtio_serial_irq_asserted() {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // VirtIO-Net: procesar virtqueues RX/TX y red integrada
-        {
-            let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
             b.step_virtio_net(&guest_mem);
-            let irq = b.virtio_net_irq_line() as u32;
-            if b.take_virtio_net_irq_pulse() {
-                vm.set_irq_line(irq, false).ok();
-                vm.set_irq_line(irq, true).ok();
-            } else if !b.is_virtio_net_irq_asserted() {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // SATA AHCI: sincronizar línea de interrupción
-        {
-            let b = bus.lock().unwrap_or_else(|p| p.into_inner());
-            let irq = b.ahci_irq_line() as u32;
-            if b.is_ahci_irq_asserted() {
-                vm.set_irq_line(irq, true).ok();
-            } else {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // VirtualBox VMMDev: sincronizar línea de interrupción (dev 6:0)
-        {
-            let b = bus.lock().unwrap_or_else(|p| p.into_inner());
-            let irq = b.vmmdev_irq_line() as u32;
-            if b.is_vmmdev_irq_asserted() {
-                vm.set_irq_line(irq, true).ok();
-            } else {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // Intel 82801AA AC'97 Audio: sincronizar línea de interrupción (dev 7:0)
-        {
-            let b = bus.lock().unwrap_or_else(|p| p.into_inner());
-            let irq = b.ac97_irq_line() as u32;
-            if b.is_ac97_irq_asserted() {
-                vm.set_irq_line(irq, true).ok();
-            } else {
-                vm.set_irq_line(irq, false).ok();
-            }
+            sync_pci_irqs(&mut b, &vm, None);
         }
         // UART 16550 (IRQ4): RX/THRE pendientes también con el guest parado.
         if bus.lock().unwrap_or_else(|p| p.into_inner()).take_uart_irq() {
@@ -740,6 +682,77 @@ fn mmap_zeroed_region(size: usize) -> &'static mut [u8] {
 fn install_signal_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     unsafe {
         libc::signal(sig, handler as *const () as libc::sighandler_t);
+    }
+}
+
+/// Sincroniza las líneas de interrupción de todos los dispositivos PCI hacia la VM de KVM
+/// implementando la semántica estándar de nivel compartida (wired-OR activo en bajo/alto).
+///
+/// Si múltiples dispositivos comparten la misma línea IRQ (ej. AHCI y VirtIO-Serial en IRQ 10,
+/// o USB UHCI y VMMDev en IRQ 11), la línea permanece en alto mientras CUALQUIERA de ellos
+/// la mantenga asserted. Esto previene que un dispositivo inactivo limpie la interrupción
+/// recién levantada por otro dispositivo en el mismo bus.
+fn sync_pci_irqs(
+    b: &mut devices::DeviceBus,
+    vm: &kvm_ioctls::VmFd,
+    metrics: Option<&metrics::VmmMetrics>,
+) {
+    let irq_usb = b.usb_irq_line() as u32;
+    let pulse_usb = b.take_usb_irq_pulse();
+    let assert_usb = b.is_usb_irq_asserted();
+
+    let irq_vs = b.virtio_serial_irq_line() as u32;
+    let pulse_vs = b.take_virtio_serial_irq_pulse();
+    let assert_vs = b.is_virtio_serial_irq_asserted();
+
+    let irq_vn = b.virtio_net_irq_line() as u32;
+    let pulse_vn = b.take_virtio_net_irq_pulse();
+    let assert_vn = b.is_virtio_net_irq_asserted();
+
+    let irq_ahci = b.ahci_irq_line() as u32;
+    let assert_ahci = b.is_ahci_irq_asserted();
+
+    let irq_vmm = b.vmmdev_irq_line() as u32;
+    let assert_vmm = b.is_vmmdev_irq_asserted();
+
+    let irq_ac97 = b.ac97_irq_line() as u32;
+    let assert_ac97 = b.is_ac97_irq_asserted();
+
+    let mut lines = [irq_usb, irq_vs, irq_vn, irq_ahci, irq_vmm, irq_ac97];
+    lines.sort_unstable();
+
+    let mut last = 0xFF;
+    for &line in &lines {
+        if line == last || line == 0 || line == 0xFF {
+            continue;
+        }
+        last = line;
+
+        let pulse = (line == irq_usb && pulse_usb)
+            || (line == irq_vs && pulse_vs)
+            || (line == irq_vn && pulse_vn);
+
+        let asserted = (line == irq_usb && assert_usb)
+            || (line == irq_vs && assert_vs)
+            || (line == irq_vn && assert_vn)
+            || (line == irq_ahci && assert_ahci)
+            || (line == irq_vmm && assert_vmm)
+            || (line == irq_ac97 && assert_ac97);
+
+        if pulse {
+            vm.set_irq_line(line, false).ok();
+            vm.set_irq_line(line, true).ok();
+            if let Some(m) = metrics {
+                m.record_irq(line as u8);
+            }
+        } else if asserted {
+            vm.set_irq_line(line, true).ok();
+            if let Some(m) = metrics {
+                m.record_irq(line as u8);
+            }
+        } else {
+            vm.set_irq_line(line, false).ok();
+        }
     }
 }
 
@@ -1030,6 +1043,7 @@ fn main() {
 
     // ─── Instalación Desatendida (OEMDRV / CIDATA) ──────────────
     if unattended {
+        bus.ahci.unattended = true;
         if let Some(ref mut cdrom) = bus.cdrom {
             cdrom.unattended = true;
         }
@@ -1732,68 +1746,10 @@ fn main() {
                     vm.set_irq_line(15, false).ok();
                     vm.set_irq_line(15, true).ok();
                 }
-                // USB UHCI (IRQ11)
+                // Dispositivos PCI (UHCI, VirtIO, AHCI, VMMDev, AC'97): sincronizar con lógica wired-OR
                 {
                     let mut b = bus_lock();
-                    let irq = b.usb_irq_line() as u32;
-                    if b.take_usb_irq_pulse() {
-                        vm.set_irq_line(irq, false).ok();
-                        vm.set_irq_line(irq, true).ok();
-                    } else if !b.is_usb_irq_asserted() {
-                        vm.set_irq_line(irq, false).ok();
-                    }
-                }
-                // VirtIO-Serial (IRQ10)
-                {
-                    let mut b = bus_lock();
-                    let irq = b.virtio_serial_irq_line() as u32;
-                    if b.take_virtio_serial_irq_pulse() {
-                        vm.set_irq_line(irq, false).ok();
-                        vm.set_irq_line(irq, true).ok();
-                    } else if !b.is_virtio_serial_irq_asserted() {
-                        vm.set_irq_line(irq, false).ok();
-                    }
-                }
-                // VirtIO-Net (IRQ9)
-                {
-                    let mut b = bus_lock();
-                    let irq = b.virtio_net_irq_line() as u32;
-                    if b.take_virtio_net_irq_pulse() {
-                        vm.set_irq_line(irq, false).ok();
-                        vm.set_irq_line(irq, true).ok();
-                    } else if !b.is_virtio_net_irq_asserted() {
-                        vm.set_irq_line(irq, false).ok();
-                    }
-                }
-                // SATA AHCI (IRQ10)
-                {
-                    let b = bus_lock();
-                    let irq = b.ahci_irq_line() as u32;
-                    if b.is_ahci_irq_asserted() {
-                        vm.set_irq_line(irq, true).ok();
-                    } else {
-                        vm.set_irq_line(irq, false).ok();
-                    }
-                }
-                // VirtualBox VMMDev (IRQ11)
-                {
-                    let b = bus_lock();
-                    let irq = b.vmmdev_irq_line() as u32;
-                    if b.is_vmmdev_irq_asserted() {
-                        vm.set_irq_line(irq, true).ok();
-                    } else {
-                        vm.set_irq_line(irq, false).ok();
-                    }
-                }
-                // Intel 82801AA AC'97 Audio
-                {
-                    let b = bus_lock();
-                    let irq = b.ac97_irq_line() as u32;
-                    if b.is_ac97_irq_asserted() {
-                        vm.set_irq_line(irq, true).ok();
-                    } else {
-                        vm.set_irq_line(irq, false).ok();
-                    }
+                    sync_pci_irqs(&mut b, &vm, None);
                 }
                 continue;
             }
@@ -1842,74 +1798,10 @@ fn main() {
             vm.set_irq_line(15, true).ok();
             metrics.record_irq(15);
         }
-        // USB UHCI (IRQ11)
+        // Dispositivos PCI (UHCI, VirtIO, AHCI, VMMDev, AC'97): sincronizar con lógica wired-OR
         {
             let mut b = bus_lock();
-            let irq = b.usb_irq_line() as u32;
-            if b.take_usb_irq_pulse() {
-                vm.set_irq_line(irq, false).ok();
-                vm.set_irq_line(irq, true).ok();
-                metrics.record_irq(irq as u8);
-            } else if !b.is_usb_irq_asserted() {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // VirtIO-Serial (IRQ10)
-        {
-            let mut b = bus_lock();
-            let irq = b.virtio_serial_irq_line() as u32;
-            if b.take_virtio_serial_irq_pulse() {
-                vm.set_irq_line(irq, false).ok();
-                vm.set_irq_line(irq, true).ok();
-                metrics.record_irq(irq as u8);
-            } else if !b.is_virtio_serial_irq_asserted() {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // VirtIO-Net (IRQ9)
-        {
-            let mut b = bus_lock();
-            let irq = b.virtio_net_irq_line() as u32;
-            if b.take_virtio_net_irq_pulse() {
-                vm.set_irq_line(irq, false).ok();
-                vm.set_irq_line(irq, true).ok();
-                metrics.record_irq(irq as u8);
-            } else if !b.is_virtio_net_irq_asserted() {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // SATA AHCI (IRQ10)
-        {
-            let b = bus_lock();
-            let irq = b.ahci_irq_line() as u32;
-            if b.is_ahci_irq_asserted() {
-                vm.set_irq_line(irq, true).ok();
-                metrics.record_irq(irq as u8);
-            } else {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // VirtualBox VMMDev (IRQ11)
-        {
-            let b = bus_lock();
-            let irq = b.vmmdev_irq_line() as u32;
-            if b.is_vmmdev_irq_asserted() {
-                vm.set_irq_line(irq, true).ok();
-                metrics.record_irq(irq as u8);
-            } else {
-                vm.set_irq_line(irq, false).ok();
-            }
-        }
-        // Intel 82801AA AC'97 Audio
-        {
-            let b = bus_lock();
-            let irq = b.ac97_irq_line() as u32;
-            if b.is_ac97_irq_asserted() {
-                vm.set_irq_line(irq, true).ok();
-                metrics.record_irq(irq as u8);
-            } else {
-                vm.set_irq_line(irq, false).ok();
-            }
+            sync_pci_irqs(&mut b, &vm, Some(&metrics));
         }
         // APM / SMI (Item 23): inyectar SMI al vCPU si hubo comando en 0xB2
         if bus_lock().take_smi() {
