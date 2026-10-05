@@ -95,6 +95,13 @@ d-i netcfg/wireless_wep string
 d-i mirror/country string manual
 d-i mirror/http/directory string /debian
 d-i mirror/http/proxy string
+d-i apt-setup/use_mirror boolean false
+d-i apt-setup/cdrom/set-first boolean false
+d-i apt-setup/services-select multiselect
+d-i apt-setup/non-free boolean true
+d-i apt-setup/non-free-firmware boolean true
+d-i apt-setup/contrib boolean true
+d-i apt-setup/disable-cdrom-entries boolean false
 
 #### 4. Reloj y zona horaria
 d-i clock-setup/utc boolean true
@@ -126,6 +133,7 @@ d-i partman/confirm_nooverwrite boolean true
 d-i partman-md/confirm boolean true
 d-i partman-partitioning/confirm_resize boolean true
 d-i partman/confirm_write_new_label boolean true
+d-i partman-basicfilesystems/no_swap boolean false
 
 #### 7. Seleccion e instalacion de paquetes del sistema base
 tasksel tasksel/first multiselect standard, ssh-server

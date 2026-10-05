@@ -70,6 +70,13 @@ pub fn patch_unattended_iso_sectors(buf: &mut [u8]) {
         b"simple-cdd/profiles=kali,offline desktop=xfce vga=788",
         b"desktop=xfce auto=true priority=critical vga=788     ",
     );
+
+    // 4. Parchear simple-cdd/default.preseed en el CD-ROM para incluir /media/preseed.cfg
+    patch_slice(
+        buf,
+        b"# loads the simple-cdd-profiles udeb to which asks for which profiles to use,\n",
+        b"d-i preseed/include string file:///media/preseed.cfg                         \n",
+    );
 }
 
 fn patch_slice(buf: &mut [u8], from: &[u8], to: &[u8]) {
