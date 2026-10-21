@@ -458,6 +458,72 @@ impl DisplayManager {
     }
 }
 
+/// Captura y guarda el framebuffer actual (VBE, VGA gráfico o texto) en formato PPM (P6)
+/// para diagnóstico e inspección visual automatizada.
+pub fn save_ppm_screenshot(
+    vga_state: &Arc<Mutex<VgaState>>,
+    guest_mem: &GuestMemory,
+    path: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let st = vga_state.lock().unwrap();
+    let (w, h, bpp) = st.get_resolution();
+    let is_vbe = st.is_vbe_enabled();
+    let is_std_gfx = !is_vbe && st.is_standard_vga_graphics();
+    let (lw, lh) = if is_vbe {
+        (w, h)
+    } else if is_std_gfx {
+        st.standard_vga_geometry()
+    } else {
+        (640, 400)
+    };
+    let mut render_buf = vec![0u32; lw * lh];
+    if is_vbe {
+        if !st.vram_ptr.is_null() {
+            let mut hashes = vec![0u64; lh];
+            let virt_w = st.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] as usize;
+            let x_off = st.dispi_regs[VBE_DISPI_INDEX_X_OFFSET as usize] as usize;
+            let y_off = st.dispi_regs[VBE_DISPI_INDEX_Y_OFFSET as usize] as usize;
+            let dac8 = st.dispi_regs[VBE_DISPI_INDEX_ENABLE as usize] & VBE_DISPI_8BIT_DAC != 0;
+            render_vbe_framebuffer(
+                &mut render_buf,
+                st.vram_ptr,
+                st.vram_size,
+                lw,
+                lh,
+                bpp,
+                virt_w,
+                x_off,
+                y_off,
+                &st.dac_palette,
+                dac8,
+                &mut hashes,
+                true,
+            );
+        }
+    } else if is_std_gfx {
+        if !st.vram_ptr.is_null() {
+            let mut hash = 0u64;
+            render_vga_graphics(&mut render_buf, &st, lw, lh, &mut hash, true);
+        }
+    } else {
+        let mut hash = 0u64;
+        render_vga_text_mode(&mut render_buf, guest_mem, &mut hash, true);
+    }
+    drop(st);
+
+    let mut file = std::fs::File::create(path)?;
+    write!(file, "P6\n{} {}\n255\n", lw, lh)?;
+    let mut rgb = Vec::with_capacity(lw * lh * 3);
+    for &px in &render_buf {
+        rgb.push(((px >> 16) & 0xFF) as u8);
+        rgb.push(((px >> 8) & 0xFF) as u8);
+        rgb.push((px & 0xFF) as u8);
+    }
+    file.write_all(&rgb)?;
+    Ok(())
+}
+
 /// Hash ultra-rápido de 64 bits para detección de scanlines y regiones sucias (dirty tracking)
 /// Traducido conceptualmente de DevVGA.cpp de VirtualBox para evitar re-renderizados innecesarios.
 #[inline]

@@ -225,10 +225,12 @@ pub struct CmosRtc {
     rtc_start: Instant,
     /// Unix timestamp base at start (seconds)
     rtc_base_unix_secs: u64,
-    /// Status C: UF (Update Finished) interrupt pending bit
+    /// Status C: IRQF (bit 7), PF (bit 6), AF (bit 5), UF (bit 4)
     status_c: u8,
     /// Track the last second we saw (to detect second transitions)
     last_second: u64,
+    /// Acumulador de nanosegundos para el temporizador periódico (PF, bit 6)
+    periodic_ns_acc: u64,
     /// CMOS RAM (256 bytes: 0..128 Banco 0, 128..256 Banco 1)
     ram: [u8; 256],
 }
@@ -250,6 +252,9 @@ impl CmosRtc {
             .unwrap_or(1774828800);
 
         let mut ram = [0u8; 256];
+        ram[0x0A] = 0x26; // Status A: 32.768 kHz timebase, 1024 Hz periodic rate (RS=6)
+        ram[0x0B] = 0x02; // Status B: 24-hour mode, BCD
+        ram[0x0D] = 0x80; // Status D: CMOS battery power good
         ram[0x0F] = 0x00; // Shutdown status: normal boot
         ram[0x10] = 0x00; // Equipment byte: 0 floppies
         ram[0x14] = 0x23; // Equipment: 80x25 color, keyboard installed
@@ -315,6 +320,7 @@ impl CmosRtc {
             rtc_base_unix_secs: unix_secs,
             status_c: 0,
             last_second: 0,
+            periodic_ns_acc: 0,
             ram,
         }
     }
@@ -326,8 +332,57 @@ impl CmosRtc {
         self.index = [0, 0];
         self.status_c = 0;
         self.last_second = self.rtc_start.elapsed().as_secs();
+        self.periodic_ns_acc = 0;
+        self.ram[0x0A] = 0x26;
+        self.ram[0x0B] = 0x02;
         // Shutdown status: boot normal
         self.ram[0x0F] = 0x00;
+    }
+
+    /// Avanza el reloj RTC por `elapsed_ns` nanosegundos y devuelve `true`
+    /// si se debe inyectar una interrupción IRQ 8 (cuando PF/AF/UF están
+    /// activos y habilitados en el Registro B 0x0B).
+    pub fn rtc_advance_ns(&mut self, elapsed_ns: u64) -> bool {
+        let mut new_event = false;
+        let current_second = self.rtc_start.elapsed().as_secs();
+        if current_second != self.last_second {
+            self.status_c |= 0x10; // UF (Update-ended Interrupt Flag)
+            self.last_second = current_second;
+            if (self.ram[0x0B] & 0x10) != 0 {
+                new_event = true;
+            }
+        }
+
+        let rs = self.ram[0x0A] & 0x0F;
+        let period_ns: u64 = match rs {
+            0 => 0,
+            1 => 3_906_250, // 256 Hz
+            2 => 7_812_500, // 128 Hz
+            3..=15 => {
+                let freq = 32768u64 >> (rs - 1);
+                1_000_000_000 / freq.max(1)
+            }
+            _ => 0,
+        };
+
+        if period_ns > 0 {
+            self.periodic_ns_acc += elapsed_ns;
+            if self.periodic_ns_acc >= period_ns {
+                self.periodic_ns_acc %= period_ns;
+                self.status_c |= 0x40; // PF (Periodic Interrupt Flag)
+                if (self.ram[0x0B] & 0x40) != 0 {
+                    new_event = true;
+                }
+            }
+        }
+
+        let enabled = self.ram[0x0B] & 0x70;
+        if (self.status_c & enabled) != 0 {
+            self.status_c |= 0x80; // IRQF
+            new_event
+        } else {
+            false
+        }
     }
 
     /// Convert a binary value to BCD (Binary Coded Decimal).
@@ -370,36 +425,42 @@ impl CmosRtc {
     /// Valores CMOS que reportamos al guest para Banco 0.
     fn read_reg(&mut self, reg: u8) -> u8 {
         let (year, month, day, hour, min, sec, wday) = self.current_utc();
+        let is_binary = (self.ram[0x0B] & 0x04) != 0;
+        let fmt = |v: u8| if is_binary { v } else { Self::to_bcd(v) };
         match reg {
             // RTC: tiempo real UTC emulado
             0x00 => { // Seconds
                 self.update_rtc_cycle();
-                Self::to_bcd(sec)
+                fmt(sec)
             }
-            0x02 => Self::to_bcd(min), // Minutes
-            0x04 => Self::to_bcd(hour), // Hours
+            0x02 => fmt(min), // Minutes
+            0x04 => fmt(hour), // Hours
             0x06 => wday,               // Day of week (1..=7)
-            0x07 => Self::to_bcd(day),  // Day of month
-            0x08 => Self::to_bcd(month), // Month
-            0x09 => Self::to_bcd((year % 100) as u8), // Year
-            0x01..=0x03 | 0x05 => 0,
+            0x07 => fmt(day),  // Day of month
+            0x08 => fmt(month), // Month
+            0x09 => fmt((year % 100) as u8), // Year
+            0x01 | 0x03 | 0x05 => self.ram[reg as usize],
             0x0A => {
-                // Status A: bit 7 = UIP (Update In Progress)
+                // Status A: bit 7 = UIP (Update In Progress), bits 6..0 = DV/RS configurables
                 let elapsed_ns = self.rtc_start.elapsed().as_nanos() as u64;
                 let nanos_in_second = elapsed_ns % 1_000_000_000;
                 let uip = if nanos_in_second >= 999_756_000 { 0x80 } else { 0x00 };
-                uip | 0x26 // dividers: 32768 Hz, 22-stage divider
+                uip | (self.ram[0x0A] & 0x7F)
             }
-            0x0B => 0x02, // Status B: 24h, BCD
+            0x0B => self.ram[0x0B], // Status B: PIE, AIE, UIE, DM, 24/12
             0x0C => {
                 // Status C: read clears the register
-                let val = self.status_c;
+                let enabled = self.ram[0x0B] & 0x70;
+                let mut val = self.status_c;
+                if (val & enabled) != 0 {
+                    val |= 0x80; // IRQF
+                }
                 self.status_c = 0; // Clear all pending interrupts on read
                 val
             }
             0x0D => 0x80, // Status D: batería OK
-            0x0F => 0x00, // Shutdown status: boot normal (soft reset)
-            0x32 | 0x37 => Self::to_bcd((year / 100) as u8),
+            0x0F => self.ram[0x0F], // Shutdown status
+            0x32 | 0x37 => fmt((year / 100) as u8),
             // Registros de memoria, configuración y NVRAM de Banco 0:
             _ => self.ram[reg as usize],
         }
@@ -553,8 +614,8 @@ pub struct AcpiPm {
     pm1a_cnt: u16,
     /// PM Timer start time
     pm_timer_start: Instant,
-    /// Last PM Timer value returned (to ensure monotonic increase)
-    pm_timer_last: u32,
+    /// Last PM Timer value returned (64-bit unwrapped to ensure monotonic increase across 24-bit wraps)
+    pm_timer_last: u64,
     /// PM I/O base address (configured via PCI config reg 0x40)
     pm_base: u16,
     /// PM I/O space enabled (PCI config reg 0x80 bit 0)
@@ -581,7 +642,7 @@ impl AcpiPm {
         Self {
             pm1a_sts: 0,
             pm1a_en: 0,
-            pm1a_cnt: 0,
+            pm1a_cnt: 0x0001, // SCI_EN = 1 (ACPI habilitado por defecto)
             pm_timer_start: Instant::now(),
             pm_timer_last: 0,
             pm_base: 0xB0,  // default QEMU base
@@ -657,18 +718,14 @@ impl AcpiPm {
     }
 
     /// Retorna el PM Timer actual (24-bit counter).
-    /// Uses stored counter that always advances to ensure tight polling loops
-    /// eventually see a different value.
+    /// Uses 64-bit unwrapped counter that always advances monotonically
+    /// without getting stuck when the 24-bit low part wraps every 4.68 seconds.
     fn pm_timer_value(&mut self) -> u32 {
         let elapsed_ns = self.pm_timer_start.elapsed().as_nanos() as u64;
-        let ticks = ((elapsed_ns * PM_TIMER_HZ as u64) / 1_000_000_000) as u32;
-        let val = ticks & 0x00FFFFFF;
-        // Ensure monotonically increasing: use max of (real value, last + 1)
-        // This prevents both oscillation AND backwards movement when
-        // Instant::now() returns the same nanosecond in a tight loop.
-        let next = self.pm_timer_last.wrapping_add(1) & 0x00FFFFFF;
-        self.pm_timer_last = std::cmp::max(val, next);
-        self.pm_timer_last
+        let ticks = (elapsed_ns * PM_TIMER_HZ) / 1_000_000_000;
+        let next = self.pm_timer_last.wrapping_add(1);
+        self.pm_timer_last = std::cmp::max(ticks, next);
+        (self.pm_timer_last & 0x00FF_FFFF) as u32
     }
 }
 
@@ -735,19 +792,26 @@ impl IoDevice for AcpiPm {
             match off {
                 0x00..=0x01 => {
                     // PM1a Event Status (2 bytes at base+0x00/0x01): write-1-to-clear
-                    let bit_shift = (off * 8) as u16;
-                    self.pm1a_sts &= !((val as u16) << bit_shift);
+                    for (i, &b) in data.iter().enumerate() {
+                        let cur_off = off + i as u16;
+                        if cur_off <= 0x01 {
+                            let bit_shift = (cur_off * 8) as u16;
+                            self.pm1a_sts &= !((b as u16) << bit_shift);
+                        }
+                    }
                 }
                 0x02..=0x03 => {
-                  // PM1a Event Enable (2 bytes at base+0x02/0x03)
-                    if off == 0x02 {
-                        self.pm1a_en = (self.pm1a_en & 0xFF00) | (val as u16);
-                    } else {
-                        self.pm1a_en = (self.pm1a_en & 0x00FF) | ((val as u16) << 8);
+                    // PM1a Event Enable (2 bytes at base+0x02/0x03)
+                    for (i, &b) in data.iter().enumerate() {
+                        match off + i as u16 {
+                            0x02 => self.pm1a_en = (self.pm1a_en & 0xFF00) | (b as u16),
+                            0x03 => self.pm1a_en = (self.pm1a_en & 0x00FF) | ((b as u16) << 8),
+                            _ => {}
+                        }
                     }
                 }
                 0x04..=0x05 => {
-                    // PM1a Control: accepts writes, register is read-only.
+                    // PM1a Control: accepts writes, SCI_EN (bit 0) stays enabled.
                     // El guest puede escribir 1 o 2 bytes en un solo OUT
                     // (outw/outl a 0x604): aplicar cada byte a su offset.
                     for (i, &b) in data.iter().enumerate() {
@@ -774,64 +838,73 @@ impl IoDevice for AcpiPm {
         }
     }
 
-    fn read(&mut self, port: u16, _count: usize) -> Vec<u8> {
+    fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
         self.read_count += 1;
+        let n = count.max(1);
 
         // GPE0 registers (0xAFE0-0xAFE3)
         if matches!(port, 0xAFE0..=0xAFE3) {
-            let off = (port - 0xAFE0) as usize;
-            return vec![match off {
-                0 => self.gpe0_sts,
-                1 => self.gpe0_en,
-                2 => self.gpe0_sts,
-                3 => self.gpe0_en,
-                _ => 0,
-            }];
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let off = (port - 0xAFE0) as usize + i;
+                out.push(match off {
+                    0 => self.gpe0_sts,
+                    1 => self.gpe0_en,
+                    2 => self.gpe0_sts,
+                    3 => self.gpe0_en,
+                    _ => 0,
+                });
+            }
+            return out;
         }
 
         // SMBus registers — return 0
         if self.smb_enabled && port >= self.smb_base && port < self.smb_base.wrapping_add(16) {
-            return vec![0];
+            return vec![0; n];
         }
 
         // Legacy range 0xB0-0xB7
         if matches!(port, 0xB0..=0xB7) {
-            return vec![self.legacy_regs[(port - 0xB0) as usize]];
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let idx = (port - 0xB0) as usize + i;
+                out.push(if idx < 8 { self.legacy_regs[idx] } else { 0 });
+            }
+            return out;
         }
 
         // Dynamic PM I/O range
         if self.pm_enabled && port >= self.pm_base && port < self.pm_base.wrapping_add(64) {
             let off = port - self.pm_base;
-            let result = match off {
-                0x00 => (self.pm1a_sts & 0xFF) as u8,
-                0x01 => ((self.pm1a_sts >> 8) & 0xFF) as u8,
-                0x02 => (self.pm1a_en & 0xFF) as u8,
-                0x03 => ((self.pm1a_en >> 8) & 0xFF) as u8,
-                0x04 => (self.pm1a_cnt & 0xFF) as u8,
-                0x05 => ((self.pm1a_cnt >> 8) & 0xFF) as u8,
-                0x08..=0x0B => {
-                    // PM Timer: 24-bit counter, 4-byte read or sub-byte reads
-                    let val = self.pm_timer_value();
-                    let shift = (off - 0x08) * 8;
-                    if _count <= 1 {
-                        return vec![(val >> shift) as u8];
-                    }
-                    let mut bytes = Vec::with_capacity(_count);
-                    for i in 0.._count {
-                        bytes.push(((val >> ((off - 0x08 + i as u16) * 8)) & 0xFF) as u8);
-                    }
-                    return bytes;
+            if (0x08..=0x0B).contains(&off) {
+                let val = self.pm_timer_value();
+                let mut bytes = Vec::with_capacity(n);
+                for i in 0..n {
+                    bytes.push(((val >> ((off - 0x08 + i as u16) * 8)) & 0xFF) as u8);
                 }
-                _ => 0,
-            };
-            if self.read_count <= 10 {
-                eprintln!("[ACPI] PM READ base+{:#x} = 0x{:02X}", off, result);
+                return bytes;
             }
-            return vec![result];
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let b = match off + i as u16 {
+                    0x00 => (self.pm1a_sts & 0xFF) as u8,
+                    0x01 => ((self.pm1a_sts >> 8) & 0xFF) as u8,
+                    0x02 => (self.pm1a_en & 0xFF) as u8,
+                    0x03 => ((self.pm1a_en >> 8) & 0xFF) as u8,
+                    0x04 => (self.pm1a_cnt & 0xFF) as u8,
+                    0x05 => ((self.pm1a_cnt >> 8) & 0xFF) as u8,
+                    _ => 0,
+                };
+                out.push(b);
+            }
+            if self.read_count <= 10 {
+                eprintln!("[ACPI] PM READ base+{:#x} = 0x{:02X}", off, out[0]);
+            }
+            return out;
         }
 
         // Fallback
-        vec![0]
+        vec![0; n]
     }
 }
 

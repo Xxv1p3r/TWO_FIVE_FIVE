@@ -81,34 +81,35 @@ fn build_rsdt(fadt_off: u32, madt_off: u32) -> Vec<u8> {
 fn build_fadt(facs_off: u32, dsdt_off: u32) -> Vec<u8> {
     let mut t = acpi_header(b"FACP", 116, b"MI-FADT ");
     t.resize(116, 0);
-    t[34..38].copy_from_slice(&facs_off.to_le_bytes()); // firmware_ctrl → FACS
-    t[38..42].copy_from_slice(&dsdt_off.to_le_bytes()); // dsdt → DSDT
-    t[43] = 9; // SCI interrupt
-    t[52..56].copy_from_slice(&(PM_IO_BASE as u32).to_le_bytes());       // PM1a_EVT_BLK
-    t[60..64].copy_from_slice(&((PM_IO_BASE + 4) as u32).to_le_bytes()); // PM1a_CNT_BLK
-    t[72..76].copy_from_slice(&((PM_IO_BASE + 8) as u32).to_le_bytes()); // PM_TMR_BLK
-    t[76..80].copy_from_slice(&(GPE0_BLK as u32).to_le_bytes());         // GPE0_BLK
-    t[84] = 4; // pm1_evt_len
-    t[85] = 2; // pm1_cnt_len
-    t[87] = 4; // pm_tmr_len
-    t[88] = 4; // gpe0_blk_len
-    t[92..94].copy_from_slice(&0xFFFu16.to_le_bytes()); // plvl2_lat: C2 no soportado
-    t[94..96].copy_from_slice(&0xFFFu16.to_le_bytes()); // plvl3_lat: C3 no soportado
-    t[105] = 0x02; // iapc_boot_arch: 8042 presente (teclado/ratón PS/2)
-    // flags: WBINVD | PROC_C1 | SLP_BUTTON | RTC_S4 | USE_PLATFORM_CLOCK
-    t[108..112].copy_from_slice(&0x80A5u32.to_le_bytes());
+    t[36..40].copy_from_slice(&facs_off.to_le_bytes()); // firmware_ctrl → FACS (offset 36)
+    t[40..44].copy_from_slice(&dsdt_off.to_le_bytes()); // dsdt → DSDT (offset 40)
+    t[46..48].copy_from_slice(&9u16.to_le_bytes());     // SCI_INT (offset 46)
+    t[56..60].copy_from_slice(&(PM_IO_BASE as u32).to_le_bytes());       // PM1a_EVT_BLK (offset 56)
+    t[64..68].copy_from_slice(&((PM_IO_BASE + 4) as u32).to_le_bytes()); // PM1a_CNT_BLK (offset 64)
+    t[76..80].copy_from_slice(&((PM_IO_BASE + 8) as u32).to_le_bytes()); // PM_TMR_BLK (offset 76)
+    t[80..84].copy_from_slice(&(GPE0_BLK as u32).to_le_bytes());         // GPE0_BLK (offset 80)
+    t[88] = 4; // pm1_evt_len (offset 88)
+    t[89] = 2; // pm1_cnt_len (offset 89)
+    t[91] = 4; // pm_tmr_len (offset 91)
+    t[92] = 4; // gpe0_blk_len (offset 92)
+    t[96..98].copy_from_slice(&0xFFFu16.to_le_bytes());  // plvl2_lat: C2 no soportado (offset 96)
+    t[98..100].copy_from_slice(&0xFFFu16.to_le_bytes()); // plvl3_lat: C3 no soportado (offset 98)
+    t[108] = 0x32; // century (offset 108)
+    t[109..111].copy_from_slice(&0x0002u16.to_le_bytes()); // iapc_boot_arch: 8042 presente (offset 109)
+    // flags (offset 112): WBINVD | PROC_C1 | SLP_BUTTON | RTC_S4 | TMR_VAL_EXT (0) | USE_PLATFORM_CLOCK
+    t[112..116].copy_from_slice(&0x80A5u32.to_le_bytes());
     t
 }
 
-/// DSDT mínimo: solo define `_S5` (estado S5 = apagado) para que Linux
-/// pueda pedir un apagado limpio. AML: Name(_S5, Package(4){0,0,0,0}).
+/// DSDT mínimo: define `_S5_` (estado S5 = apagado) para que el guest
+/// pueda pedir un apagado limpio. AML: Name(_S5_, Package(4){0,0,0,0}).
 fn build_dsdt() -> Vec<u8> {
-    let aml: [u8; 11] = [
+    let aml: [u8; 12] = [
         0x08, b'_', b'S', b'5', b'_', // NameOp "_S5_"
-        0x12, 0x04, // PackageOp, 4 elementos
+        0x12, 0x06, 0x04, // PackageOp, PkgLength=6, NumElements=4
         0x00, 0x00, 0x00, 0x00, // { 0, 0, 0, 0 } (SLP_TYP S5)
     ];
-    let mut t = acpi_header(b"DSDT", 36 + 11, b"MI-DSDT ");
+    let mut t = acpi_header(b"DSDT", 36 + 12, b"MI-DSDT ");
     t.extend_from_slice(&aml);
     t
 }
@@ -208,18 +209,20 @@ pub fn build_acpi_files(num_cpus: u32) -> AcpiFiles {
     const RSDT_OFF: u32 = 0x00;
     const FADT_OFF: u32 = 0x40;
     const DSDT_OFF: u32 = 0xC0;
-    const MADT_OFF: u32 = 0xF0;
+    let dsdt = build_dsdt();
+    let dsdt_len = dsdt.len() as u32;
+    let madt_off = (DSDT_OFF + dsdt_len + 15) & !15; // alinear a 16
     let madt_len = (44 + 8 * num_cpus as usize + 12) as u32;
-    let facs_off = (MADT_OFF + madt_len + 15) & !15; // alinear a 16
+    let facs_off = (madt_off + madt_len + 15) & !15; // alinear a 16
     let total = (facs_off + 64) as usize;
 
     let mut tables = Vec::with_capacity(total);
-    tables.extend_from_slice(&build_rsdt(FADT_OFF, MADT_OFF));
+    tables.extend_from_slice(&build_rsdt(FADT_OFF, madt_off));
     tables.resize(FADT_OFF as usize, 0);
     tables.extend_from_slice(&build_fadt(facs_off, DSDT_OFF));
     tables.resize(DSDT_OFF as usize, 0);
-    tables.extend_from_slice(&build_dsdt());
-    tables.resize(MADT_OFF as usize, 0);
+    tables.extend_from_slice(&dsdt);
+    tables.resize(madt_off as usize, 0);
     tables.extend_from_slice(&build_madt(num_cpus));
     tables.resize(facs_off as usize, 0);
     tables.extend_from_slice(&build_facs());
@@ -243,16 +246,16 @@ pub fn build_acpi_files(num_cpus: u32) -> AcpiFiles {
         ACPI_TABLES_FILE, ACPI_TABLES_FILE, RSDT_OFF + 40, 4, // RSDT[1] → MADT
     ));
     loader.extend_from_slice(&entry_add_pointer(
-        ACPI_TABLES_FILE, ACPI_TABLES_FILE, FADT_OFF + 34, 4, // FADT → FACS
+        ACPI_TABLES_FILE, ACPI_TABLES_FILE, FADT_OFF + 36, 4, // FADT → FACS
     ));
     loader.extend_from_slice(&entry_add_pointer(
-        ACPI_TABLES_FILE, ACPI_TABLES_FILE, FADT_OFF + 38, 4, // FADT → DSDT
+        ACPI_TABLES_FILE, ACPI_TABLES_FILE, FADT_OFF + 40, 4, // FADT → DSDT
     ));
     // 3) Checksums de cada tabla y del RSDP (tras los punteros).
     loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, RSDT_OFF + 9, RSDT_OFF, 44));
     loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, FADT_OFF + 9, FADT_OFF, 116));
-    loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, DSDT_OFF + 9, DSDT_OFF, 36 + 11));
-    loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, MADT_OFF + 9, MADT_OFF, madt_len));
+    loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, DSDT_OFF + 9, DSDT_OFF, dsdt_len));
+    loader.extend_from_slice(&entry_add_checksum(ACPI_TABLES_FILE, madt_off + 9, madt_off, madt_len));
     loader.extend_from_slice(&entry_add_checksum(ACPI_RSDP_FILE, 8, 0, 20));
 
     AcpiFiles { tables, rsdp, loader }
@@ -348,13 +351,17 @@ mod tests {
     fn loader_simulation_produces_valid_tables() {
         let files = build_acpi_files(2);
         let (tables, rsdp) = simulate_loader(&files);
+        let dsdt_len = build_dsdt().len();
+        let madt_off = (0xC0 + dsdt_len + 15) & !15;
+        let madt_len = 44 + 16 + 12;
+        let facs_off = (madt_off + madt_len + 15) & !15;
 
         // RSDP: firma + checksum del bloque de 20 bytes + puntero al RSDT.
         assert_eq!(&rsdp[0..8], b"RSD PTR ");
         assert_eq!(checksum(&rsdp[..20]), 0, "checksum RSDP");
         assert_eq!(u32::from_le_bytes(rsdp[16..20].try_into().unwrap()), 0x0010_0000);
 
-        // RSDT: checksum y entrada[0] → FADT (base + 0x40), entrada[1] → MADT (base + 0xF0).
+        // RSDT: checksum y entrada[0] → FADT (base + 0x40), entrada[1] → MADT.
         assert_eq!(sig(&tables, 0x00), *b"RSDT");
         assert_eq!(checksum(&tables[0x00..0x00 + 44]), 0, "checksum RSDT");
         assert_eq!(
@@ -364,7 +371,7 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(tables[0x28..0x2C].try_into().unwrap()),
-            0x0010_0000 + 0xF0,
+            0x0010_0000 + madt_off as u32,
             "RSDT[1] apunta al MADT"
         );
 
@@ -372,44 +379,48 @@ mod tests {
         assert_eq!(sig(&tables, 0x40), *b"FACP");
         assert_eq!(checksum(&tables[0x40..0x40 + 116]), 0, "checksum FADT");
         assert_eq!(
-            u32::from_le_bytes(tables[0x40 + 38..0x40 + 42].try_into().unwrap()),
+            u32::from_le_bytes(tables[0x40 + 40..0x40 + 44].try_into().unwrap()),
             0x0010_0000 + 0xC0,
             "FADT.dsdt"
         );
         assert_eq!(
-            u32::from_le_bytes(tables[0x40 + 34..0x40 + 38].try_into().unwrap()),
-            0x0010_0000 + 0x140,
+            u32::from_le_bytes(tables[0x40 + 36..0x40 + 40].try_into().unwrap()),
+            0x0010_0000 + facs_off as u32,
             "FADT.firmware_ctrl (FACS)"
         );
         // Bloques PM del PIIX.
-        assert_eq!(u32::from_le_bytes(tables[0x40 + 60..0x40 + 64].try_into().unwrap()), 0x604);
-        assert_eq!(u32::from_le_bytes(tables[0x40 + 72..0x40 + 76].try_into().unwrap()), 0x608);
+        assert_eq!(u32::from_le_bytes(tables[0x40 + 64..0x40 + 68].try_into().unwrap()), 0x604);
+        assert_eq!(u32::from_le_bytes(tables[0x40 + 76..0x40 + 80].try_into().unwrap()), 0x608);
 
         // DSDT: checksum + AML de _S5.
         assert_eq!(sig(&tables, 0xC0), *b"DSDT");
-        assert_eq!(checksum(&tables[0xC0..0xC0 + 47]), 0, "checksum DSDT");
-        assert_eq!(&tables[0xC0 + 36..0xC0 + 36 + 11], &[0x08, b'_', b'S', b'5', b'_', 0x12, 0x04, 0, 0, 0, 0]);
+        assert_eq!(checksum(&tables[0xC0..0xC0 + dsdt_len]), 0, "checksum DSDT");
+        assert_eq!(
+            &tables[0xC0 + 36..0xC0 + 36 + 12],
+            &[0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x04, 0, 0, 0, 0]
+        );
 
         // MADT: checksum, LAPIC base y flags PCAT.
-        let madt_len = 44 + 16 + 12;
-        assert_eq!(sig(&tables, 0xF0), *b"APIC");
-        assert_eq!(checksum(&tables[0xF0..0xF0 + madt_len]), 0, "checksum MADT");
-        assert_eq!(u32::from_le_bytes(tables[0xF0 + 36..0xF0 + 40].try_into().unwrap()), 0xFEE0_0000);
-        assert_eq!(u32::from_le_bytes(tables[0xF0 + 40..0xF0 + 44].try_into().unwrap()), 1);
+        assert_eq!(sig(&tables, madt_off), *b"APIC");
+        assert_eq!(checksum(&tables[madt_off..madt_off + madt_len]), 0, "checksum MADT");
+        assert_eq!(u32::from_le_bytes(tables[madt_off + 36..madt_off + 40].try_into().unwrap()), 0xFEE0_0000);
+        assert_eq!(u32::from_le_bytes(tables[madt_off + 40..madt_off + 44].try_into().unwrap()), 1);
 
         // FACS presente con longitud correcta.
-        assert_eq!(sig(&tables, 0x140), *b"FACS");
+        assert_eq!(sig(&tables, facs_off), *b"FACS");
     }
 
     #[test]
     fn madt_scales_with_cpu_count() {
         let files = build_acpi_files(8);
-        // 8 LAPIC + IOAPIC: MADT = 44 + 64 + 12 = 120 bytes en 0xF0.
+        let dsdt_len = build_dsdt().len();
+        let madt_off = (0xC0 + dsdt_len + 15) & !15;
+        // 8 LAPIC + IOAPIC: MADT = 44 + 64 + 12 = 120 bytes.
         let (tables, _) = simulate_loader(&files);
         let madt_len = 44 + 64 + 12;
-        assert_eq!(checksum(&tables[0xF0..0xF0 + madt_len]), 0, "checksum MADT 8 cpus");
-        // El FACS debe estar tras el MADT (offset 0xF0+120=0x168 → 0x170).
-        assert_eq!(sig(&tables, 0x170), *b"FACS");
+        let facs_off = (madt_off + madt_len + 15) & !15;
+        assert_eq!(checksum(&tables[madt_off..madt_off + madt_len]), 0, "checksum MADT 8 cpus");
+        assert_eq!(sig(&tables, facs_off), *b"FACS");
     }
 
     #[test]

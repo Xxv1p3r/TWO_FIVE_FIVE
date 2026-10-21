@@ -750,6 +750,12 @@ impl PciBus {
         let mut isa = PciDevice::new(0x8086, 0x7000, 0x06, 0x01, 0x00);
         isa.header_type = HEADER_TYPE_MULTIFUNCTION; // bit 7 = multifunction
         isa.revision = 0x00;
+        // PIRQ routing registers (0x60..0x63 = PIRQA..PIRQD):
+        // SeaBIOS y el DSDT ACPI (LNKA..LNKD) leen estos bytes en P40C.
+        isa.config_regs[0x60] = 10;
+        isa.config_regs[0x61] = 10;
+        isa.config_regs[0x62] = 11;
+        isa.config_regs[0x63] = 11;
         self.add_device(1, 0, isa);
 
         // Function 1: IDE Controller (PIIX3)
@@ -776,6 +782,8 @@ impl PciBus {
         // Function 3: ACPI/PM
         let mut acpi = PciDevice::new(0x8086, 0x7113, 0x06, 0x80, 0x00);
         acpi.revision = 0x00;
+        // Habilitar COM1 (CAEN bit 3 en offset 0x67) para el método _STA del DSDT
+        acpi.config_regs[0x67] = 0x08;
         // No BARs - PM I/O base configured via PCI config regs 0x40/0x80
         self.add_device(1, 3, acpi);
 

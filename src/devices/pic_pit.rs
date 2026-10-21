@@ -441,6 +441,18 @@ impl LegacyInterrupts {
     #[allow(dead_code)]
     pub fn irq_vector_slave(&self, irq: u8) -> u8 { self.pic2_icw2 + irq }
 
+    /// Habilita el canal 0 del PIT en el modo estándar de arranque PC (Modo 3,
+    /// divisor 0 = 65536 → 18.2065 Hz) para que IRQ0 lata desde el encendido
+    /// incluso si el BIOS usa PM Timer y no reprograma el 8254.
+    pub fn enable_default_pit(&mut self) {
+        self.pit[0].reload = 0;
+        self.pit[0].counter = 65536;
+        self.pit[0].mode = 3;
+        self.pit[0].rw_mode = 3;
+        self.pit[0].enabled = true;
+        self.pit[0].last_tick = Instant::now();
+    }
+
     /// Tickea TODOS los canales del PIT usando tiempo real.
     #[allow(dead_code)]
     pub fn pit_tick(&mut self) -> bool {
@@ -546,6 +558,9 @@ impl LegacyInterrupts {
     fn pit_read(&mut self, port: u16) -> u8 {
         let ch = (port - PIT_CH0) as usize;
         if ch >= 3 { return 0; }
+        if self.pit[ch].latched_counter.is_none() {
+            self.pit[ch].tick();
+        }
         let cur = self.pit[ch].current();
         match self.pit[ch].rw_mode {
             3 => {
@@ -554,13 +569,25 @@ impl LegacyInterrupts {
                 if !self.pit[ch].read_high { self.pit[ch].latched_counter = None; }
                 b
             }
-            1 => cur as u8,
-            2 => (cur >> 8) as u8,
-            _ => cur as u8,
+            1 => {
+                self.pit[ch].latched_counter = None;
+                cur as u8
+            }
+            2 => {
+                self.pit[ch].latched_counter = None;
+                (cur >> 8) as u8
+            }
+            _ => {
+                let b = if self.pit[ch].read_high { (cur >> 8) as u8 } else { cur as u8 };
+                self.pit[ch].read_high = !self.pit[ch].read_high;
+                if !self.pit[ch].read_high { self.pit[ch].latched_counter = None; }
+                b
+            }
         }
     }
 
     fn pit_write(&mut self, port: u16, val: u8) {
+        self.pit_access_count += 1;
         let ch = (port - PIT_CH0) as usize;
         if ch >= 3 { return; }
 
@@ -568,7 +595,7 @@ impl LegacyInterrupts {
             3 => {
                 if self.pit[ch].read_high {
                     self.pit[ch].reload = (self.pit[ch].reload & 0x00FF) | ((val as u32) << 8);
-                    self.pit[ch].counter = self.pit[ch].reload;
+                    self.pit[ch].counter = self.pit[ch].effective_reload();
                     self.pit[ch].enabled = true;
                     self.pit[ch].last_tick = Instant::now();
                 } else {
@@ -578,13 +605,13 @@ impl LegacyInterrupts {
             }
             1 => {
                 self.pit[ch].reload = val as u32;
-                self.pit[ch].counter = self.pit[ch].reload;
+                self.pit[ch].counter = self.pit[ch].effective_reload();
                 self.pit[ch].enabled = true;
                 self.pit[ch].last_tick = Instant::now();
             }
             2 => {
                 self.pit[ch].reload = (val as u32) << 8;
-                self.pit[ch].counter = self.pit[ch].reload;
+                self.pit[ch].counter = self.pit[ch].effective_reload();
                 self.pit[ch].enabled = true;
                 self.pit[ch].last_tick = Instant::now();
             }
@@ -593,6 +620,7 @@ impl LegacyInterrupts {
     }
 
     fn pit_write_ctrl(&mut self, val: u8) {
+        self.pit_access_count += 1;
         let ch = ((val >> 6) & 0x3) as usize;
         let rw = (val >> 4) & 0x3;
 
@@ -600,8 +628,9 @@ impl LegacyInterrupts {
         if ch >= 3 {
             let latch_count = val & 0x20 == 0;
             for i in 0..3u8 {
-                if val & (1 << i) != 0 {
+                if val & (1 << (i + 1)) != 0 {
                     if latch_count {
+                        self.pit[i as usize].tick();
                         self.pit[i as usize].latched_counter = Some(self.pit[i as usize].counter);
                     }
                 }
@@ -609,18 +638,23 @@ impl LegacyInterrupts {
             return;
         }
 
-        self.pit[ch].bcd = val & 1 != 0;
-        self.pit[ch].mode = (val >> 1) & 0x7;
-
         if rw == 0 {
-            // Comando latch: congelar counter.
+            // Comando latch: actualizar y congelar counter sin alterar modo/bcd.
+            self.pit[ch].tick();
             self.pit[ch].latched_counter = Some(self.pit[ch].counter);
             self.pit[ch].read_high = false;
             return;
         }
 
+        self.pit[ch].bcd = val & 1 != 0;
+        let mut mode = (val >> 1) & 0x7;
+        if mode >= 6 {
+            mode -= 4;
+        }
+        self.pit[ch].mode = mode;
         self.pit[ch].rw_mode = rw;
         self.pit[ch].read_high = false;
+        self.pit[ch].latched_counter = None;
     }
 
     // ─── PS/2 ───────────────────────────────────────────────────────
@@ -900,7 +934,18 @@ impl IoDevice for LegacyInterrupts {
                 vec![self.pit_read(port)]
             }
             PIT_CTRL => vec![0],
-            0x61 => vec![self.port_b & 0x0F | 0x10],
+            0x61 => {
+                self.pit[2].tick();
+                self.port_b ^= 0x10; // Toggle refresh bit (bit 4)
+                let out2 = if !self.pit[2].enabled || self.pit[2].counter == 0 {
+                    0x20
+                } else if matches!(self.pit[2].mode, 2 | 3) && self.pit[2].counter > self.pit[2].effective_reload() / 2 {
+                    0x20
+                } else {
+                    0x00
+                };
+                vec![(self.port_b & 0x1F) | out2]
+            }
             PS2_DATA | PS2_STATUS => vec![self.ps2_read(port)],
             _ => vec![0xFF], // DMA and unknown: return 0xFF (device not present)
         }

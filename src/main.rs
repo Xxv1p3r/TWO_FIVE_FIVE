@@ -457,6 +457,7 @@ fn pit_timer_thread(
     resize_queue: Arc<Mutex<Option<(u32, u32)>>>,
     irq0_raised: Arc<AtomicBool>,
     bda_tick_count: Arc<AtomicU32>,
+    metrics: Arc<metrics::VmmMetrics>,
 ) {
     let mut ms_since_bda_tick: u32 = 0;
     let mut last = mono_now();
@@ -465,12 +466,13 @@ fn pit_timer_thread(
         let elapsed_ms = ts_elapsed_ms(now, last).max(1);
         last = now;
 
-        // Avanzar el PIT por el tiempo REAL transcurrido (1.193182 MHz).
-        let underflow = bus
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .legacy_irq
-            .pit_advance_ticks(elapsed_ms * 1193);
+        // Avanzar el PIT (1.193182 MHz) y el RTC CMOS (IRQ8) por el tiempo REAL transcurrido.
+        let (underflow, rtc_irq8) = {
+            let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+            let u = b.legacy_irq.pit_advance_ticks(elapsed_ms * 1193);
+            let r = b.cmos.rtc_advance_ns((elapsed_ms as u64) * 1_000_000);
+            (u, r)
+        };
         if underflow {
             // Flanco fresco bajo→alto en IRQ0 (PIC edge-triggered). No se
             // baja después: un tick pendiente sin entregar no debe perderse.
@@ -478,6 +480,12 @@ fn pit_timer_thread(
             vm.set_irq_line(0, false).ok();
             vm.set_irq_line(0, true).ok();
             irq0_raised.store(true, Ordering::Relaxed);
+            metrics.record_irq(0);
+        }
+        if rtc_irq8 {
+            vm.set_irq_line(8, false).ok();
+            vm.set_irq_line(8, true).ok();
+            metrics.record_irq(8);
         }
 
         // Tick del BDA (0x46C) a 18.2 Hz (~55 ms): SeaBIOS lo sondea en
@@ -635,11 +643,13 @@ fn reset_vcpu_to_post(
     // Reset de dispositivos (CD-ROM/ATAPI, PIT/PIC/PS2, PCI, VGA, CMOS...)
     // y de las áreas de memoria que el BIOS espera limpias.
     bus.reset();
+    bus.legacy_irq.enable_default_pit();
     init_bios_data_area(guest_mem);
     // Bajar las líneas de IRQ del kernel para no arrastrar flancos del ciclo
     // anterior (SeaBIOS reprograma el PIC en el POST de todas formas).
     vm.set_irq_line(0, false).ok();
     vm.set_irq_line(1, false).ok();
+    vm.set_irq_line(8, false).ok();
     // IRQ4 del UART 16550 (COM1) también limpia en cada reset.
     vm.set_irq_line(4, false).ok();
     // IRQ14 (IDE primario) e IRQ15 (IDE secundario / ATAPI)
@@ -676,6 +686,61 @@ fn mmap_zeroed_region(size: usize) -> &'static mut [u8] {
         chunk.fill(0);
     }
     slice
+}
+
+/// Ajusta las hojas CPUID de topología e identificador APIC inicial para que
+/// cada vCPU reporte su propio `cpu_id` (0..num_cpus-1) en lugar del APIC ID
+/// del núcleo físico del host donde se ejecutó `get_supported_cpuid`.
+/// Ajusta las hojas CPUID de topología e identificador APIC inicial para que
+/// cada vCPU reporte su propio `cpu_id` (0..num_cpus-1) en lugar del APIC ID
+/// del núcleo físico del host donde se ejecutó `get_supported_cpuid`.
+fn apply_vcpu_cpuid(vcpu: &kvm_ioctls::VcpuFd, base_cpuid: &kvm_bindings::CpuId, cpu_id: u32, num_cpus: u32) {
+    let mut cpuid = base_cpuid.clone();
+    for entry in cpuid.as_mut_slice().iter_mut() {
+        match entry.function {
+            0x01 => {
+                entry.ebx = (entry.ebx & 0x0000_FFFF)
+                    | ((num_cpus.max(1) & 0xFF) << 16)
+                    | ((cpu_id & 0xFF) << 24);
+                if num_cpus > 1 {
+                    entry.edx |= 1 << 28; // HTT
+                }
+            }
+            0x0B | 0x1F => {
+                entry.edx = cpu_id; // x2APIC ID = cpu_id
+            }
+            0x8000_001E => {
+                entry.eax = cpu_id; // Extended APIC ID (AMD) = cpu_id
+            }
+            _ => {}
+        }
+    }
+    vcpu.set_cpuid2(&cpuid).expect("set_cpuid2 falló");
+}
+
+/// Convierte una dirección física del guest (GPA) a un offset dentro de `guest_mem`,
+/// teniendo en cuenta el hueco PCI MMIO en 3.5 GB (0xE000_0000..0x1_0000_0000).
+fn gpa_to_mem_offset(gpa: u64, guest_mem_len: usize) -> Option<usize> {
+    let off = if gpa < 0xE000_0000 {
+        gpa as usize
+    } else if gpa >= 0x1_0000_0000 {
+        (0xE000_0000 + (gpa - 0x1_0000_0000)) as usize
+    } else {
+        return None;
+    };
+    if off < guest_mem_len { Some(off) } else { None }
+}
+
+/// Traduce una dirección lineal/virtual del guest a GPA si la paginación está activa.
+fn resolve_guest_gpa(vcpu: &kvm_ioctls::VcpuFd, cr0: u64, linear: u64) -> u64 {
+    if (cr0 & 0x8000_0000) != 0 {
+        if let Ok(tr) = vcpu.translate_gva(linear) {
+            if tr.valid != 0 {
+                return tr.physical_address;
+            }
+        }
+    }
+    linear
 }
 
 /// Instala un handler para las señales indicadas (wrapper de libc::signal).
@@ -1037,6 +1102,8 @@ fn main() {
     bus.debugcon.set_guest_mem(guest_mem_handle.clone());
     // Connect DeviceBus to guest memory for Bus Master DMA (BMDMA)
     bus.set_guest_mem(guest_mem_handle.clone());
+    // Habilitar PIT canal 0 por defecto (Modo 3, 18.2 Hz) como en hardware PC real
+    bus.legacy_irq.enable_default_pit();
     if !bus.debugcon.mirror_enabled() {
         eprintln!("[VMM] Espejo BIOS→0xB8000 desactivado (MI_VMM_MIRROR_BIOS=1 para activarlo)");
     }
@@ -1231,16 +1298,16 @@ fn main() {
         snapshot::load_vm_snapshot(&snap_path, guest_mem, high_mem, &[&vcpu]).ok();
     }
 
-    // ─── Configurar CPUID (FPU, SSE, MMX, etc. para Linux) ─────
+    // ─── Configurar CPUID (FPU, SSE, MMX, etc. para Linux/Windows) ─────
     let cpuid = kvm
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
         .expect("get_supported_cpuid falló");
-    vcpu.set_cpuid2(&cpuid).expect("set_cpuid2 falló");
+    apply_vcpu_cpuid(&vcpu, &cpuid, 0, num_cpus);
 
     let mut ap_handles = Vec::new();
     for cpu_id in 1..num_cpus {
         let ap = vm.create_vcpu(cpu_id as u64).expect("create_vcpu (AP) falló");
-        ap.set_cpuid2(&cpuid).expect("set_cpuid2 (AP) falló");
+        apply_vcpu_cpuid(&ap, &cpuid, cpu_id, num_cpus);
         ap.set_mp_state(kvm_mp_state {
             mp_state: kvm_bindings::KVM_MP_STATE_INIT_RECEIVED,
         })
@@ -1339,19 +1406,22 @@ fn main() {
             let resize_t = Arc::clone(&resize_queue);
             let irq0_t = Arc::clone(&irq0_flag);
             let bda_t = Arc::clone(&bda_tick_count);
+            let metrics_t = Arc::clone(&metrics);
             // vm (Arc<VmFd>) se clona ANTES del move (el BSP sigue usando vm).
             let vm_t = Arc::clone(&vm);
+            let gm_t = Arc::clone(&guest_mem_handle);
             move || {
                 pit_timer_thread(
                     vm_t,
                     bus_t,
-                    guest_mem_handle.clone(),
+                    gm_t,
                     kbd_t,
                     mouse_t,
                     tablet_t,
                     resize_t,
                     irq0_t,
                     bda_t,
+                    metrics_t,
                 )
             }
         })
@@ -1390,6 +1460,13 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(150));
             eprintln!("[VMM] Shutdown solicitado — volcando estado final (exits={}, reboots={})...",
                 total_exits, total_reboots);
+            if let Ok(shot_path) = std::env::var("MI_VMM_SCREENSHOT") {
+                if let Err(e) = display::save_ppm_screenshot(&vga_state, &guest_mem_handle, &shot_path) {
+                    eprintln!("[VMM] Error al guardar captura en {}: {}", shot_path, e);
+                } else {
+                    eprintln!("[VMM] Captura guardada en {}", shot_path);
+                }
+            }
             dump_vga_text_screen(guest_mem);
             exit(0);
         }
@@ -1440,7 +1517,7 @@ fn main() {
                             if bus_lock().plug_cpu(new_id).is_ok() {
                                 match vm.create_vcpu(new_id as u64) {
                                     Ok(new_vcpu) => {
-                                        let _ = new_vcpu.set_cpuid2(&cpuid);
+                                        apply_vcpu_cpuid(&new_vcpu, &cpuid, new_id, max_cpus);
                                         let _ = new_vcpu.set_mp_state(kvm_mp_state {
                                             mp_state: kvm_bindings::KVM_MP_STATE_INIT_RECEIVED,
                                         });
@@ -1546,26 +1623,29 @@ fn main() {
                     tui::log(format!("[VMM] exits={} (reboots={}) | POST=0x{:02X}", total_exits, total_reboots, post_last));
                 } else if let Ok(r) = vcpu.get_regs() {
                     if let Ok(s) = vcpu.get_sregs() {
-                        let phys = s.cs.base + r.rip;
-                        let p = phys as usize;
-                        let code_dump = if p + 16 <= guest_mem.len() {
-                            format!("{:02x?}", &guest_mem[p..p+16])
+                        let linear = s.cs.base.wrapping_add(r.rip);
+                        let phys = resolve_guest_gpa(&vcpu, s.cr0, linear);
+                        let code_dump = if let Some(p) = gpa_to_mem_offset(phys, guest_mem.len()) {
+                            if p + 16 <= guest_mem.len() {
+                                format!("{:02x?}", &guest_mem[p..p+16])
+                            } else { String::from("???") }
                         } else { String::from("???") };
-                        // Dump stack top 32 bytes (SS:ESP in real mode)
-                        let esp = r.rsp as usize;
-                        let ss_base = s.ss.base as usize;
-                        let stack_phys = ss_base + esp;
-                        let stack_dump = if stack_phys + 32 <= guest_mem.len() {
-                            format!("{:02x?}", &guest_mem[stack_phys..stack_phys+32])
+                        // Dump stack top 32 bytes
+                        let stack_lin = s.ss.base.wrapping_add(r.rsp);
+                        let stack_phys = resolve_guest_gpa(&vcpu, s.cr0, stack_lin);
+                        let stack_dump = if let Some(sp) = gpa_to_mem_offset(stack_phys, guest_mem.len()) {
+                            if sp + 32 <= guest_mem.len() {
+                                format!("{:02x?}", &guest_mem[sp..sp+32])
+                            } else { String::from("???") }
                         } else { String::from("???") };
                         let (post_last, ps2_acc, pit_acc) = {
                             let b = bus_lock();
                             (b.post.last, b.legacy_irq.ps2_access_count, b.legacy_irq.pit_access_count)
                         };
                         eprintln!(
-                            "[VMM] {} exits (reboots={}) | POST=0x{:02X} phys={:#x} cr0={:#x} rflags={:#x} idt={:#x}/{:#x}\n  code: {}\n  stack(S:{:04x} P:{:#x}): {}",
-                            total_exits, total_reboots, post_last, phys, s.cr0, r.rflags, s.idt.base, s.idt.limit, code_dump,
-                            s.ss.selector, stack_phys, stack_dump
+                            "[VMM] {} exits (reboots={}) | POST=0x{:02X} rip={:#x} (gpa={:#x}) cr0={:#x} rflags={:#x} idt={:#x}/{:#x}\n  code: {}\n  stack(S:{:04x} L:{:#x} P:{:#x}): {}",
+                            total_exits, total_reboots, post_last, linear, phys, s.cr0, r.rflags, s.idt.base, s.idt.limit, code_dump,
+                            s.ss.selector, stack_lin, stack_phys, stack_dump
                         );
                         eprintln!("  PS2 access={}, PIT access={}, mode_transitions={}",
                             ps2_acc,
@@ -1607,14 +1687,16 @@ fn main() {
                             .collect();
                         eprintln!("  Top I/O: {}", top_ports.join(", "));
                         // Dump code at the return address (caller on stack)
-                        if stack_phys + 4 <= guest_mem.len() {
-                            let ret_addr = guest_mem[stack_phys] as u32
-                                | ((guest_mem[stack_phys + 1] as u32) << 8)
-                                | ((guest_mem[stack_phys + 2] as u32) << 16)
-                                | ((guest_mem[stack_phys + 3] as u32) << 24);
-                            let ra = ret_addr as usize;
-                            if ra + 48 <= guest_mem.len() {
-                                eprintln!("  Caller at {:#x}: {:02x?}", ra, &guest_mem[ra..ra+48]);
+                        if let Some(sp) = gpa_to_mem_offset(stack_phys, guest_mem.len()) {
+                            if sp + 4 <= guest_mem.len() {
+                                let ret_addr = guest_mem[sp] as u32
+                                    | ((guest_mem[sp + 1] as u32) << 8)
+                                    | ((guest_mem[sp + 2] as u32) << 16)
+                                    | ((guest_mem[sp + 3] as u32) << 24);
+                                let ra = ret_addr as usize;
+                                if ra + 48 <= guest_mem.len() {
+                                    eprintln!("  Caller at {:#x}: {:02x?}", ra, &guest_mem[ra..ra+48]);
+                                }
                             }
                         }
                         // Dump IVT entries for key vectors
@@ -2091,14 +2173,16 @@ fn dump_crash_state(
 ) {
     let sregs = vcpu.get_sregs().unwrap_or_default();
     let regs = vcpu.get_regs().unwrap_or_default();
-    let phys = sregs.cs.base + regs.rip;
+    let linear = sregs.cs.base.wrapping_add(regs.rip);
+    let phys = resolve_guest_gpa(vcpu, sregs.cr0, linear);
     eprintln!("[VMM] Crash: rip={:#x} cs={:#x} base={:#x} cr0={:#x} rflags={:#x}",
         regs.rip, sregs.cs.selector, sregs.cs.base, sregs.cr0, regs.rflags);
-    eprintln!("  phys={:#x} idt={:#x}/{:#x} gdt={:#x}/{:#x} exits={}",
-        phys, sregs.idt.base, sregs.idt.limit, sregs.gdt.base, sregs.gdt.limit, total_exits);
-    let p = phys as usize;
-    if p + 32 <= guest_mem.len() {
-        eprintln!("  Code: {:02x?}", &guest_mem[p..p + 32]);
+    eprintln!("  linear={:#x} gpa={:#x} idt={:#x}/{:#x} gdt={:#x}/{:#x} exits={}",
+        linear, phys, sregs.idt.base, sregs.idt.limit, sregs.gdt.base, sregs.gdt.limit, total_exits);
+    if let Some(p) = gpa_to_mem_offset(phys, guest_mem.len()) {
+        if p + 32 <= guest_mem.len() {
+            eprintln!("  Code: {:02x?}", &guest_mem[p..p + 32]);
+        }
     }
     let ep = 0xFE05B_usize;
     if ep + 16 <= guest_mem.len() {
