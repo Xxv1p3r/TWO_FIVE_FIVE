@@ -2,7 +2,7 @@
 
 Hipervisor Tipo-2 minimalista de alto rendimiento sobre **KVM** y **Rust**.
 
-**Two Five Five (255)** arranca firmwares estándar (SeaBIOS, coreboot) y sistemas operativos modernos (Linux x86_64, distros Live como Kali Linux, Linux Mint, Alpine, TinyCore) directamente sobre KVM sin dependencias pesadas como QEMU.
+**Two Five Five (255)** arranca firmwares estándar (SeaBIOS, coreboot) y sistemas operativos modernos (**Windows 7 SP1 x64**, Linux x86_64, distros Live como Kali Linux, Linux Mint, Alpine, TinyCore) directamente sobre KVM sin dependencias pesadas como QEMU.
 
 ---
 
@@ -14,7 +14,11 @@ Hipervisor Tipo-2 minimalista de alto rendimiento sobre **KVM** y **Rust**.
   - Tablas E820 y CMOS RTC con soporte para memorias superiores a 4 GB.
 
 - **Multiprocesamiento Simétrico (SMP)**:
-  - Soporte multi-core nativo (por defecto 4 vCPUs: 1 BSP + 3 APs) con sondeo SIPI y tablas ACPI MADT enlazadas al RSDT.
+  - Soporte multi-core nativo (por defecto 4 vCPUs: 1 BSP + 3 APs) con sondeo SIPI, APIC IDs individuales por vCPU en hojas CPUID (`0x1`, `0xB`, `0x1F`, `0x8000001E`) y tablas ACPI MADT enlazadas al RSDT.
+
+- **Compatibilidad Completa con Windows 7 x64 y Linux**:
+  - **ACPI 1.0 (RSDP/RSDT/FADT/DSDT/MADT/FACS)**: Generación dinámica vía `fw_cfg` (`etc/table-loader`) con bloques PIIX4 PM (`0x600..0x608`), GPE0 (`0xAFE0`) y temporizador ACPI PM de 24 bits (3.579545 MHz) respaldado por contador monotónico de 64 bits sin bloqueo por wrap-around.
+  - **CMOS RTC + IRQ 8 (`MC146818`)**: Emulación de interrupciones periódicas (`PIE`/`PF`, p. ej. 64 Hz y 1024 Hz) y de actualización (`UIE`/`UF`) en IRQ 8 requeridas por `hal.dll` / `ntoskrnl.exe` en Windows x64, además de modos BCD y binario.
 
 - **Paridad con Oracle VirtualBox**:
   - **AHCI SATA (0x8086:0x2829)**: Controlador ICH-8M completo con máquina de estados COMRESET, conteo LBA48 (65,536 sectores), interrupciones NCQ Set Device Bits FIS (0xA1) y emulación ATAPI CD-ROM SATA.
@@ -97,6 +101,7 @@ Two Five Five (255) soporta instalación desatendida automática sin intervenci�
 | `TWO_FIVE_FIVE_TAP` | Nombre de la interfaz TAP de red | No configurada (usa stack DHCP interno) |
 | `TWO_FIVE_FIVE_AUTO_ENTER` | Inyección automática de Enter para bootloaders | `1` (activo) |
 | `TWO_FIVE_FIVE_VERBOSE` | Muestra logs detallados de depuración de dispositivos | Desactivado |
+| `MI_VMM_SCREENSHOT` | Ruta donde guardar captura del framebuffer (`.ppm`) al apagar | No configurada |
 
 *(Nota: Los prefijos heredados `MI_VMM_*` continúan siendo compatibles).*
 
@@ -110,7 +115,7 @@ El proyecto cuenta con una amplia suite de pruebas que valida cada componente co
 cargo test
 ```
 
-Actualmente: **188 tests pasando (0 fallos)**.
+Actualmente: **191 tests pasando (0 fallos)**.
 
 ---
 
