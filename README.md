@@ -39,11 +39,13 @@ Hipervisor Tipo-2 minimalista de alto rendimiento sobre **KVM** y **Rust**.
 
 ---
 
-## Compilación
+## Instalación y Compilación
 
 Requiere Rust 1.75+ y Linux con soporte para KVM (`/dev/kvm`).
 
 ```bash
+git clone https://github.com/Xxv1p3r/TWO_FIVE_FIVE.git
+cd TWO_FIVE_FIVE
 cargo build --release
 ```
 
