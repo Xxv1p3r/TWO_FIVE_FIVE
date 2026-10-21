@@ -515,32 +515,34 @@ fn pit_timer_thread(
         // los latches one-shot evitan doble inyección).
         if let Ok(mut q) = kbd_queue.try_lock() {
             if !q.is_empty() {
-                let pulse = {
-                    let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
-                    while let Some(sc) = q.pop_front() {
-                        b.legacy_irq.inject_scancode(sc);
-                    }
-                    b.take_ps2_irq()
-                };
-                if pulse {
-                    vm.set_irq_line(1, false).ok();
-                    vm.set_irq_line(1, true).ok();
+                let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                while let Some(sc) = q.pop_front() {
+                    b.legacy_irq.inject_scancode(sc);
                 }
             }
         }
         if let Ok(mut q) = mouse_queue.try_lock() {
             if !q.is_empty() {
-                let pulse = {
-                    let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
-                    while let Some((dx, dy, buttons)) = q.pop_front() {
-                        b.legacy_irq.inject_mouse_delta(dx, dy, buttons);
-                    }
-                    b.take_mouse_irq()
-                };
-                if pulse {
-                    vm.set_irq_line(12, false).ok();
-                    vm.set_irq_line(12, true).ok();
+                let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                while let Some((dx, dy, buttons)) = q.pop_front() {
+                    b.legacy_irq.inject_mouse_delta(dx, dy, buttons);
                 }
+            }
+        }
+        {
+            let (pulse_kbd, pulse_mouse) = {
+                let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                (b.take_ps2_irq(), b.take_mouse_irq())
+            };
+            if pulse_kbd {
+                vm.set_irq_line(1, false).ok();
+                vm.set_irq_line(1, true).ok();
+                metrics.record_irq(1);
+            }
+            if pulse_mouse {
+                vm.set_irq_line(12, false).ok();
+                vm.set_irq_line(12, true).ok();
+                metrics.record_irq(12);
             }
         }
         // Tableta Gráfica USB: inyección de coordenadas absolutas (0..32767)
@@ -1314,10 +1316,11 @@ fn main() {
         .expect("set_mp_state (AP) falló");
         let bus_ap = Arc::clone(&bus);
         let metrics_ap = Arc::clone(&metrics);
+        let vm_ap = Arc::clone(&vm);
         ap_handles.push(
             std::thread::Builder::new()
                 .name(format!("vcpu-{cpu_id}"))
-                .spawn(move || ap_vcpu_worker(cpu_id, ap, bus_ap, metrics_ap, verbose))
+                .spawn(move || ap_vcpu_worker(cpu_id, ap, vm_ap, bus_ap, metrics_ap, verbose))
                 .expect("spawn de hilo AP falló"),
         );
     }
@@ -1493,6 +1496,17 @@ fn main() {
                 bus_lock().legacy_irq.inject_mouse_delta(dx, dy, buttons);
             }
         }
+        if bus_lock().take_ps2_irq() {
+            vm.set_irq_line(1, false).ok();
+            vm.set_irq_line(1, true).ok();
+            irq1_line_high = true;
+            metrics.record_irq(1);
+        }
+        if bus_lock().take_mouse_irq() {
+            vm.set_irq_line(12, false).ok();
+            vm.set_irq_line(12, true).ok();
+            metrics.record_irq(12);
+        }
         // Eventos de la tableta gráfica USB (coordenadas absolutas 0..32767)
         if let Ok(mut q) = tablet_queue.try_lock() {
             while let Some((x, y, buttons, wheel)) = q.pop_front() {
@@ -1523,10 +1537,11 @@ fn main() {
                                         });
                                         let bus_ap = Arc::clone(&bus);
                                         let metrics_ap = Arc::clone(&metrics);
+                                        let vm_ap = Arc::clone(&vm);
                                         ap_handles.push(
                                             std::thread::Builder::new()
                                                 .name(format!("vcpu-{new_id}"))
-                                                .spawn(move || ap_vcpu_worker(new_id, new_vcpu, bus_ap, metrics_ap, verbose))
+                                                .spawn(move || ap_vcpu_worker(new_id, new_vcpu, vm_ap, bus_ap, metrics_ap, verbose))
                                                 .expect("spawn de hilo AP falló"),
                                         );
                                         metrics.num_cpus.fetch_add(1, Ordering::Relaxed);
@@ -2064,6 +2079,7 @@ fn main() {
 fn ap_vcpu_worker(
     cpu_id: u32,
     vcpu: kvm_ioctls::VcpuFd,
+    vm: Arc<kvm_ioctls::VmFd>,
     bus: Arc<Mutex<DeviceBus>>,
     metrics: Arc<metrics::VmmMetrics>,
     verbose: bool,
@@ -2098,15 +2114,71 @@ fn ap_vcpu_worker(
         match exit_reason {
             VcpuExit::IoOut(port, data) => {
                 metrics.record_io_out(port);
-                let handled =
-                    bus.lock().unwrap_or_else(|p| p.into_inner()).out(port, data);
+                let (handled, kbd_irq, mouse_irq, ide_irqs) = {
+                    let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                    let h = b.out(port, data);
+                    let k = b.take_ps2_irq();
+                    let m = b.take_mouse_irq();
+                    let ide = b.take_ide_irq();
+                    sync_pci_irqs(&mut b, &vm, Some(&metrics));
+                    (h, k, m, ide)
+                };
+                if kbd_irq {
+                    vm.set_irq_line(1, false).ok();
+                    vm.set_irq_line(1, true).ok();
+                    metrics.record_irq(1);
+                }
+                if mouse_irq {
+                    vm.set_irq_line(12, false).ok();
+                    vm.set_irq_line(12, true).ok();
+                    metrics.record_irq(12);
+                }
+                if ide_irqs.0 {
+                    vm.set_irq_line(14, false).ok();
+                    vm.set_irq_line(14, true).ok();
+                    metrics.record_irq(14);
+                }
+                if ide_irqs.1 {
+                    vm.set_irq_line(15, false).ok();
+                    vm.set_irq_line(15, true).ok();
+                    metrics.record_irq(15);
+                }
                 if !handled {
                     eprintln!("[AP{}] OUT no manejado: 0x{:X} <- {:02X?}", cpu_id, port, data);
                 }
             }
             VcpuExit::IoIn(port, data) => {
                 metrics.record_io_in(port);
-                match bus.lock().unwrap_or_else(|p| p.into_inner()).input(port, data.len()) {
+                let (res, kbd_irq, mouse_irq, ide_irqs) = {
+                    let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+                    let r = b.input(port, data.len());
+                    let k = b.take_ps2_irq();
+                    let m = b.take_mouse_irq();
+                    let ide = b.take_ide_irq();
+                    sync_pci_irqs(&mut b, &vm, Some(&metrics));
+                    (r, k, m, ide)
+                };
+                if kbd_irq {
+                    vm.set_irq_line(1, false).ok();
+                    vm.set_irq_line(1, true).ok();
+                    metrics.record_irq(1);
+                }
+                if mouse_irq {
+                    vm.set_irq_line(12, false).ok();
+                    vm.set_irq_line(12, true).ok();
+                    metrics.record_irq(12);
+                }
+                if ide_irqs.0 {
+                    vm.set_irq_line(14, false).ok();
+                    vm.set_irq_line(14, true).ok();
+                    metrics.record_irq(14);
+                }
+                if ide_irqs.1 {
+                    vm.set_irq_line(15, false).ok();
+                    vm.set_irq_line(15, true).ok();
+                    metrics.record_irq(15);
+                }
+                match res {
                     Some(bytes) => {
                         for (i, b) in bytes.iter().take(data.len()).enumerate() {
                             data[i] = *b;

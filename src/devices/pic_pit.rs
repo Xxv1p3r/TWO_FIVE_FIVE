@@ -792,14 +792,15 @@ impl LegacyInterrupts {
 
     /// Procesa un comando enviado al dispositivo auxiliar (ratón PS/2).
     ///
-    /// Protocolo estándar de 3 botones: ACK (0xFA) a cada comando y paquetes
-    /// de 3 bytes [flags+botones, dx, dy] con el reporte habilitado (0xF4).
-    /// Los comandos con argumento (0xF3 sample rate, 0xE8 resolución)
-    /// consumen el siguiente byte en silencio (sin ACK espurio).
+    /// Protocolo estándar de 3 botones: ACK (0xFA) a cada comando y argumento,
+    /// y paquetes de 3 bytes [flags+botones, dx, dy] con el reporte habilitado (0xF4).
     fn mouse_command(&mut self, val: u8) {
-        // Argumento pendiente de 0xF3/0xE8: consumirlo sin respuesta.
+        // Argumento pendiente de 0xF3 (sample rate) / 0xE8 (resolución):
+        // En hardware PS/2 real (y requerido por i8042prt.sys en Windows),
+        // el ratón responde con ACK (0xFA) también al byte de parámetro.
         if self.mouse_expect_arg {
             self.mouse_expect_arg = false;
+            self.push_aux_buf(0xFA);
             self.ps2_expect = Ps2Expect::None;
             return;
         }
@@ -825,11 +826,13 @@ impl LegacyInterrupts {
                 // Set sample rate: ACK y espera el argumento.
                 self.push_aux_buf(0xFA);
                 self.mouse_expect_arg = true;
+                self.ps2_expect = Ps2Expect::None;
             }
             0xE8 => {
                 // Set resolution: ACK y espera el argumento.
                 self.push_aux_buf(0xFA);
                 self.mouse_expect_arg = true;
+                self.ps2_expect = Ps2Expect::None;
             }
             0xF4 => {
                 // Enable data reporting.
@@ -1185,8 +1188,10 @@ mod tests {
         aux_write(&mut d, 0xF3); // set sample rate
         assert!(d.take_irq12_pending());
         assert_eq!(d.read(PS2_DATA, 1)[0], 0xFA);
-        // El argumento (100) no genera ACK espurio
+        // El argumento (100) responde con ACK (0xFA) sin ser interpretado como comando
         aux_write(&mut d, 100);
+        assert!(d.take_irq12_pending());
+        assert_eq!(d.read(PS2_DATA, 1)[0], 0xFA);
         assert!(!d.mouse_has_data());
         assert!(!d.take_irq12_pending());
     }

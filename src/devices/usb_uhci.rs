@@ -87,7 +87,7 @@ impl UhciState {
 
     /// Comprueba si la línea de interrupción del UHCI está activa.
     pub fn is_irq_asserted(&self) -> bool {
-        let ioc_enabled = (self.usb_intr & 0x0004) != 0;
+        let ioc_enabled = (self.usb_intr & 0x000C) != 0; // IOC (bit 2) o Short Packet (bit 3)
         let int_status = (self.usb_sts & USBSTS_USBINT) != 0;
         let err_enabled = (self.usb_intr & 0x0001) != 0;
         let err_status = (self.usb_sts & USBSTS_ERROR) != 0;
@@ -163,12 +163,20 @@ impl UhciState {
                     status = (status & !0x0080_07FF) | actlen_field;
                     mem.write_u32(td_addr + 4, status);
 
-                    if status & 0x0100_0000 != 0 {
-                        // IOC
+                    let is_short = actual_len < max_len;
+                    let spd = (status & 0x2000_0000) != 0;
+                    if (status & 0x0100_0000 != 0) || (is_short && spd) {
+                        // IOC o Short Packet Detect (SPD)
                         self.usb_sts |= USBSTS_USBINT;
                         self.irq_pulse = true;
                     }
-                    (link, false)
+                    if is_short && spd {
+                        // Según especificación UHCI 3.2.2: cuando SPD=1 y el paquete es corto,
+                        // qh.elem_link NO se avanza para que el HCD procese el short packet.
+                        (link, true)
+                    } else {
+                        (link, false)
+                    }
                 } else {
                     // NAK: el dispositivo no tiene datos preparados (p. ej. EP 1 sin eventos pendientes)
                     // El TD sigue activo en memoria y no avanzamos la cola este frame
@@ -203,6 +211,59 @@ impl UhciState {
         }
     }
 
+    /// Procesa recursivamente una Queue Head (QH) y sus elementos verticales/horizontales.
+    /// Soporta jerarquías de QHs enlazadas verticalmente (`elem_link & 2 != 0`), usadas
+    /// tanto por SeaBIOS (`wait_pipe`) como por Windows (`usbuhci.sys`).
+    fn process_qh(&mut self, mem: &GuestMemory, qh_addr: usize, depth: usize) {
+        if depth > 8 || qh_addr == 0 {
+            return;
+        }
+        let mut elem_link = mem.read_u32(qh_addr + 4);
+
+        let mut vert_limit = 64;
+        while (elem_link & 1) == 0 && vert_limit > 0 {
+            vert_limit -= 1;
+            let elem_addr = (elem_link & 0xFFFF_FFF0) as usize;
+            if elem_addr == 0 {
+                break;
+            }
+
+            if (elem_link & 2) != 0 {
+                // El puntero vertical apunta a una cadena de Queue Heads hijas
+                let mut child_link = elem_link;
+                let mut child_horiz_limit = 64;
+                while (child_link & 1) == 0 && child_horiz_limit > 0 {
+                    child_horiz_limit -= 1;
+                    let child_addr = (child_link & 0xFFFF_FFF0) as usize;
+                    if child_addr == 0 {
+                        break;
+                    }
+                    if (child_link & 2) != 0 {
+                        let next_horiz = mem.read_u32(child_addr);
+                        self.process_qh(mem, child_addr, depth + 1);
+                        child_link = next_horiz;
+                    } else {
+                        let (next_td, still_active) = self.process_td(mem, child_addr);
+                        if still_active {
+                            break;
+                        }
+                        child_link = next_td;
+                    }
+                }
+                break;
+            }
+
+            let (next_link, still_active) = self.process_td(mem, elem_addr);
+            if still_active {
+                // El TD no completó (p. ej. NAK o SPD short packet), detener esta cola
+                break;
+            }
+            // Actualizar element link de la QH para avanzar la cola
+            mem.write_u32(qh_addr + 4, next_link);
+            elem_link = next_link;
+        }
+    }
+
     /// Ejecuta un tick de 1 ms del scheduler UHCI (recorre Frame List, Queue Heads y TDs).
     pub fn step(&mut self, mem: &GuestMemory) {
         // Solo procesar si el controlador está en marcha (Run/Stop bit = 1)
@@ -234,32 +295,7 @@ impl UhciState {
             if (link & 2) != 0 {
                 // Queue Head (QH)
                 let horizontal_link = mem.read_u32(target_addr);
-                let mut elem_link = mem.read_u32(target_addr + 4);
-
-                // Recorrer los TDs en el elemento vertical de la cola
-                let mut vert_limit = 64;
-                while (elem_link & 1) == 0 && vert_limit > 0 {
-                    vert_limit -= 1;
-                    let elem_addr = (elem_link & 0xFFFF_FFF0) as usize;
-                    if elem_addr == 0 {
-                        break;
-                    }
-
-                    if (elem_link & 2) != 0 {
-                        // Enlace a otra QH en vertical no soportado, salir
-                        break;
-                    }
-
-                    let (next_link, still_active) = self.process_td(mem, elem_addr);
-                    if still_active {
-                        // El TD no completó (p. ej. NAK), detener procesamiento en esta cola
-                        break;
-                    }
-                    // Actualizar element link de la QH para avanzar la cola
-                    mem.write_u32(target_addr + 4, next_link);
-                    elem_link = next_link;
-                }
-
+                self.process_qh(mem, target_addr, 0);
                 link = horizontal_link;
             } else {
                 // Transfer Descriptor (TD) directo en la lista de frames
@@ -422,7 +458,8 @@ impl IoDevice for UsbUhci {
                     eprintln!("[UHCI] Port 1 reset completado, UsbTablet habilitado (PE=1)");
                 } else if val & USBPORTSC_PE != 0 {
                     s.port_status[0] |= USBPORTSC_PE;
-                } else {
+                } else if (val & (USBPORTSC_CSC | USBPORTSC_PEC)) == 0 {
+                    // Solo deshabilitar PE si la escritura no era simplemente para limpiar R/WC (CSC/PEC)
                     s.port_status[0] &= !USBPORTSC_PE;
                 }
 
