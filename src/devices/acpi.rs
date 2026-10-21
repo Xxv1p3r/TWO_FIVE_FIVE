@@ -101,15 +101,49 @@ fn build_fadt(facs_off: u32, dsdt_off: u32) -> Vec<u8> {
     t
 }
 
-/// DSDT mínimo: define `_S5_` (estado S5 = apagado) para que el guest
-/// pueda pedir un apagado limpio. AML: Name(_S5_, Package(4){0,0,0,0}).
+/// DSDT completo para i440FX/PIIX3:
+///   - `_S5_` (Package(4){0,0,0,0}) para apagado ACPI S5.
+///   - `\_SB.PCI0` (PNP0A03) con `_ADR`, `_UID`, `_BBN`, `_CRS` (bus 0..255,
+///     I/O 0x0000..0x0CF7 y 0x0D00..0xFFFF, VRAM 0xA0000..0xBFFFF y ventana
+///     MMIO PCI 32-bit 0xE0000000..0xFEBFFFFF).
+///   - Dispositivos integrados: `VGA_`, `PX13`, `ISA_` (`RTC_` PNP0B00,
+///     `KBD_` PNP0303, `MOU_` PNP0F13, `FDC0`, `LPT_`, `COM1`, `COM2`).
+///   - Enrutamiento IRQ PCI (`_PRT` y links `LNKA..LNKD`, `LNKS`).
 fn build_dsdt() -> Vec<u8> {
-    let aml: [u8; 12] = [
-        0x08, b'_', b'S', b'5', b'_', // NameOp "_S5_"
-        0x12, 0x06, 0x04, // PackageOp, PkgLength=6, NumElements=4
-        0x00, 0x00, 0x00, 0x00, // { 0, 0, 0, 0 } (SLP_TYP S5)
-    ];
-    let mut t = acpi_header(b"DSDT", 36 + 12, b"MI-DSDT ");
+    const SEABIOS_DSDT: &[u8] = include_bytes!("../../bios/acpi-dsdt.aml");
+    let mut aml = Vec::with_capacity(3520);
+
+    // 1) Name(_S5_, Package(4) { 0, 0, 0, 0 }) con PkgLength=0x06 y NumElements=0x04
+    aml.extend_from_slice(&[
+        0x08, b'_', b'S', b'5', b'_',
+        0x12, 0x06, 0x04,
+        0x00, 0x00, 0x00, 0x00,
+    ]);
+
+    // 2) Scope(\) { DBG_ } + Scope(_SB_) { Device(PCI0) { _HID, _ADR, _UID } }
+    aml.extend_from_slice(&SEABIOS_DSDT[216..325]);
+
+    // 3) Scope(._SB_PCI0) { Name(_BBN, 0), Name(_CRS, ResourceTemplate(){...}) }
+    //    El BufferOp de CRES en bios/acpi-dsdt.aml está exactamente en 342..457 (115 bytes).
+    let mut scope_body = Vec::with_capacity(140);
+    scope_body.extend_from_slice(b"._SB_PCI0");
+    scope_body.extend_from_slice(b"\x08_BBN\x00");
+    scope_body.extend_from_slice(b"\x08_CRS");
+    scope_body.extend_from_slice(&SEABIOS_DSDT[342..457]);
+    let pkglen = scope_body.len() + 2;
+    aml.push(0x10); // ScopeOp
+    aml.push(0x40 | ((pkglen & 0x0F) as u8));
+    aml.push((pkglen >> 4) as u8);
+    aml.extend_from_slice(&scope_body);
+
+    // 4) VGA_, PX13, ISA_ y dispositivos hijos ISA (RTC_, KBD_, MOU_, FDC0, LPT_, COM1, COM2)
+    aml.extend_from_slice(&SEABIOS_DSDT[818..1485]);
+
+    // 5) _PRT y PCI Interrupt Link Devices (LNKA..LNKD, LNKS)
+    aml.extend_from_slice(&SEABIOS_DSDT[1623..4194]);
+
+    let total_len = (36 + aml.len()) as u32;
+    let mut t = acpi_header(b"DSDT", total_len, b"MI-DSDT ");
     t.extend_from_slice(&aml);
     t
 }
