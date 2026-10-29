@@ -24,12 +24,6 @@ Hipervisor Tipo-2 minimalista de alto rendimiento sobre **KVM** y **Rust**.
   - **ACPI 1.0 (RSDP/RSDT/FADT/DSDT/MADT/FACS)**: Generación dinámica vía `fw_cfg` (`etc/table-loader`) con bloques PIIX4 PM (`0x600..0x608`), GPE0 (`0xAFE0`) y temporizador ACPI PM de 24 bits (3.579545 MHz) respaldado por contador monotónico de 64 bits sin bloqueo por wrap-around.
   - **CMOS RTC + IRQ 8 (`MC146818`)**: Emulación de interrupciones periódicas (`PIE`/`PF`, p. ej. 64 Hz y 1024 Hz) y de actualización (`UIE`/`UF`) en IRQ 8 requeridas por `hal.dll` / `ntoskrnl.exe` en Windows x64, además de modos BCD y binario.
 
-- **Paridad con Oracle VirtualBox**:
-  - **AHCI SATA (0x8086:0x2829)**: Controlador ICH-8M completo con máquina de estados COMRESET, conteo LBA48 (65,536 sectores), interrupciones NCQ Set Device Bits FIS (0xA1) y emulación ATAPI CD-ROM SATA.
-  - **VMMDev (0x80EE:0xCAFE)**: Soporte de eventos de host en `u32HostEvents`, Fast IRQ Ack sin consumo espurio de eventos y banderas HGCM.
-  - **Audio AC'97 (0x8086:0x2415)**: Códec ICH con registros extendidos EAID/EACS (`0x0809` y `0x0009` con VRM/VRA), control W1C en status y lecturas NAM protegidas.
-  - **BMDMA (Bus Master DMA IDE)**: Transferencias PRD DMA directas de alta velocidad.
-
 - **Subsistemas y Dispositivos Adicionales**:
   - **Gráficos Bochs VBE**: Aceleración VBE con soporte `VBE_DISPI_GETCAPS` (hasta 2560×1600), Linear Framebuffer (LFB) y modos nativos del kernel Linux (`bochs-drm` a 1024×768@32bpp).
   - **Red VirtIO (`virtio-net`)**: Stack de red en userspace integrado con DHCP (10.0.2.15), Gateway (10.0.2.2) y proxy DNS nativo, además de soporte para interfaces TAP de Linux.
@@ -115,13 +109,13 @@ Two Five Five (255) soporta instalación desatendida automática sin intervenci�
 
 ## Tests
 
-El proyecto cuenta con una amplia suite de pruebas que valida cada componente contra especificaciones reales de hardware y comportamiento de VirtualBox:
+El proyecto cuenta con una amplia suite de pruebas que valida cada componente contra especificaciones reales de hardware:
 
 ```bash
 cargo test
 ```
 
-Actualmente: **191 tests pasando (0 fallos)**.
+Actualmente: **230 tests pasando (0 fallos)**.
 
 ---
 
