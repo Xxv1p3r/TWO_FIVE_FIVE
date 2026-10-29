@@ -16,7 +16,8 @@
 
 use crate::guest_mem::GuestMemory;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 
 // ─── Offsets HBA Globales (0x00 .. 0x2C) ──────────────────────────
 pub const HOST_CAP: u32 = 0x00;        // Host Capabilities
@@ -211,6 +212,7 @@ pub struct AhciController {
     pub ports: [AhciPort; 3],
 
     // Archivos y almacenamiento de respaldo
+    pub vdisk: Option<crate::vdisk::VirtualDisk>,
     pub disk_file: Option<File>,
     pub disk_size: u64,
     pub iso_file: Option<File>,
@@ -222,6 +224,11 @@ pub struct AhciController {
     pub ram_disk: Option<Vec<u8>>,
     /// Modo de instalación desatendida activado
     pub unattended: bool,
+    pub sectors_read_total: u64,
+    pub sectors_written_total: u64,
+    /// Buffers reutilizables para evitar asignaciones de heap por cada comando DMA/NCQ
+    io_buf: Vec<u8>,
+    prd_buf: Vec<(u64, usize)>,
 }
 
 /// Copia una cadena de texto en formato ATA (intercambiando bytes en cada palabra de 16 bits).
@@ -249,6 +256,7 @@ impl AhciController {
                 AhciPort::new(1, true, true),   // Port 1: CD-ROM ATAPI
                 AhciPort::new(2, false, false), // Port 2: HDD Auxiliar OEMDRV (presente si hay aux_disk)
             ],
+            vdisk: None,
             disk_file: None,
             disk_size: 0,
             iso_file: None,
@@ -257,28 +265,60 @@ impl AhciController {
             aux_disk_size: 0,
             ram_disk: None,
             unattended: false,
+            sectors_read_total: 0,
+            sectors_written_total: 0,
+            io_buf: Vec::with_capacity(64 * 1024),
+            prd_buf: Vec::with_capacity(32),
         }
     }
 
     pub fn with_files(disk_path: Option<&str>, iso_path: Option<&str>) -> Self {
         let mut ctrl = Self::new();
+        let mut disk_mounted = false;
         if let Some(p) = disk_path {
-            if let Ok(mut f) = OpenOptions::new().read(true).write(true).open(p) {
-                let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
-                let _ = f.seek(SeekFrom::Start(0));
-                ctrl.disk_file = Some(f);
+            if let Ok(vd) = crate::vdisk::VirtualDisk::open(p) {
+                let size = vd.logical_size();
+                let fmt = vd.format().label();
+                ctrl.vdisk = Some(vd);
                 ctrl.disk_size = size;
-                eprintln!("[AHCI] Puerto 0: Disco SATA montado ('{}', {} MiB)", p, size / (1024 * 1024));
+                disk_mounted = true;
+                eprintln!(
+                    "[AHCI] Puerto 0: Disco SATA montado ('{}', formato {}, {} MiB)",
+                    p,
+                    fmt,
+                    size / (1024 * 1024)
+                );
+            } else {
+                eprintln!("[AHCI] Advertencia: No se pudo abrir el disco '{}'", p);
             }
         }
+        if !disk_mounted {
+            ctrl.ports[0].present = false;
+            ctrl.ports[0].ssts = 0;
+            ctrl.ports[0].tfd = 0x7F;
+        }
+
+        let mut iso_mounted = false;
         if let Some(p) = iso_path {
             if let Ok(mut f) = OpenOptions::new().read(true).open(p) {
                 let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
                 let _ = f.seek(SeekFrom::Start(0));
                 ctrl.iso_file = Some(f);
                 ctrl.iso_size = size;
-                eprintln!("[AHCI] Puerto 1: ATAPI CD-ROM SATA montado ('{}', {} MiB)", p, size / (1024 * 1024));
+                iso_mounted = true;
+                eprintln!(
+                    "[AHCI] Puerto 1: ATAPI CD-ROM SATA montado ('{}', {} MiB)",
+                    p,
+                    size / (1024 * 1024)
+                );
+            } else {
+                eprintln!("[AHCI] Advertencia: No se pudo abrir la ISO '{}'", p);
             }
+        }
+        if !iso_mounted {
+            ctrl.ports[1].present = false;
+            ctrl.ports[1].ssts = 0;
+            ctrl.ports[1].tfd = 0x7F;
         }
         ctrl
     }
@@ -313,6 +353,7 @@ impl AhciController {
     }
 
     pub fn reset(&mut self) {
+        self.flush_sectors(0);
         self.cap = AHCI_CAP_DEFAULT;
         self.ghc = GHC_AE;
         self.is = 0;
@@ -478,8 +519,45 @@ impl AhciController {
                     }
                     PORT_IE => port.ie = val,
                     PORT_CMD => {
-                        port.cmd = (port.cmd & (PORT_CMD_CR | PORT_CMD_FR | PORT_CMD_ATAPI))
+                        let old_fre = (port.cmd & PORT_CMD_FRE) != 0;
+                        let new_fre = (val & PORT_CMD_FRE) != 0;
+
+                        let mut new_cmd = (port.cmd & (PORT_CMD_CR | PORT_CMD_FR | PORT_CMD_ATAPI))
                             | (val & !(PORT_CMD_CR | PORT_CMD_FR));
+                        if (val & PORT_CMD_ST) != 0 {
+                            new_cmd |= PORT_CMD_CR;
+                        } else {
+                            new_cmd &= !PORT_CMD_CR;
+                        }
+                        if new_fre {
+                            new_cmd |= PORT_CMD_FR;
+                        } else {
+                            new_cmd &= !PORT_CMD_FR;
+                        }
+                        port.cmd = new_cmd;
+
+                        // Emitir primer FIS D2H inmediatamente al activar FRE por primera vez (DevAHCI.cpp:2651)
+                        if !old_fre && new_fre && port.present {
+                            let fb_addr = port.fis_base_address();
+                            if fb_addr != 0 {
+                                if let Some(guest_memory) = mem {
+                                    let mut d2h = [0u8; 20];
+                                    d2h[0] = 0x34; // FIS Type: Register D2H
+                                    d2h[1] = 0x40; // Interrupt bit (I)
+                                    d2h[2] = 0x50; // Status (DRDY | DSC)
+                                    d2h[3] = 0x01; // Error
+                                    d2h[4] = 0x01; // LBA low
+                                    d2h[5] = if port.is_atapi { 0x14 } else { 0x00 };
+                                    d2h[6] = if port.is_atapi { 0xEB } else { 0x00 };
+                                    d2h[7] = 0x00;
+                                    d2h[12] = 0x01; // Sector count
+                                    let _ = guest_memory.copy_to((fb_addr + 0x40) as usize, &d2h);
+                                    port.sig = if port.is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA };
+                                    port.tfd = 0x150;
+                                    port.is |= PORT_IS_DHRS;
+                                }
+                            }
+                        }
                     }
                     PORT_SCTL => {
                         let old_det = port.sctl & 0x0F;
@@ -554,6 +632,9 @@ impl AhciController {
         let clb_addr = self.ports[port_idx].cmd_list_address();
         let fb_addr = self.ports[port_idx].fis_base_address();
 
+        let mut io_buf = std::mem::take(&mut self.io_buf);
+        let mut prd_entries = std::mem::take(&mut self.prd_buf);
+
         for slot in 0..32 {
             if (ci_mask & (1 << slot)) == 0 {
                 continue;
@@ -579,8 +660,11 @@ impl AhciController {
                 let _ = mem.copy_from((ctba + 0x40) as usize, &mut acmd);
             }
 
-            // Parsear PRDT (Physical Region Descriptor Table)
-            let mut prd_entries = Vec::with_capacity(prdtl);
+            // Parsear PRDT (Physical Region Descriptor Table) reutilizando prd_entries
+            prd_entries.clear();
+            if prd_entries.capacity() < prdtl {
+                prd_entries.reserve(prdtl - prd_entries.capacity());
+            }
             for p_idx in 0..prdtl {
                 let prd_addr = ctba + 0x80 + (p_idx as u64) * 16;
                 let dba_low = mem.read_u32(prd_addr as usize) as u64;
@@ -615,38 +699,46 @@ impl AhciController {
                             let lba = parse_lba(&cfis, command == 0x25);
                             let count = parse_sector_count(&cfis, command == 0x25);
                             let total_bytes = (count as usize) * 512;
-                            let mut data = vec![0u8; total_bytes];
-                            self.read_sectors(port_idx, lba, count, &mut data);
-                            bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
+                            if io_buf.len() < total_bytes {
+                                io_buf.resize(total_bytes, 0);
+                            }
+                            self.read_sectors(port_idx, lba, count, &mut io_buf[..total_bytes]);
+                            bytes_transferred = copy_to_prd(mem, &prd_entries, &io_buf[..total_bytes]);
                         }
-                        0x20 | 0x24 => {
-                            // READ SECTORS (PIO, LBA28 / LBA48)
+                        0x20 | 0x24 | 0xC4 | 0x29 => {
+                            // READ SECTORS / READ MULTIPLE (PIO, LBA28 / LBA48)
                             is_pio = true;
-                            let lba = parse_lba(&cfis, command == 0x24);
-                            let count = parse_sector_count(&cfis, command == 0x24);
+                            let lba = parse_lba(&cfis, command == 0x24 || command == 0x29);
+                            let count = parse_sector_count(&cfis, command == 0x24 || command == 0x29);
                             let total_bytes = (count as usize) * 512;
-                            let mut data = vec![0u8; total_bytes];
-                            self.read_sectors(port_idx, lba, count, &mut data);
-                            bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
+                            if io_buf.len() < total_bytes {
+                                io_buf.resize(total_bytes, 0);
+                            }
+                            self.read_sectors(port_idx, lba, count, &mut io_buf[..total_bytes]);
+                            bytes_transferred = copy_to_prd(mem, &prd_entries, &io_buf[..total_bytes]);
                         }
                         0xCA | 0x35 => {
                             // WRITE DMA (LBA28) / WRITE DMA EXT (LBA48)
                             let lba = parse_lba(&cfis, command == 0x35);
                             let count = parse_sector_count(&cfis, command == 0x35);
                             let total_bytes = (count as usize) * 512;
-                            let mut data = vec![0u8; total_bytes];
-                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
-                            self.write_sectors(port_idx, lba, count, &data[..bytes_transferred]);
+                            if io_buf.len() < total_bytes {
+                                io_buf.resize(total_bytes, 0);
+                            }
+                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut io_buf[..total_bytes]);
+                            self.write_sectors(port_idx, lba, count, &io_buf[..bytes_transferred]);
                         }
-                        0x30 | 0x34 => {
-                            // WRITE SECTORS (PIO, LBA28 / LBA48)
+                        0x30 | 0x34 | 0xC5 | 0x39 => {
+                            // WRITE SECTORS / WRITE MULTIPLE (PIO, LBA28 / LBA48)
                             is_pio = true;
-                            let lba = parse_lba(&cfis, command == 0x34);
-                            let count = parse_sector_count(&cfis, command == 0x34);
+                            let lba = parse_lba(&cfis, command == 0x34 || command == 0x39);
+                            let count = parse_sector_count(&cfis, command == 0x34 || command == 0x39);
                             let total_bytes = (count as usize) * 512;
-                            let mut data = vec![0u8; total_bytes];
-                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
-                            self.write_sectors(port_idx, lba, count, &data[..bytes_transferred]);
+                            if io_buf.len() < total_bytes {
+                                io_buf.resize(total_bytes, 0);
+                            }
+                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut io_buf[..total_bytes]);
+                            self.write_sectors(port_idx, lba, count, &io_buf[..bytes_transferred]);
                         }
                         0x60 => {
                             // READ FPDMA QUEUED (NCQ Read)
@@ -654,9 +746,11 @@ impl AhciController {
                             let lba = parse_ncq_lba(&cfis);
                             let count = parse_ncq_sector_count(&cfis);
                             let total_bytes = (count as usize) * 512;
-                            let mut data = vec![0u8; total_bytes];
-                            self.read_sectors(port_idx, lba, count, &mut data);
-                            bytes_transferred = copy_to_prd(mem, &prd_entries, &data);
+                            if io_buf.len() < total_bytes {
+                                io_buf.resize(total_bytes, 0);
+                            }
+                            self.read_sectors(port_idx, lba, count, &mut io_buf[..total_bytes]);
+                            bytes_transferred = copy_to_prd(mem, &prd_entries, &io_buf[..total_bytes]);
                         }
                         0x61 => {
                             // WRITE FPDMA QUEUED (NCQ Write)
@@ -664,18 +758,49 @@ impl AhciController {
                             let lba = parse_ncq_lba(&cfis);
                             let count = parse_ncq_sector_count(&cfis);
                             let total_bytes = (count as usize) * 512;
-                            let mut data = vec![0u8; total_bytes];
-                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut data);
-                            self.write_sectors(port_idx, lba, count, &data[..bytes_transferred]);
+                            if io_buf.len() < total_bytes {
+                                io_buf.resize(total_bytes, 0);
+                            }
+                            bytes_transferred = copy_from_prd(mem, &prd_entries, &mut io_buf[..total_bytes]);
+                            self.write_sectors(port_idx, lba, count, &io_buf[..bytes_transferred]);
                         }
                         0xE7 | 0xEA => {
                             // FLUSH CACHE / FLUSH CACHE EXT
                             self.flush_sectors(port_idx);
                         }
-                        0xEF | 0x00 | 0x10..=0x1F => {
-                            // SET FEATURES, NOP, RECALIBRATE
+                        0x90 => {
+                            // EXECUTE DEVICE DIAGNOSTIC (0x01 = Passed, no error)
+                            status = ATA_STATUS_DRDY;
+                            error = 0x01;
+                        }
+                        0xEF | 0x00 | 0x06 | 0x08 | 0x10..=0x1F | 0x40..=0x42 | 0xB0 | 0x27 | 0xF5 | 0xF8
+                        | 0x91 | 0xC6 | 0xDA | 0xDE | 0xDF | 0xE0..=0xE6 | 0xE8 => {
+                            // 0x06: DATA SET MANAGEMENT (TRIM / Discard en NTFS)
+                            // 0x08: DEVICE RESET
+                            // 0x40..=0x42: READ VERIFY SECTORS (Requerido por particionadores MBR/GPT)
+                            // 0xB0: SMART (Chequeos de salud de disco de Windows)
+                            // 0x27/0xF8: READ NATIVE MAX ADDRESS / EXT
+                            // 0xEF: SET FEATURES, 0x00: NOP, 0x10..=0x1F: RECALIBRATE
+                            // 0x91: INITIALIZE DEVICE PARAMETERS
+                            // 0xC6: SET MULTIPLE MODE
+                            // 0xDA/0xDE/0xDF: Media status y lock/unlock
+                            // 0xE0..=0xE3: Standby/Idle power management
+                            // 0xE4/0xE8: Read/Write Buffer
+                            // 0xE5: CHECK POWER MODE
+                            // 0xE6: SLEEP
+                            // 0xF5: SECURITY FREEZE LOCK
+                            status = ATA_STATUS_DRDY;
+                            error = 0;
+                        }
+                        0x2F => {
+                            // READ LOG EXT (Página de diagnóstico y directorio de logs ATA/NCQ)
+                            let log_buf = [0u8; 512];
+                            bytes_transferred = copy_to_prd(mem, &prd_entries, &log_buf);
+                            status = ATA_STATUS_DRDY;
+                            error = 0;
                         }
                         _ => {
+                            eprintln!("[AHCI] Puerto {}: comando ATA no implementado: 0x{:02X}", port_idx, command);
                             status = ATA_STATUS_DRDY | ATA_STATUS_ERR;
                             error = 0x04; // ABRT
                         }
@@ -697,6 +822,7 @@ impl AhciController {
                             }
                         }
                         _ => {
+                            eprintln!("[AHCI] Puerto 1: comando ATAPI no implementado: 0x{:02X}", command);
                             status = ATA_STATUS_DRDY | ATA_STATUS_ERR;
                             error = 0x04; // ABRT
                         }
@@ -736,15 +862,33 @@ impl AhciController {
                     d2h_fis[1] = 0x40; // Bit 6 = Interrupt Bit (I)
                     d2h_fis[2] = status;
                     d2h_fis[3] = error;
-                    d2h_fis[4] = cfis[4];
-                    d2h_fis[5] = cfis[5];
-                    d2h_fis[6] = cfis[6];
-                    d2h_fis[7] = cfis[7];
-                    d2h_fis[8] = cfis[8];
-                    d2h_fis[9] = cfis[9];
-                    d2h_fis[10] = cfis[10];
-                    d2h_fis[12] = cfis[12];
-                    d2h_fis[13] = cfis[13];
+                    if is_atapi {
+                        // Razón de interrupción ATAPI en el registro Sector Count (d2h[12]):
+                        // Bit 0 = C/D (Command/Data: 1 = fase comando/status, 0 = fase datos)
+                        // Bit 1 = I/O (Dirección: 1 = hacia Host (lectura), 0 = desde Host (escritura))
+                        d2h_fis[4] = 0;
+                        d2h_fis[5] = 0x14; // LBA Mid (Firma mágica ATAPI byte 1)
+                        d2h_fis[6] = 0xEB; // LBA High (Firma mágica ATAPI byte 2)
+                        d2h_fis[12] = if bytes_transferred > 0 { 0x02 } else { 0x03 };
+                        d2h_fis[13] = 0;
+                    } else {
+                        d2h_fis[4] = cfis[4];
+                        d2h_fis[5] = cfis[5];
+                        d2h_fis[6] = cfis[6];
+                        d2h_fis[7] = cfis[7];
+                        d2h_fis[8] = cfis[8];
+                        d2h_fis[9] = cfis[9];
+                        d2h_fis[10] = cfis[10];
+                        if cfis[2] == 0xE5 {
+                            // CHECK POWER MODE: 0xFF = Unidad activa / idle
+                            d2h_fis[12] = 0xFF;
+                            d2h_fis[13] = 0x00;
+                        } else {
+                            // En transferencias de datos completadas sin error, el conteo de sectores restantes es 0
+                            d2h_fis[12] = 0;
+                            d2h_fis[13] = 0;
+                        }
+                    }
                     let _ = mem.copy_to((fb_addr + 0x40) as usize, &d2h_fis);
                 }
             }
@@ -763,6 +907,8 @@ impl AhciController {
             }
         }
 
+        self.io_buf = io_buf;
+        self.prd_buf = prd_entries;
         self.update_irq();
     }
 
@@ -773,28 +919,46 @@ impl AhciController {
         let total = (count as usize) * 512;
         let len = dst.len().min(total);
         if port == 2 {
-            if let Some(ref mut f) = self.aux_disk_file {
-                if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
-                    let _ = f.read_exact(&mut dst[..len]);
+            if let Some(ref f) = self.aux_disk_file {
+                if f.read_exact_at(&mut dst[..len], lba * 512).is_err() {
+                    dst[..len].fill(0);
                 }
+            } else {
+                dst[..len].fill(0);
             }
             return;
         }
 
-        // Puerto 0 (disco principal o RAM)
-        if let Some(ref mut f) = self.disk_file {
-            if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
-                let _ = f.read_exact(&mut dst[..len]);
-                return;
+        // Puerto 0 (disco principal VDI/RAW o RAM)
+        if let Some(ref mut vd) = self.vdisk {
+            if vd.read_sectors(lba, count, &mut dst[..len]).is_err() {
+                dst[..len].fill(0);
             }
+            self.sectors_read_total += count as u64;
+            return;
+        }
+        if let Some(ref f) = self.disk_file {
+            if f.read_exact_at(&mut dst[..len], lba * 512).is_err() {
+                dst[..len].fill(0);
+            }
+            self.sectors_read_total += count as u64;
+            return;
         }
         if let Some(ref ram) = self.ram_disk {
             let offset = (lba * 512) as usize;
             if offset < ram.len() {
                 let avail = (ram.len() - offset).min(len);
                 dst[..avail].copy_from_slice(&ram[offset..offset + avail]);
+                if avail < len {
+                    dst[avail..len].fill(0);
+                }
+            } else {
+                dst[..len].fill(0);
             }
+            self.sectors_read_total += count as u64;
+            return;
         }
+        dst[..len].fill(0);
     }
 
     /// Escribe sectores de 512 bytes en el puerto indicado (Puerto 0: disco principal, Puerto 2: aux_disk).
@@ -802,22 +966,22 @@ impl AhciController {
         let total = (count as usize) * 512;
         let len = src.len().min(total);
         if port == 2 {
-            if let Some(ref mut f) = self.aux_disk_file {
-                if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
-                    let _ = f.write_all(&src[..len]);
-                    let _ = f.sync_data();
-                }
+            if let Some(ref f) = self.aux_disk_file {
+                let _ = f.write_all_at(&src[..len], lba * 512);
             }
             return;
         }
 
-        // Puerto 0 (disco principal o RAM)
-        if let Some(ref mut f) = self.disk_file {
-            if f.seek(SeekFrom::Start(lba * 512)).is_ok() {
-                let _ = f.write_all(&src[..len]);
-                let _ = f.sync_data();
-                return;
-            }
+        // Puerto 0 (disco principal VDI/RAW o RAM)
+        if let Some(ref mut vd) = self.vdisk {
+            let _ = vd.write_sectors(lba, count, &src[..len]);
+            self.sectors_written_total += count as u64;
+            return;
+        }
+        if let Some(ref f) = self.disk_file {
+            let _ = f.write_all_at(&src[..len], lba * 512);
+            self.sectors_written_total += count as u64;
+            return;
         }
         if let Some(ref mut ram) = self.ram_disk {
             let offset = (lba * 512) as usize;
@@ -825,6 +989,7 @@ impl AhciController {
                 ram.resize(offset + len, 0);
             }
             ram[offset..offset + len].copy_from_slice(&src[..len]);
+            self.sectors_written_total += count as u64;
         }
     }
 
@@ -834,6 +999,10 @@ impl AhciController {
             if let Some(ref mut f) = self.aux_disk_file {
                 let _ = f.sync_data();
             }
+            return;
+        }
+        if let Some(ref mut vd) = self.vdisk {
+            let _ = vd.flush();
             return;
         }
         if let Some(ref mut f) = self.disk_file {
@@ -857,13 +1026,14 @@ impl AhciController {
         let offset = (lba as u64) * CD_SECTOR_SIZE as u64;
         let total = (count as usize) * CD_SECTOR_SIZE;
         let len = dst.len().min(total);
-        if let Some(ref mut f) = self.iso_file {
-            if f.seek(SeekFrom::Start(offset)).is_ok() {
-                let _ = f.read_exact(&mut dst[..len]);
-                if self.unattended || self.aux_disk_file.is_some() {
-                    crate::unattended::patch_unattended_iso_sectors(&mut dst[..len]);
-                }
+        if let Some(ref f) = self.iso_file {
+            if f.read_exact_at(&mut dst[..len], offset).is_err() {
+                dst[..len].fill(0);
+            } else if self.unattended || self.aux_disk_file.is_some() {
+                crate::unattended::patch_unattended_iso_sectors(&mut dst[..len]);
             }
+        } else {
+            dst[..len].fill(0);
         }
     }
 
@@ -892,22 +1062,61 @@ impl AhciController {
             buf[126] = 0x07; buf[127] = 0x07;
 
             let total_sectors = (self.aux_disk_size / 512).max(1);
+            let sectors_per_track = 63u16;
+            let heads = if total_sectors <= 1024 * 16 * 63 { 16u16 } else { 255u16 };
+            let cylinders = ((total_sectors / (heads as u64 * sectors_per_track as u64)).min(16383) as u16).max(1);
+
+            buf[2..4].copy_from_slice(&cylinders.to_le_bytes());
+            buf[6..8].copy_from_slice(&heads.to_le_bytes());
+            buf[12..14].copy_from_slice(&sectors_per_track.to_le_bytes());
+
+            copy_ata_string(&mut buf[20..40], b"TWO555-SATA2    ");
+            copy_ata_string(&mut buf[46..54], b"01.00   ");
+            copy_ata_string(&mut buf[54..94], b"Two Five Five Virtual OEMDRV Disk       ");
+
+            buf[94] = 16; buf[95] = 0x80;
+            buf[96] = 0x01; buf[97] = 0x00;
+            buf[98] = 0x00; buf[99] = 0x0B;
+            buf[100] = 0x00; buf[101] = 0x40;
+            buf[102] = 240; buf[103] = 0;
+            buf[104] = 240; buf[105] = 0;
+
+            buf[106] = 0x07; buf[107] = 0x00;
+
+            buf[108..110].copy_from_slice(&cylinders.to_le_bytes());
+            buf[110..112].copy_from_slice(&heads.to_le_bytes());
+            buf[112..114].copy_from_slice(&sectors_per_track.to_le_bytes());
+            let chs_capacity = (cylinders as u32) * (heads as u32) * (sectors_per_track as u32);
+            buf[114..118].copy_from_slice(&chs_capacity.to_le_bytes());
+            buf[118] = 16; buf[119] = 0x01;
+
             let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
             buf[120..124].copy_from_slice(&lba28.to_le_bytes());
 
-            // Word 80: Versión mayor ATA/ATAPI-4..8 (0x01F0)
-            buf[160] = 0xF0; buf[161] = 0x01;
-            // Word 82: Conjuntos de comandos soportados
-            buf[164] = 0x00; buf[165] = 0x74;
-            // Word 83: Soporte LBA48 (bit 10=1, bit 14=1) -> 0x4400
-            buf[166] = 0x00; buf[167] = 0x44;
-            // Word 86: LBA48 habilitado (bit 10=1) -> 0x0400
-            buf[172] = 0x00; buf[173] = 0x04;
-            // Word 88: Ultra DMA modos 0..6 soportados y activos
-            buf[176] = 0x7F; buf[177] = 0x7F;
+            buf[126] = 0x07; buf[127] = 0x07;
+            buf[128] = 0x03; buf[129] = 0x00;
+            buf[130] = 120; buf[132] = 120; buf[134] = 120; buf[136] = 120;
 
-            // LBA48 total de sectores
+            buf[150] = 31; buf[151] = 0;
+            buf[152] = 0x04; buf[153] = 0x01;
+
+            buf[160] = 0xF0; buf[161] = 0x01;
+            buf[162] = 0x28; buf[163] = 0x00;
+            buf[164] = 0x78; buf[165] = 0x00;
+            buf[166] = 0x00; buf[167] = 0x74;
+            buf[168] = 0x00; buf[169] = 0x40;
+            buf[170] = 0x78; buf[171] = 0x00;
+            buf[172] = 0x00; buf[173] = 0x34;
+            buf[174] = 0x00; buf[175] = 0x40;
+            buf[176] = 0x7F; buf[177] = 0x7F;
+            buf[186] = 0x01; buf[187] = 0x60;
+
             buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
+
+            let sum: u8 = buf[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+            let csum = 0u8.wrapping_sub(sum);
+            buf[510] = 0xA5;
+            buf[511] = csum;
 
             buf
         } else {
@@ -919,60 +1128,155 @@ impl AhciController {
         let mut buf = [0u8; 512];
         buf[0] = 0x40; // Non-removable, ATA device
         buf[1] = 0x00;
-        buf[2] = 0x3F; buf[3] = 0x3F; // Cylinders (16383)
-        buf[6] = 16;   buf[7] = 0;    // Heads
-        buf[8] = 0x03; buf[9] = 0x00;
-        buf[12] = 63;  buf[13] = 0;   // Sectors per track
+
+        let total_sectors = (self.disk_size / 512).max(1);
+        let sectors_per_track = 63u16;
+        let heads = if total_sectors <= 1024 * 16 * 63 { 16u16 } else { 255u16 };
+        let cylinders = ((total_sectors / (heads as u64 * sectors_per_track as u64)).min(16383) as u16).max(1);
+
+        // Word 1, 3, 6: Geometría LCHS
+        buf[2..4].copy_from_slice(&cylinders.to_le_bytes());
+        buf[6..8].copy_from_slice(&heads.to_le_bytes());
+        buf[12..14].copy_from_slice(&sectors_per_track.to_le_bytes());
 
         copy_ata_string(&mut buf[20..40], b"TWO555-SATA0    ");
         copy_ata_string(&mut buf[46..54], b"01.00   ");
         copy_ata_string(&mut buf[54..94], b"Two Five Five Virtual SATA HDD          ");
 
-        // Word 49: DMA (bit 8), LBA (bit 9), IORDY (bit 11) -> 0x0F00
-        buf[98] = 0x00; buf[99] = 0x0F;
-        // Word 53: Words 54-58, 64-70, 88 son válidos
-        buf[106] = 0x07; buf[107] = 0x00;
-        // Word 63: Multiword DMA modos 0, 1, 2 soportados y activos
-        buf[126] = 0x07; buf[127] = 0x07;
+        // Word 47: Sectores múltiples por interrupción (16)
+        buf[94] = 16; buf[95] = 0x80;
+        // Word 48: dword I/O soportado
+        buf[96] = 0x01; buf[97] = 0x00;
+        // Word 49: DMA, LBA, IORDY (0x0B00)
+        buf[98] = 0x00; buf[99] = 0x0B;
+        // Word 50: Standby timer standard (0x4000)
+        buf[100] = 0x00; buf[101] = 0x40;
+        // Word 51 & 52: PIO y DMA transfer cycle
+        buf[102] = 240; buf[103] = 0;
+        buf[104] = 240; buf[105] = 0;
 
-        let total_sectors = (self.disk_size / 512).max(1);
+        // Word 53: Palabras 54-58, 64-70, 88 son válidas
+        buf[106] = 0x07; buf[107] = 0x00;
+
+        // Words 54-58: Geometría CHS Actual y Capacidad en Sectores (Crucial para Windows 7)
+        buf[108..110].copy_from_slice(&cylinders.to_le_bytes());
+        buf[110..112].copy_from_slice(&heads.to_le_bytes());
+        buf[112..114].copy_from_slice(&sectors_per_track.to_le_bytes());
+        let chs_capacity = (cylinders as u32) * (heads as u32) * (sectors_per_track as u32);
+        buf[114..118].copy_from_slice(&chs_capacity.to_le_bytes());
+
+        // Word 59: Múltiples sectores habilitados (0x0110)
+        buf[118] = 16; buf[119] = 0x01;
+
+        // Words 60-61: LBA28 Sectores Totales (máximo 0x0FFFFFFF)
         let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
         buf[120..124].copy_from_slice(&lba28.to_le_bytes());
 
-        // Word 80: Versión mayor ATA/ATAPI-4..8 (0x01F0)
+        // Word 63: Multiword DMA modos 0, 1, 2
+        buf[126] = 0x07; buf[127] = 0x07;
+        // Word 64: Modos PIO avanzados 3 y 4
+        buf[128] = 0x03; buf[129] = 0x00;
+        // Words 65-68: Tiempos de ciclo mínimos (120 ns)
+        buf[130] = 120; buf[132] = 120; buf[134] = 120; buf[136] = 120;
+
+        // Words 75 & 76: Específico de Serial ATA (DevAHCI.cpp:2875-2876)
+        buf[150] = 31; buf[151] = 0; // 32 slots de comando soportados
+        buf[152] = 0x04; buf[153] = 0x01; // Gen2 3.0 Gbps + NCQ soportado
+
+        // Word 80: Versión mayor ATA/ATAPI-4..8
         buf[160] = 0xF0; buf[161] = 0x01;
-        // Word 82: Conjuntos de comandos soportados
-        buf[164] = 0x00; buf[165] = 0x74;
-        // Word 83: Soporte LBA48 (bit 10=1, bit 14=1) -> 0x4400
-        buf[166] = 0x00; buf[167] = 0x44;
-        // Word 86: LBA48 habilitado (bit 10=1) -> 0x0400
-        buf[172] = 0x00; buf[173] = 0x04;
+        // Word 81: Cumplimiento ATA/ATAPI-8 ACS
+        buf[162] = 0x28; buf[163] = 0x00;
+
+        // Word 82: Conjunto de Comandos Soportados (Power Mgmt, Write Cache, Look-Ahead)
+        buf[164] = 0x78; buf[165] = 0x00;
+
+        // Word 83: Soporte LBA48 y FLUSH CACHE (Bit 14=1, 13=FlushExt, 12=Flush, 10=LBA48 -> 0x7400)
+        buf[166] = 0x00; buf[167] = 0x74;
+
+        // Word 84: Bit 14 en 1
+        buf[168] = 0x00; buf[169] = 0x40;
+
+        // Word 85: Comandos habilitados por defecto
+        buf[170] = 0x78; buf[171] = 0x00;
+
+        // Word 86: LBA48 y FLUSH CACHE habilitados (0x3400)
+        buf[172] = 0x00; buf[173] = 0x34;
+
+        // Word 87: Bit 14 en 1
+        buf[174] = 0x00; buf[175] = 0x40;
+
         // Word 88: Ultra DMA modos 0..6 soportados y activos
         buf[176] = 0x7F; buf[177] = 0x7F;
 
-        // LBA48 total de sectores
+        // Word 93: Resultado de hardware reset (0x6001)
+        buf[186] = 0x01; buf[187] = 0x60;
+
+        // Words 100-103: Sectores Totales LBA48 (64-bit LE)
         buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
+
+        // Word 255: Checksum de Integridad ATA (DevAHCI.cpp:2878-2879)
+        let sum: u8 = buf[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let csum = 0u8.wrapping_sub(sum);
+        buf[510] = 0xA5;
+        buf[511] = csum;
 
         buf
     }
 
     pub fn generate_atapi_identify(&self) -> [u8; 512] {
         let mut pkt = [0u8; 512];
-        // Word 0: CD-ROM device (0x8580: ATAPI, CD-ROM, 12-byte CDB)
-        pkt[0] = 0x05;
+        // Word 0: CD-ROM device (0x8580: ATAPI, CD-ROM, 12-byte CDB, removable)
+        pkt[0] = 0x80;
         pkt[1] = 0x85;
 
-        copy_ata_string(&mut pkt[20..40], b"TWO555-SATA1    ");
-        copy_ata_string(&mut pkt[46..54], b"01.00   ");
-        copy_ata_string(&mut pkt[54..94], b"Two Five Five Virtual SATA CD-ROM       ");
+        // Words 10..19: Serial number (20 bytes)
+        copy_ata_string(&mut pkt[20..40], b"VB1234-5678         ");
+        // Words 23..26: Firmware revision (8 bytes)
+        copy_ata_string(&mut pkt[46..54], b"1.0     ");
+        // Words 27..46: Model number (40 bytes)
+        copy_ata_string(&mut pkt[54..94], b"VBOX CD-ROM                             ");
 
-        // Word 49: DMA, LBA, IORDY soportados (0x0F00)
-        pkt[98] = 0x00; pkt[99] = 0x0F;
-        pkt[124] = 0x07; pkt[125] = 0x00;
-        pkt[160] = 0x7E; pkt[161] = 0x00; // ATA/ATAPI-6
+        // Word 49: DMA, LBA, IORDY soportados (0x0B00)
+        pkt[98] = 0x00; pkt[99] = 0x0B;
+        // Word 53: Palabras 64-70 y 88 son válidas (0x0006)
+        pkt[106] = 0x06; pkt[107] = 0x00;
+        // Word 63: Multiword DMA modos 0, 1, 2 soportados y activos (0x0007)
+        pkt[126] = 0x07; pkt[127] = 0x00;
+        // Word 64: Modos PIO avanzados 3 y 4 (0x0003)
+        pkt[128] = 0x03; pkt[129] = 0x00;
+        // Words 65..68: Tiempos mínimos de ciclo (120 ns)
+        pkt[130] = 120; pkt[132] = 120; pkt[134] = 120; pkt[136] = 120;
 
-        let total_lba = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
-        pkt[200..204].copy_from_slice(&total_lba.to_le_bytes());
+        // Words 75 & 76: Específico de Serial ATA (32 slots y SATA Gen2 3.0 Gbps + NCQ)
+        pkt[150] = 31; pkt[151] = 0;
+        pkt[152] = 0x04; pkt[153] = 0x01;
+
+        // Word 80: Versión mayor ATA/ATAPI-4..6 (0x007E)
+        pkt[160] = 0x7E; pkt[161] = 0x00;
+        // Word 81: Versión menor (0x0022)
+        pkt[162] = 0x22; pkt[163] = 0x00;
+
+        // Words 82..87: Command sets (Device reset, Power mgmt)
+        pkt[164] = 0x10; pkt[165] = 0x02; // Word 82: 0x0210
+        pkt[166] = 0x00; pkt[167] = 0x40; // Word 83: 0x4000
+        pkt[168] = 0x00; pkt[169] = 0x40; // Word 84: 0x4000
+        pkt[170] = 0x10; pkt[171] = 0x02; // Word 85: 0x0210
+        pkt[172] = 0x00; pkt[173] = 0x40; // Word 86: 0x4000
+        pkt[174] = 0x00; pkt[175] = 0x40; // Word 87: 0x4000
+
+        // Word 88: Ultra DMA modos 0..5 soportados y modo 5 activo (0x207F)
+        pkt[176] = 0x7F; pkt[177] = 0x20;
+
+        // Words 100..103: Total LBA (64-bit)
+        let total_lba = (self.iso_size / CD_SECTOR_SIZE as u64).max(1);
+        pkt[200..208].copy_from_slice(&total_lba.to_le_bytes());
+
+        // Word 255: Checksum de integridad ATA (DevAHCI.cpp)
+        let sum: u8 = pkt[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let csum = 0u8.wrapping_sub(sum);
+        pkt[510] = 0xA5;
+        pkt[511] = csum;
 
         pkt
     }
@@ -981,6 +1285,9 @@ impl AhciController {
 
     pub fn execute_scsi(&mut self, cdb: &[u8; 16]) -> Option<Vec<u8>> {
         let opcode = cdb[0];
+        let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
+        let is_dvd = self.iso_size > 700 * 1024 * 1024;
+
         match opcode {
             0x00 => {
                 // TEST UNIT READY
@@ -995,20 +1302,62 @@ impl AhciController {
                 let len = alloc.min(18);
                 Some(sense[..len].to_vec())
             }
+            0x08 => {
+                // READ (6)
+                let lba = (((cdb[1] & 0x1F) as u32) << 16) | ((cdb[2] as u32) << 8) | (cdb[3] as u32);
+                let mut count = cdb[4] as u16;
+                if count == 0 { count = 256; }
+                let total_bytes = (count as usize) * CD_SECTOR_SIZE;
+                let mut buf = vec![0u8; total_bytes];
+                self.read_iso_sectors(lba, count, &mut buf);
+                Some(buf)
+            }
             0x12 => {
-                // INQUIRY
-                let alloc = cdb[4] as usize;
-                let mut inq = vec![0u8; 96];
-                inq[0] = 0x05; // CD-ROM
-                inq[1] = 0x80; // Removable
-                inq[2] = 0x02; // SPC-2
-                inq[3] = 0x02;
-                inq[4] = 91;   // Additional length
-                inq[8..16].copy_from_slice(b"TWO555  ");
-                inq[16..32].copy_from_slice(b"SATA CD-ROM     ");
-                inq[32..36].copy_from_slice(b"1.0 ");
-                let len = alloc.min(96);
-                Some(inq[..len].to_vec())
+                // INQUIRY (Standard & EVPD)
+                let evpd = (cdb[1] & 0x01) != 0;
+                let page_code = cdb[2];
+                let alloc = if cdb[4] == 0 && cdb[3] != 0 {
+                    cdb[3] as usize
+                } else {
+                    cdb[4] as usize
+                };
+                let resp = if evpd {
+                    match page_code {
+                        0x00 => {
+                            // Supported VPD Pages
+                            vec![0x05, 0x00, 0x00, 0x03, 0x00, 0x80, 0x83]
+                        }
+                        0x80 => {
+                            // Unit Serial Number
+                            let serial = b"VB1234-5678";
+                            let mut p = vec![0x05, 0x80, 0x00, serial.len() as u8];
+                            p.extend_from_slice(serial);
+                            p
+                        }
+                        0x83 => {
+                            // Device Identification
+                            let mut p = vec![0x05, 0x83, 0x00, 0x14, 0x02, 0x01, 0x00, 0x10];
+                            p.extend_from_slice(b"VBOX    VB123456");
+                            p
+                        }
+                        _ => {
+                            vec![0x05, page_code, 0x00, 0x00]
+                        }
+                    }
+                } else {
+                    let mut inq = vec![0u8; 96];
+                    inq[0] = 0x05; // CD-ROM
+                    inq[1] = 0x80; // Removable
+                    inq[2] = 0x02; // SPC-2
+                    inq[3] = 0x02;
+                    inq[4] = 91;   // Additional length
+                    inq[8..16].copy_from_slice(b"VBOX    ");
+                    inq[16..32].copy_from_slice(b"CD-ROM          ");
+                    inq[32..36].copy_from_slice(b"1.0 ");
+                    inq
+                };
+                let send_len = alloc.min(resp.len());
+                Some(resp[..send_len].to_vec())
             }
             0x1A => {
                 // MODE SENSE (6)
@@ -1021,9 +1370,23 @@ impl AhciController {
                 let len = alloc.min(36);
                 Some(ms[..len].to_vec())
             }
+            0x1B | 0x1E | 0x2B | 0x35 => {
+                // START/STOP UNIT, PREVENT/ALLOW, SEEK (10), SYNCHRONIZE CACHE
+                Some(Vec::new())
+            }
+            0x23 => {
+                // READ FORMAT CAPACITIES
+                let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+                let mut cap = vec![0u8; 12];
+                cap[3] = 8; // Capacity list length
+                cap[4..8].copy_from_slice(&total_sectors.to_be_bytes());
+                cap[8] = 0x02; // Formatted media
+                cap[9..12].copy_from_slice(&[0x00, 0x08, 0x00]); // 2048 sector size
+                let len = alloc.min(12);
+                Some(cap[..len].to_vec())
+            }
             0x25 => {
                 // READ CAPACITY (10)
-                let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
                 let last_lba = total_sectors.saturating_sub(1);
                 let block_size = CD_SECTOR_SIZE as u32;
                 let mut cap = vec![0u8; 8];
@@ -1048,45 +1411,267 @@ impl AhciController {
                 Some(buf)
             }
             0x43 => {
-                // READ TOC
+                // READ TOC (con soporte MSF y formato multi-sesión)
+                let msf = (cdb[1] & 0x02) != 0;
+                let format = cdb[2] & 0x0F;
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
-                let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
-                let mut toc = vec![0u8; 20];
-                let len: u16 = 18;
-                toc[0..2].copy_from_slice(&len.to_be_bytes());
-                toc[2] = 1; // First track
-                toc[3] = 1; // Last track
-                // Track 1
-                toc[5] = 0x14; // Data track
-                toc[6] = 1;
-                // Lead-out track (0xAA)
-                toc[13] = 0x14;
-                toc[14] = 0xAA;
-                toc[16..20].copy_from_slice(&total_sectors.to_be_bytes());
-                let send_len = alloc.min(20);
-                Some(toc[..send_len].to_vec())
+                let lba_to_msf = |lba: u32| -> [u8; 4] {
+                    let f = (lba % 75) as u8;
+                    let s = ((lba / 75) % 60) as u8;
+                    let m = (lba / (75 * 60)) as u8;
+                    [0x00, m, s, f]
+                };
+
+                let buf = match format {
+                    0 => {
+                        // Standard TOC: Header (4 bytes) + Track 1 (8 bytes) + Lead-out (8 bytes) = 20 bytes
+                        let mut toc = vec![0u8; 20];
+                        let len: u16 = 18;
+                        toc[0..2].copy_from_slice(&len.to_be_bytes());
+                        toc[2] = 1; // First track
+                        toc[3] = 1; // Last track
+                        // Track 1
+                        toc[4] = 0;
+                        toc[5] = 0x14; // ADR=1, Data track
+                        toc[6] = 1;
+                        toc[7] = 0;
+                        if msf {
+                            toc[8..12].copy_from_slice(&lba_to_msf(150));
+                        } else {
+                            toc[8..12].copy_from_slice(&0u32.to_be_bytes());
+                        }
+                        // Lead-out track 0xAA
+                        toc[12] = 0;
+                        toc[13] = 0x14;
+                        toc[14] = 0xAA;
+                        toc[15] = 0;
+                        if msf {
+                            toc[16..20].copy_from_slice(&lba_to_msf(total_sectors + 150));
+                        } else {
+                            toc[16..20].copy_from_slice(&total_sectors.to_be_bytes());
+                        }
+                        toc
+                    }
+                    1 => {
+                        // Multi-session info: Header (4 bytes) + Track info (8 bytes) = 12 bytes
+                        let mut toc = vec![0u8; 12];
+                        let len: u16 = 10;
+                        toc[0..2].copy_from_slice(&len.to_be_bytes());
+                        toc[2] = 1; // First session
+                        toc[3] = 1; // Last session
+                        toc[4] = 0;
+                        toc[5] = 0x14;
+                        toc[6] = 1;
+                        toc[7] = 0;
+                        if msf {
+                            toc[8..12].copy_from_slice(&lba_to_msf(150));
+                        } else {
+                            toc[8..12].copy_from_slice(&0u32.to_be_bytes());
+                        }
+                        toc
+                    }
+                    _ => vec![0u8; 4],
+                };
+                let send_len = alloc.min(buf.len());
+                Some(buf[..send_len].to_vec())
+            }
+            0x46 => {
+                // GET CONFIGURATION (Soporte completo MMC Feature Descriptors)
+                let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+                let cur_profile: u16 = if is_dvd { 0x0010 } else { 0x0008 };
+                let mut conf = vec![0u8; 88];
+                let data_len: u32 = 84; // 88 - 4
+                conf[0..4].copy_from_slice(&data_len.to_be_bytes());
+                conf[6..8].copy_from_slice(&cur_profile.to_be_bytes());
+
+                let mut off = 8;
+                // Feature 0000h: Profile List
+                conf[off..off+2].copy_from_slice(&0x0000u16.to_be_bytes());
+                conf[off+2] = 0x03; // Version 0, persistent, current
+                conf[off+3] = 8;    // 8 additional bytes
+                conf[off+4..off+6].copy_from_slice(&0x0010u16.to_be_bytes()); // DVD-ROM
+                conf[off+6] = if is_dvd { 1 } else { 0 }; // Current
+                conf[off+8..off+10].copy_from_slice(&0x0008u16.to_be_bytes()); // CD-ROM
+                conf[off+10] = if is_dvd { 0 } else { 1 }; // Current
+                off += 12;
+
+                // Feature 0001h: Core Feature
+                conf[off..off+2].copy_from_slice(&0x0001u16.to_be_bytes());
+                conf[off+2] = (2 << 2) | 0x03; // Version 2, persistent, current
+                conf[off+3] = 8;
+                conf[off+4..off+8].copy_from_slice(&2u32.to_be_bytes()); // Physical ATAPI
+                conf[off+8] = 1; // DBE
+                off += 12;
+
+                // Feature 0002h: Morphing
+                conf[off..off+2].copy_from_slice(&0x0002u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                conf[off+4] = 2; // ASYNCH
+                off += 8;
+
+                // Feature 0003h: Removable Medium
+                conf[off..off+2].copy_from_slice(&0x0003u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                conf[off+4] = 0x20; // Lockable
+                off += 8;
+
+                // Feature 0010h: Random Readable
+                conf[off..off+2].copy_from_slice(&0x0010u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 8;
+                conf[off+4..off+8].copy_from_slice(&2048u32.to_be_bytes()); // Block size 2048
+                conf[off+8..off+10].copy_from_slice(&1u16.to_be_bytes());   // Blocking 1
+                off += 12;
+
+                // Feature 001Eh: CD Read
+                conf[off..off+2].copy_from_slice(&0x001Eu16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                conf[off+4] = 0x03; // CD-Text, DAP
+                off += 8;
+
+                // Feature 001Fh: DVD Read
+                conf[off..off+2].copy_from_slice(&0x001Fu16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                off += 8;
+
+                // Feature 0100h: Power Management
+                conf[off..off+2].copy_from_slice(&0x0100u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 0;
+                off += 4;
+
+                // Feature 0105h: Timeout
+                conf[off..off+2].copy_from_slice(&0x0105u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                off += 8;
+
+                let actual_len = off.min(conf.len());
+                let send_len = alloc.min(actual_len);
+                Some(conf[..send_len].to_vec())
+            }
+            0x4A => {
+                // GET EVENT STATUS NOTIFICATION
+                let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+                let mut ev = vec![0u8; 8];
+                let len: u16 = 4;
+                ev[0..2].copy_from_slice(&len.to_be_bytes());
+                ev[2] = 0x84; // NEA | class 4 (Media)
+                ev[4] = 0x02; // Media present
+                let send_len = alloc.min(8);
+                Some(ev[..send_len].to_vec())
+            }
+            0x51 => {
+                // READ DISC INFORMATION
+                let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+                let mut info = vec![0u8; 34];
+                let len: u16 = 32;
+                info[0..2].copy_from_slice(&len.to_be_bytes());
+                info[2] = 0x0E;
+                info[3] = 1;
+                info[4] = 1;
+                info[5] = 1;
+                info[6] = 1;
+                info[7] = 0x20;
+                info[8] = if is_dvd { 0x10 } else { 0x00 };
+                let send_len = alloc.min(34);
+                Some(info[..send_len].to_vec())
+            }
+            0x52 => {
+                // READ TRACK INFORMATION
+                let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+                let mut info = vec![0u8; 36];
+                let len: u16 = 34;
+                info[0..2].copy_from_slice(&len.to_be_bytes());
+                info[2] = 1;
+                info[3] = 1;
+                info[5] = 0x04;
+                info[6] = 0x01;
+                info[8..12].copy_from_slice(&0u32.to_be_bytes());
+                info[24..28].copy_from_slice(&total_sectors.to_be_bytes());
+                let send_len = alloc.min(36);
+                Some(info[..send_len].to_vec())
             }
             0x5A => {
                 // MODE SENSE (10)
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+                let page_code = cdb[2] & 0x3F;
                 let mut ms = vec![0u8; 44];
                 let mode_len: u16 = 42;
                 ms[0..2].copy_from_slice(&mode_len.to_be_bytes());
                 ms[3] = 0x80; // Write protected
                 ms[8] = 0x2A; // Page 0x2A
                 ms[9] = 0x1E;
-                let len = alloc.min(44);
+                ms[16] = 0x02; ms[17] = 0xC0; // max read speed (4x)
+                ms[22] = 0x02; ms[23] = 0xC0;
+                let len = alloc.min(if page_code == 0x2A || page_code == 0x3F { 44 } else { 8 });
                 Some(ms[..len].to_vec())
             }
-            0x46 => {
-                // GET CONFIGURATION
-                let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
-                let mut conf = vec![0u8; 8];
-                let len: u32 = 4;
-                conf[0..4].copy_from_slice(&len.to_be_bytes());
-                conf[7] = 0x08; // Profile 0x08: CD-ROM
+            0xAD => {
+                // READ DVD STRUCTURE (Crucial para Windows 7 / WinPE DVD-ROM detection)
+                let format = cdb[7];
+                let alloc = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
+                match format {
+                    0x00 => {
+                        // Physical format information (MMC-2 / VirtualBox vscsiLunMmcReadDvdStructure)
+                        let mut buf = vec![0u8; 2048 + 4];
+                        let data_len = 2048u16 + 2u16;
+                        buf[0..2].copy_from_slice(&data_len.to_be_bytes());
+                        buf[2] = 0;
+                        buf[3] = 0;
+                        buf[4] = 0x01; // DVD-ROM, part version 1
+                        buf[5] = 0x0F; // 120mm disc, minimum rate unspecified
+                        buf[6] = 0x01; // One layer, read-only
+                        buf[7] = 0x00; // Default densities
+
+                        // Starting PSN: 0x00030000 per MMC spec
+                        buf[8..12].copy_from_slice(&0x0003_0000u32.to_be_bytes());
+                        let end_psn = 0x0003_0000u32.saturating_add(total_sectors.saturating_sub(1));
+                        buf[12..16].copy_from_slice(&end_psn.to_be_bytes());
+                        buf[16..20].copy_from_slice(&end_psn.to_be_bytes());
+
+                        let send_len = alloc.min(buf.len());
+                        Some(buf[..send_len].to_vec())
+                    }
+                    0x01 => {
+                        // DVD copyright information
+                        let mut buf = vec![0u8; 8];
+                        let data_len = 4u16 + 2u16;
+                        buf[0..2].copy_from_slice(&data_len.to_be_bytes());
+                        buf[2] = 0;
+                        buf[3] = 0;
+                        buf[4] = 0; // No copyright data
+                        buf[5] = 0; // No region restrictions
+                        let send_len = alloc.min(8);
+                        Some(buf[..send_len].to_vec())
+                    }
+                    _ => {
+                        let buf = vec![0u8; 4];
+                        let send_len = alloc.min(4);
+                        Some(buf[..send_len].to_vec())
+                    }
+                }
+            }
+            0xBD => {
+                // MECHANISM STATUS
+                let alloc = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
+                let mut resp = vec![0u8; 8];
+                resp[5] = 1; // 1 slot
                 let send_len = alloc.min(8);
-                Some(conf[..send_len].to_vec())
+                Some(resp[..send_len].to_vec())
+            }
+            0xBE => {
+                // READ CD
+                let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+                let count = (((cdb[6] as u32) << 16) | ((cdb[7] as u32) << 8) | (cdb[8] as u32)) as u16;
+                let total_bytes = (count as usize) * CD_SECTOR_SIZE;
+                let mut buf = vec![0u8; total_bytes];
+                self.read_iso_sectors(lba, count, &mut buf);
+                Some(buf)
             }
             _ => {
                 Some(Vec::new())
@@ -1178,6 +1763,7 @@ fn parse_ncq_sector_count(cfis: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_ahci_initial_registers() {
@@ -1373,8 +1959,8 @@ mod tests {
         let mut inq_resp = [0u8; 96];
         guest_mem.copy_from(prd_data_buf as usize, &mut inq_resp);
         assert_eq!(inq_resp[0], 0x05); // CD-ROM
-        assert_eq!(&inq_resp[8..16], b"TWO555  ");
-        assert_eq!(&inq_resp[16..28], b"SATA CD-ROM ");
+        assert_eq!(&inq_resp[8..16], b"VBOX    ");
+        assert_eq!(&inq_resp[16..24], b"CD-ROM  ");
 
         // 2. SCSI READ CAPACITY 10 (0x25)
         guest_mem.write_u8((ctba + 0x40) as usize, 0x25); // READ CAPACITY 10
@@ -1752,5 +2338,48 @@ mod tests {
         assert_eq!(read_buf[511], 0x55);
 
         let _ = std::fs::remove_file(&aux_path);
+    }
+
+    #[test]
+    fn test_ahci_scsi_read_dvd_structure_and_get_configuration() {
+        let mut ctrl = AhciController::new();
+        // Simular ISO de Windows 7 DVD (3.5 GB)
+        ctrl.iso_size = 3500 * 1024 * 1024;
+
+        // 1. Probar GET CONFIGURATION (0x46)
+        let mut cdb_cfg = [0u8; 16];
+        cdb_cfg[0] = 0x46; // GET CONFIGURATION
+        cdb_cfg[7] = 0;
+        cdb_cfg[8] = 88; // Alloc len = 88
+        let cfg_resp = ctrl.execute_scsi(&cdb_cfg).expect("GET CONFIGURATION response");
+        assert_eq!(cfg_resp.len(), 88);
+        // Current profile must be DVD-ROM (0x0010)
+        let cur_profile = u16::from_be_bytes([cfg_resp[6], cfg_resp[7]]);
+        assert_eq!(cur_profile, 0x0010, "DVD-ROM profile must be 0x0010 for >700MB ISO");
+
+        // 2. Probar READ DVD STRUCTURE (0xAD) Format 0 (Physical Format Information)
+        let mut cdb_dvd = [0u8; 16];
+        cdb_dvd[0] = 0xAD; // READ DVD STRUCTURE
+        cdb_dvd[7] = 0x00; // Format 0: Physical format information
+        cdb_dvd[8] = 0x08;
+        cdb_dvd[9] = 0x04; // Alloc len = 2052 (2048 + 4)
+        let dvd_resp = ctrl.execute_scsi(&cdb_dvd).expect("READ DVD STRUCTURE response");
+        assert_eq!(dvd_resp.len(), 2052);
+        assert_eq!(dvd_resp[4], 0x01, "DVD-ROM Book type v1");
+        assert_eq!(dvd_resp[5], 0x0F, "120mm size");
+        assert_eq!(dvd_resp[6], 0x01, "Single layer read-only");
+        let start_psn = u32::from_be_bytes([dvd_resp[8], dvd_resp[9], dvd_resp[10], dvd_resp[11]]);
+        assert_eq!(start_psn, 0x0003_0000, "Starting PSN must be 0x30000 per MMC spec");
+
+        // 3. Probar EVPD INQUIRY Page 0x80 (Unit Serial Number)
+        let mut cdb_evpd = [0u8; 16];
+        cdb_evpd[0] = 0x12; // INQUIRY
+        cdb_evpd[1] = 0x01; // EVPD = 1
+        cdb_evpd[2] = 0x80; // Page 0x80
+        cdb_evpd[4] = 32;
+        let evpd_resp = ctrl.execute_scsi(&cdb_evpd).expect("EVPD INQUIRY response");
+        assert_eq!(evpd_resp[0], 0x05); // CD-ROM
+        assert_eq!(evpd_resp[1], 0x80); // Page 0x80
+        assert_eq!(&evpd_resp[4..15], b"VB1234-5678");
     }
 }

@@ -36,8 +36,8 @@ pub const VBE_DISPI_LFB_ENABLED: u16 = 0x40;
 #[allow(dead_code)]
 pub const VBE_DISPI_NOCLEARMEM: u16 = 0x80;
 
-pub const VBE_DISPI_MAX_XRES: u16 = 2560;
-pub const VBE_DISPI_MAX_YRES: u16 = 1600;
+pub const VBE_DISPI_MAX_XRES: u16 = 3840;
+pub const VBE_DISPI_MAX_YRES: u16 = 2160;
 pub const VBE_DISPI_MAX_BPP: u16 = 32;
 
 #[allow(dead_code)]
@@ -49,6 +49,7 @@ pub const VRAM_DEFAULT_BASE_GPA: u64 = 0xE800_0000;
 pub const VGA_MMIO_BAR_SIZE: u64 = 0x1000;
 
 // ─── Estado interno compartido de VGA / VBE ────────────────────────
+#[derive(Clone)]
 pub struct VgaState {
     pub dispi_index: u16,
     pub dispi_regs: [u16; 16],
@@ -208,10 +209,10 @@ impl VgaState {
                     }
                 }
                 VBE_DISPI_INDEX_XRES => {
-                    self.dispi_regs[idx as usize] = val.clamp(320, 2560);
+                    self.dispi_regs[idx as usize] = val.clamp(320, VBE_DISPI_MAX_XRES);
                 }
                 VBE_DISPI_INDEX_YRES => {
-                    self.dispi_regs[idx as usize] = val.clamp(200, 1600);
+                    self.dispi_regs[idx as usize] = val.clamp(200, VBE_DISPI_MAX_YRES);
                 }
                 VBE_DISPI_INDEX_BPP => {
                     if matches!(val, 4 | 8 | 15 | 16 | 24 | 32) {
@@ -222,6 +223,12 @@ impl VgaState {
                     self.dispi_regs[idx as usize] = val;
                     if (val & VBE_DISPI_ENABLED) != 0 {
                         self.vbe_active = true;
+                        if self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] == 0 {
+                            self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] = self.dispi_regs[VBE_DISPI_INDEX_XRES as usize];
+                        }
+                        if self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] == 0 {
+                            self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] = self.dispi_regs[VBE_DISPI_INDEX_YRES as usize];
+                        }
                     }
                     // Según especificación Bochs VBE: si VBE_DISPI_NOCLEARMEM (0x80)
                     // NO está activo al habilitar VBE, la memoria de vídeo se limpia a 0

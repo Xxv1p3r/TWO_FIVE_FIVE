@@ -160,10 +160,24 @@ BIOS=""
 ISO=""
 DISK=""
 
+# Si se ejecuta sin argumentos y hay servidor gráfico disponible, abrir el Mini GUI
+if [ $# -eq 0 ] && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } && [ -z "${MI_VMM_NO_GUI:-}" ]; then
+    exec "$BINARY" --gui
+fi
+
+# Si se solicita modo GUI o utilidades VDI directamente, delegar al binario
+for arg in "$@"; do
+    if [ "$arg" = "-g" ] || [ "$arg" = "--gui" ] || [ "$arg" = "--launcher" ] || \
+       [ "$arg" = "--create-vdi" ] || [ "$arg" = "--compact-vdi" ] || [ "$arg" = "--disk-info" ]; then
+        exec "$BINARY" "$@"
+    fi
+done
+
 # Categorizar los argumentos pasados (Flags, BIOS, ISO o DISK)
 for arg in "$@"; do
     [ -z "$arg" ] && continue
-    if [ "$arg" = "-u" ] || [ "$arg" = "--unattended" ] || [[ "$arg" == --unattended-* ]]; then
+    if [ "$arg" = "-u" ] || [ "$arg" = "--unattended" ] || [[ "$arg" == --unattended-* ]] || \
+       [[ "$arg" == --cpus=* ]] || [[ "$arg" == --ram=* ]] || [ "$arg" = "--no-gui" ]; then
         FLAGS+=("$arg")
     elif [ -z "$BIOS" ] && ([[ "$arg" == *.bin ]] || [[ "$arg" == *.fd ]] || [[ "$arg" == *seabios* ]] || [[ "$arg" == *ovmf* ]]); then
         BIOS=$(find_bios "$arg")

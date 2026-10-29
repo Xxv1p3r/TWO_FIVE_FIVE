@@ -209,8 +209,10 @@ pub struct LegacyInterrupts {
     aux_irq_enabled: bool,
 
     // ─── Ratón PS/2 (dispositivo auxiliar del 8042) ─────────────
-    /// Output buffer del dispositivo auxiliar (ratón).
+    /// Output buffer del dispositivo auxiliar (ratón) para paquetes de movimiento.
     ps2_aux_buf: std::collections::VecDeque<u8>,
+    /// Buffer separado para respuestas a comandos (ACKs, IDs, status) para evitar corromper la trama de 3 bytes.
+    ps2_aux_cmd_buf: std::collections::VecDeque<u8>,
     /// Reporte de movimiento habilitado (0xF4) / deshabilitado (0xF5).
     mouse_reporting: bool,
     /// Botones actuales del ratón (bits PS/2: 1=left, 2=right, 4=middle).
@@ -227,6 +229,7 @@ pub struct LegacyInterrupts {
 
     // Diagnostic: track if IRQ1 needs injection into kernel PIC
     irq1_pending: bool,
+    pub reset_requested: bool,
     // Diagnostic counters
     pub ps2_access_count: u32,
     pub pit_access_count: u32,
@@ -261,6 +264,7 @@ impl LegacyInterrupts {
             kb_irq_enabled: true,
             aux_irq_enabled: false,
             ps2_aux_buf: std::collections::VecDeque::new(),
+            ps2_aux_cmd_buf: std::collections::VecDeque::new(),
             mouse_reporting: false,
             mouse_buttons: 0,
             mouse_last_packet: [0x08, 0, 0],
@@ -269,9 +273,16 @@ impl LegacyInterrupts {
             port_b: 0,
 
             irq1_pending: false,
+            reset_requested: false,
             ps2_access_count: 0,
             pit_access_count: 0,
         }
+    }
+
+    pub fn take_reset_requested(&mut self) -> bool {
+        let r = self.reset_requested;
+        self.reset_requested = false;
+        r
     }
 
     /// Returns true if IRQ1 needs to be injected into the kernel PIC.
@@ -298,7 +309,7 @@ impl LegacyInterrupts {
 
     /// Hay bytes del ratón sin leer en el output buffer auxiliar.
     pub fn mouse_has_data(&self) -> bool {
-        !self.ps2_aux_buf.is_empty()
+        !self.ps2_aux_cmd_buf.is_empty() || !self.ps2_aux_buf.is_empty()
     }
 
     /// Inyecta un movimiento/cambio de botones del ratón host al dispositivo
@@ -309,19 +320,29 @@ impl LegacyInterrupts {
         if !self.mouse_reporting {
             return;
         }
+        // Descartar en múltiplos exactos de 3 bytes para preservar alineación de trama PS/2
+        while self.ps2_aux_buf.len() + 3 > 30 {
+            for _ in 0..3 {
+                self.ps2_aux_buf.pop_front();
+            }
+        }
         // Paquete estándar de 3 bytes con deltas de 9 bits (signo en b0).
+        // Clamping a [-255, 255] sin activar bits de overflow (0x40 / 0x80)
+        // porque VirtualBox DevPS2M.cpp y los drivers i8042prt.sys / psmouse
+        // descartan el paquete como error de hardware si b0 tiene bits 6 o 7 activos.
         let dx_c = dx.clamp(-255, 255);
         let dy_c = dy.clamp(-255, 255);
         let mut b0: u8 = 0x08; // bit 3: siempre 1 (protocolo PS/2)
         b0 |= buttons & 0x07;
         if dx_c < 0 { b0 |= 0x10; } // X sign (bit 8 de dx)
         if dy_c < 0 { b0 |= 0x20; } // Y sign (bit 8 de dy)
-        if dx < -255 || dx > 255 { b0 |= 0x40; } // X overflow
-        if dy < -255 || dy > 255 { b0 |= 0x80; } // Y overflow
         let packet = [b0, dx_c as u8, dy_c as u8];
         self.mouse_last_packet = packet;
         for &b in &packet {
-            self.push_aux_buf(b);
+            self.ps2_aux_buf.push_back(b);
+        }
+        if self.aux_irq_enabled {
+            self.irq12_pending = true;
         }
     }
 
@@ -362,11 +383,24 @@ impl LegacyInterrupts {
 
     /// Encola un byte en el output buffer auxiliar (ratón) y marca IRQ12
     /// como pendiente si el command byte tiene habilitada la IRQ aux.
+    #[allow(dead_code)]
     fn push_aux_buf(&mut self, val: u8) {
         if self.ps2_aux_buf.len() >= 16 {
             self.ps2_aux_buf.pop_front();
         }
         self.ps2_aux_buf.push_back(val);
+        if self.aux_irq_enabled {
+            self.irq12_pending = true;
+        }
+    }
+
+    /// Encola una respuesta de comando auxiliar (ACK, ID, status) separada
+    /// de los paquetes de movimiento para no desalinear las tramas de 3 bytes.
+    fn push_aux_cmd(&mut self, val: u8) {
+        if self.ps2_aux_cmd_buf.len() >= 16 {
+            self.ps2_aux_cmd_buf.pop_front();
+        }
+        self.ps2_aux_cmd_buf.push_back(val);
         if self.aux_irq_enabled {
             self.irq12_pending = true;
         }
@@ -662,13 +696,19 @@ impl LegacyInterrupts {
         self.ps2_access_count += 1;
         match port {
             PS2_DATA => {
-                // Prioridad: teclado (IRQ1), luego auxiliar/ratón (IRQ12).
+                // Prioridad: teclado (IRQ1), luego respuestas a comandos de ratón (IRQ12), luego movimiento auxiliar (IRQ12).
                 if let Some(val) = self.ps2_out_buf.pop_front() {
                     self.irq1_pending = self.kb_irq_enabled && !self.ps2_out_buf.is_empty();
                     return val;
                 }
+                if let Some(val) = self.ps2_aux_cmd_buf.pop_front() {
+                    let has_more = !self.ps2_aux_cmd_buf.is_empty() || !self.ps2_aux_buf.is_empty();
+                    self.irq12_pending = self.aux_irq_enabled && has_more;
+                    return val;
+                }
                 if let Some(val) = self.ps2_aux_buf.pop_front() {
-                    self.irq12_pending = self.aux_irq_enabled && !self.ps2_aux_buf.is_empty();
+                    let has_more = !self.ps2_aux_cmd_buf.is_empty() || !self.ps2_aux_buf.is_empty();
+                    self.irq12_pending = self.aux_irq_enabled && has_more;
                     return val;
                 }
                 0xFF
@@ -676,16 +716,15 @@ impl LegacyInterrupts {
             PS2_STATUS => {
                 // bit0 OBF: hay dato listo para leer (teclado o ratón).
                 // bit1 IBF: 0 — el controlador consume los escritos del host
-                //   síncronamente, así que SIEMPRE se puede escribir. Antes
-                //   se devolvía fijo a 1 y cada i8042_wait_write de SeaBIOS
-                //   se quedaba esperando hasta el timeout.
+                //   síncronamente, así que SIEMPRE se puede escribir.
                 // bit2 system flag: self-test OK.
                 // bit5: OBF contiene datos del dispositivo auxiliar (ratón).
                 let mut st = PS2_SYS_FLAG;
-                if !self.ps2_out_buf.is_empty() || !self.ps2_aux_buf.is_empty() {
+                let aux_has_data = !self.ps2_aux_cmd_buf.is_empty() || !self.ps2_aux_buf.is_empty();
+                if !self.ps2_out_buf.is_empty() || aux_has_data {
                     st |= PS2_OUTBUF_FULL;
                 }
-                if !self.ps2_aux_buf.is_empty() && self.ps2_out_buf.is_empty() {
+                if aux_has_data && self.ps2_out_buf.is_empty() {
                     st |= 1 << 5;
                 }
                 st
@@ -718,7 +757,7 @@ impl LegacyInterrupts {
                 }
                 Ps2Expect::AuxOut => {
                     // 0xD3: byte directo al output buffer auxiliar (ratón).
-                    self.push_aux_buf(val);
+                    self.push_aux_cmd(val);
                     self.ps2_expect = Ps2Expect::None;
                 }
                 Ps2Expect::AuxDev => {
@@ -783,9 +822,16 @@ impl LegacyInterrupts {
                 self.ps2_cmd_byte |= 0x20; // disable aux/mouse interface
             }
             0xF6 => {}
-            // Pulse output port (0xF0-0xF3) y comandos desconocidos: sin
-            // respuesta. Responder ACK a lo desconocido es tan incorrecto
-            // como peligroso: el BIOS lee bytes que no esperaba.
+            // Comandos 0xF0..0xFF: "Pulse Output Port" del 8042.
+            // En PCs compatibles con IBM PC/AT, el bit 0 está conectado a la línea RESET del CPU.
+            // Cuando el bit 0 es 0 (ej. comando 0xFE), pulsa la línea RESET a bajo (reinicio de hardware).
+            0xFE | 0xF0..=0xFF => {
+                if (val & 0x01) == 0 {
+                    self.reset_requested = true;
+                }
+            }
+            // Comandos desconocidos: sin respuesta. Responder ACK a lo desconocido
+            // es tan incorrecto como peligroso: el BIOS lee bytes que no esperaba.
             _ => {}
         }
     }
@@ -800,16 +846,16 @@ impl LegacyInterrupts {
         // el ratón responde con ACK (0xFA) también al byte de parámetro.
         if self.mouse_expect_arg {
             self.mouse_expect_arg = false;
-            self.push_aux_buf(0xFA);
+            self.push_aux_cmd(0xFA);
             self.ps2_expect = Ps2Expect::None;
             return;
         }
         match val {
             0xFF => {
                 // Reset: ACK + self-test OK (0xAA) + device ID (0x00).
-                self.push_aux_buf(0xFA);
-                self.push_aux_buf(0xAA);
-                self.push_aux_buf(0x00);
+                self.push_aux_cmd(0xFA);
+                self.push_aux_cmd(0xAA);
+                self.push_aux_cmd(0x00);
                 self.mouse_reporting = false;
                 self.mouse_buttons = 0;
                 self.mouse_last_packet = [0x08, 0, 0];
@@ -818,59 +864,59 @@ impl LegacyInterrupts {
             }
             0xF2 => {
                 // Get device ID: ratón estándar (ID 0).
-                self.push_aux_buf(0xFA);
-                self.push_aux_buf(0x00);
+                self.push_aux_cmd(0xFA);
+                self.push_aux_cmd(0x00);
                 self.ps2_expect = Ps2Expect::None;
             }
             0xF3 => {
                 // Set sample rate: ACK y espera el argumento.
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 self.mouse_expect_arg = true;
                 self.ps2_expect = Ps2Expect::None;
             }
             0xE8 => {
                 // Set resolution: ACK y espera el argumento.
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 self.mouse_expect_arg = true;
                 self.ps2_expect = Ps2Expect::None;
             }
             0xF4 => {
                 // Enable data reporting.
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 self.mouse_reporting = true;
                 self.ps2_expect = Ps2Expect::None;
             }
             0xF5 | 0xF6 => {
                 // Disable data reporting / set defaults.
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 self.mouse_reporting = false;
                 self.ps2_expect = Ps2Expect::None;
             }
             0xE6 | 0xE7 | 0xEA => {
                 // Scaling 1:1 / 2:1 / set stream mode: solo ACK.
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 self.ps2_expect = Ps2Expect::None;
             }
             0xE9 => {
                 // Status request: ACK + 3 bytes de estado.
-                self.push_aux_buf(0xFA);
-                self.push_aux_buf(0x00); // flags: modo stream, sin botones
-                self.push_aux_buf(0x64); // sample rate 100 Hz
-                self.push_aux_buf(0x03); // resolución 8 counts/mm
+                self.push_aux_cmd(0xFA);
+                self.push_aux_cmd(0x00); // flags: modo stream, sin botones
+                self.push_aux_cmd(0x64); // sample rate 100 Hz
+                self.push_aux_cmd(0x03); // resolución 8 counts/mm
                 self.ps2_expect = Ps2Expect::None;
             }
             0xEB => {
                 // Read data: ACK + último paquete.
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 let packet = self.mouse_last_packet;
                 for &b in &packet {
-                    self.push_aux_buf(b);
+                    self.push_aux_cmd(b);
                 }
                 self.ps2_expect = Ps2Expect::None;
             }
             _ => {
                 // Comando desconocido: ACK (evita colgar el probe del guest).
-                self.push_aux_buf(0xFA);
+                self.push_aux_cmd(0xFA);
                 self.ps2_expect = Ps2Expect::None;
             }
         }
@@ -1162,23 +1208,59 @@ mod tests {
     }
 
     #[test]
-    fn mouse_delta_overflow_flags() {
+    fn mouse_delta_clamping_no_overflow_drop() {
         let mut d = LegacyInterrupts::new();
         enable_aux_irq(&mut d);
         aux_write(&mut d, 0xF4);
         assert!(d.take_irq12_pending());
         assert_eq!(d.read(PS2_DATA, 1)[0], 0xFA);
 
-        // Delta fuera de rango: se satura a ±255 y se marcan los overflows.
+        // Delta fuera de rango: se satura a ±255 y NO se marcan los bits de overflow (0x40/0x80)
+        // para evitar que i8042prt.sys / psmouse descarten el paquete como error (comportamiento VirtualBox DevPS2M.cpp).
         d.inject_mouse_delta(400, -400, 0);
         assert!(d.take_irq12_pending());
         let b0 = d.read(PS2_DATA, 1)[0];
         let dx = d.read(PS2_DATA, 1)[0];
         let dy = d.read(PS2_DATA, 1)[0];
-        assert_ne!(b0 & 0x40, 0, "X overflow");
-        assert_ne!(b0 & 0x80, 0, "Y overflow");
+        assert_eq!(b0 & 0x40, 0, "X overflow bit must not be set");
+        assert_eq!(b0 & 0x80, 0, "Y overflow bit must not be set");
         assert_eq!(dx, 0xFF); // +255
         assert_eq!(dy, 0x01); // -255 → 0x01
+    }
+
+    #[test]
+    fn mouse_framing_preserved_across_command_acks() {
+        let mut d = LegacyInterrupts::new();
+        enable_aux_irq(&mut d);
+        // Habilitar reporte
+        aux_write(&mut d, 0xF4);
+        assert_eq!(d.read(PS2_DATA, 1)[0], 0xFA);
+
+        // Inyectar movimiento
+        d.inject_mouse_delta(15, 20, 0x01);
+
+        // El huésped envía otro comando antes de leer el movimiento (ej. status request 0xE9)
+        aux_write(&mut d, 0xE9);
+
+        // Las respuestas del comando (ACK + 3 bytes de estado) deben salir ANTES de romper la trama de movimiento,
+        // o leerse en orden limpio sin desfasar el paquete de movimiento de 3 bytes.
+        let r0 = d.read(PS2_DATA, 1)[0]; // ACK 0xFA
+        let r1 = d.read(PS2_DATA, 1)[0]; // status b0 (0x00)
+        let r2 = d.read(PS2_DATA, 1)[0]; // sample rate (0x64)
+        let r3 = d.read(PS2_DATA, 1)[0]; // res (0x03)
+        assert_eq!(r0, 0xFA);
+        assert_eq!(r1, 0x00);
+        assert_eq!(r2, 0x64);
+        assert_eq!(r3, 0x03);
+
+        // Ahora leemos el paquete de movimiento: sus 3 bytes deben estar intactos
+        let mb0 = d.read(PS2_DATA, 1)[0];
+        let mdx = d.read(PS2_DATA, 1)[0];
+        let mdy = d.read(PS2_DATA, 1)[0];
+        assert_eq!(mb0, 0x09); // 0x08 | 0x01 (botón izquierdo)
+        assert_eq!(mdx, 15);
+        assert_eq!(mdy, 20);
+        assert!(!d.mouse_has_data());
     }
 
     #[test]

@@ -530,6 +530,7 @@ impl IoDevice for CmosRtc {
 pub struct A20Gate {
     /// Estado del puerto: bit 0 = A20 habilitado
     state: u8,
+    pub reset_requested: bool,
 }
 
 impl A20Gate {
@@ -538,7 +539,7 @@ impl A20Gate {
     pub fn new() -> Self {
         // Bit 0 = A20 gate (0=disabled, 1=enabled), Bit 1 = fast reset.
         // QEMU default: A20 disabled (bit 0 = 0). SeaBIOS enables it early.
-        Self { state: 0x02 }
+        Self { state: 0x02, reset_requested: false }
     }
 
     /// ¿El A20 está habilitado?
@@ -547,10 +548,17 @@ impl A20Gate {
         self.state & 0x01 != 0
     }
 
+    pub fn take_reset_requested(&mut self) -> bool {
+        let r = self.reset_requested;
+        self.reset_requested = false;
+        r
+    }
+
     /// Reset del A20: vuelve al estado inicial (A20 deshabilitado, como
     /// un reset del chipset).
     pub fn reset(&mut self) {
         self.state = 0x02;
+        self.reset_requested = false;
     }
 }
 
@@ -568,7 +576,10 @@ impl IoDevice for A20Gate {
     fn write(&mut self, _port: u16, data: &[u8]) {
         if let Some(&val) = data.first() {
             self.state = val;
-            // Bit 1 = reset rápido. Ignorado.
+            // Bit 0 = Fast Reset (pulso de reset al procesador en PCs y chipsets modernos)
+            if (val & 0x01) != 0 {
+                self.reset_requested = true;
+            }
         }
     }
 

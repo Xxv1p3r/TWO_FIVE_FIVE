@@ -232,23 +232,35 @@ impl VmmDevState {
 /// Dispositivo VMMDev conectado al bus de E/S y MMIO
 pub struct VmmDevDevice {
     pub state: Arc<Mutex<VmmDevState>>,
+    cached_iobase: u16,
+    cached_mmio_base: u32,
 }
 
 impl VmmDevDevice {
     pub fn new(state: Arc<Mutex<VmmDevState>>) -> Self {
-        Self { state }
+        let (cached_iobase, cached_mmio_base) = {
+            let st = state.lock().unwrap();
+            (st.iobase, st.mmio_base)
+        };
+        Self {
+            state,
+            cached_iobase,
+            cached_mmio_base,
+        }
     }
 
     pub fn set_iobase(&mut self, base: u16) {
+        self.cached_iobase = base;
         self.state.lock().unwrap().iobase = base;
     }
 
     pub fn set_mmio_base(&mut self, base: u32) {
+        self.cached_mmio_base = base;
         self.state.lock().unwrap().mmio_base = base;
     }
 
     pub fn matches_port(&self, port: u16) -> bool {
-        let iobase = self.state.lock().unwrap().iobase;
+        let iobase = self.cached_iobase;
         iobase != 0 && port >= iobase && port < iobase + 32
     }
 
@@ -289,33 +301,33 @@ impl VmmDevDevice {
 
     /// Despacha peticiones MMIO recibidas en la ventana BAR1
     pub fn mmio_read(&self, addr: u64, size: usize) -> Option<Vec<u8>> {
-        let state = self.state.lock().unwrap();
-        let mmio_base = state.mmio_base as u64;
-        if mmio_base != 0 && addr >= mmio_base && addr < mmio_base + VMMDEV_RAM_SIZE as u64 {
-            let off = (addr - mmio_base) as usize;
-            let end = (off + size).min(state.ram.len());
-            let mut res = vec![0xFF; size];
-            if off < state.ram.len() {
-                let copy_len = end - off;
-                res[..copy_len].copy_from_slice(&state.ram[off..end]);
-            }
-            return Some(res);
+        let mmio_base = self.cached_mmio_base as u64;
+        if mmio_base == 0 || addr < mmio_base || addr >= mmio_base + VMMDEV_RAM_SIZE as u64 {
+            return None;
         }
-        None
+        let state = self.state.lock().unwrap();
+        let off = (addr - mmio_base) as usize;
+        let end = (off + size).min(state.ram.len());
+        let mut res = vec![0xFF; size];
+        if off < state.ram.len() {
+            let copy_len = end - off;
+            res[..copy_len].copy_from_slice(&state.ram[off..end]);
+        }
+        Some(res)
     }
 
     pub fn mmio_write(&mut self, addr: u64, data: &[u8]) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let mmio_base = state.mmio_base as u64;
-        if mmio_base != 0 && addr >= mmio_base && addr < mmio_base + VMMDEV_RAM_SIZE as u64 {
-            let off = (addr - mmio_base) as usize;
-            if off < state.ram.len() {
-                let copy_len = data.len().min(state.ram.len() - off);
-                state.ram[off..off + copy_len].copy_from_slice(&data[..copy_len]);
-            }
-            return true;
+        let mmio_base = self.cached_mmio_base as u64;
+        if mmio_base == 0 || addr < mmio_base || addr >= mmio_base + VMMDEV_RAM_SIZE as u64 {
+            return false;
         }
-        false
+        let mut state = self.state.lock().unwrap();
+        let off = (addr - mmio_base) as usize;
+        if off < state.ram.len() {
+            let copy_len = data.len().min(state.ram.len() - off);
+            state.ram[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+        }
+        true
     }
 
     /// Procesa una estructura `VMMDevRequestHeader` almacenada en la memoria física del huésped
@@ -396,6 +408,9 @@ impl VmmDevDevice {
                     let or_mask = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let not_mask = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     state.guest_filter_mask = (state.guest_filter_mask | or_mask) & !not_mask;
+                    if (state.host_event_flags & state.guest_filter_mask) != 0 {
+                        state.irq_asserted = true;
+                    }
                 }
             }
 

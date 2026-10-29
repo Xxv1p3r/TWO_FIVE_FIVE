@@ -150,11 +150,27 @@ impl UhciState {
             }
             0x69 => {
                 // IN PID (transferencia hacia el host)
-                if let Some(data) = self.tablet.handle_in(endpoint, max_len) {
+                let mut stack_buf = [0u8; 64];
+                let opt_len = if max_len <= stack_buf.len() {
+                    if let Some(actual_len) = self.tablet.handle_in_buf(endpoint, max_len, &mut stack_buf) {
+                        if actual_len > 0 {
+                            mem.copy_to(buffer as usize, &stack_buf[..actual_len]);
+                        }
+                        Some(actual_len)
+                    } else {
+                        None
+                    }
+                } else if let Some(data) = self.tablet.handle_in(endpoint, max_len) {
                     let actual_len = data.len();
                     if actual_len > 0 {
                         mem.copy_to(buffer as usize, &data);
                     }
+                    Some(actual_len)
+                } else {
+                    None
+                };
+
+                if let Some(actual_len) = opt_len {
                     let actlen_field = if actual_len == 0 {
                         0x7FF
                     } else {
@@ -186,9 +202,15 @@ impl UhciState {
             0xE1 => {
                 // OUT PID (transferencia desde el host)
                 if max_len > 0 {
-                    let mut out_data = vec![0u8; max_len];
-                    mem.copy_from(buffer as usize, &mut out_data);
-                    self.tablet.handle_out(endpoint, &out_data);
+                    if max_len <= 64 {
+                        let mut stack_buf = [0u8; 64];
+                        mem.copy_from(buffer as usize, &mut stack_buf[..max_len]);
+                        self.tablet.handle_out(endpoint, &stack_buf[..max_len]);
+                    } else {
+                        let mut out_data = vec![0u8; max_len];
+                        mem.copy_from(buffer as usize, &mut out_data);
+                        self.tablet.handle_out(endpoint, &out_data);
+                    }
                 } else {
                     self.tablet.handle_out(endpoint, &[]);
                 }
@@ -314,24 +336,28 @@ impl UhciState {
 /// el DeviceBus (que despacha los accesos I/O).
 pub struct UsbUhci {
     pub state: Arc<Mutex<UhciState>>,
+    pub cached_iobase: std::sync::atomic::AtomicU16,
 }
 
 impl UsbUhci {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(UhciState::default())),
+            cached_iobase: std::sync::atomic::AtomicU16::new(0),
         }
     }
 
     /// Notificado por PciBus cuando SeaBIOS escribe al BAR4 del dispositivo USB.
     #[allow(dead_code)]
     pub fn set_iobase(&self, base: u16) {
+        self.cached_iobase.store(base, std::sync::atomic::Ordering::Relaxed);
         let mut s = self.state.lock().unwrap();
         s.iobase = base;
     }
 
     /// Reset del controlador (reset del chipset): vuelve al estado inicial.
     pub fn reset(&self) {
+        self.cached_iobase.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut s = self.state.lock().unwrap();
         *s = UhciState::default();
     }
@@ -339,7 +365,7 @@ impl UsbUhci {
     /// Devuelve el I/O base actual (0 = no asignado).
     #[allow(dead_code)]
     pub fn iobase(&self) -> u16 {
-        self.state.lock().unwrap().iobase
+        self.cached_iobase.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ejecuta un tick del scheduler UHCI.
@@ -360,10 +386,22 @@ impl UsbUhci {
         s.take_irq_pulse()
     }
 
+    /// Consume el pulso de interrupción y consulta el nivel de línea en una sola adquisición del lock.
+    pub fn poll_irq(&self) -> (bool, bool) {
+        let mut s = self.state.lock().unwrap();
+        (s.take_irq_pulse(), s.is_irq_asserted())
+    }
+
     /// Inyecta un evento en la tableta USB.
     pub fn inject_tablet_event(&self, x: u16, y: u16, buttons: u8, wheel: i8) {
         let mut s = self.state.lock().unwrap();
         s.inject_tablet_event(x, y, buttons, wheel);
+    }
+
+    /// Comprueba si el SO huésped ha completado la configuración del descriptor USB de la tableta.
+    pub fn is_tablet_configured(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.tablet.configured
     }
 }
 
@@ -374,12 +412,10 @@ impl Default for UsbUhci {
 }
 
 impl IoDevice for UsbUhci {
+    #[inline]
     fn matches_port(&self, port: u16) -> bool {
-        let s = self.state.lock().unwrap();
-        if s.iobase == 0 {
-            return false;
-        }
-        port >= s.iobase && port < s.iobase + 0x20
+        let base = self.cached_iobase.load(std::sync::atomic::Ordering::Relaxed);
+        base != 0 && port >= base && port < base + 0x20
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {

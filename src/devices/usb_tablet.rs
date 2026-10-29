@@ -187,7 +187,24 @@ impl UsbTablet {
             wheel as u8,
         ];
 
-        // Limitar la cola a 64 eventos para no saturar memoria
+        // Un puntero ABSOLUTO solo necesita el último estado: si el último
+        // reporte pendiente es un simple movimiento con los mismos botones,
+        // se sobrescribe en lugar de encolar. Así el guest nunca reproduce
+        // posiciones viejas (era lo que hacía que el cursor "persiguiera" al
+        // físico tras un tirón) y la cola no crece si el guest no sondea.
+        if wheel == 0 {
+            if let Some(last) = self.events.back_mut() {
+                let same_buttons = last[0] == report[0];
+                let last_is_plain_move = last[5] == 0;
+                if same_buttons && last_is_plain_move {
+                    *last = report;
+                    return;
+                }
+            }
+        }
+
+        // Limitar la cola a 64 eventos para no saturar memoria (con la
+        // coalescencia de arriba solo crece en flancos de botón o rueda).
         if self.events.len() >= 64 {
             self.events.pop_front();
         }
@@ -346,6 +363,45 @@ impl UsbTablet {
         true
     }
 
+    /// Procesa una transferencia IN escribiendo directamente en `dst` sin asignar en el heap.
+    /// Devuelve `Some(bytes_escritos)` o `None` si no hay datos pendientes (NAK).
+    pub fn handle_in_buf(&mut self, endpoint: u8, max_len: usize, dst: &mut [u8]) -> Option<usize> {
+        let cap = max_len.min(dst.len());
+        match endpoint {
+            // Endpoint 0: Fase de datos o estado de control
+            0 => {
+                if self.ctrl_offset >= self.ctrl_response.len() {
+                    if self.pending_address != 0 {
+                        self.address = self.pending_address;
+                        self.pending_address = 0;
+                    }
+                    return Some(0);
+                }
+                let remaining = self.ctrl_response.len() - self.ctrl_offset;
+                let chunk_len = remaining.min(cap);
+                dst[..chunk_len]
+                    .copy_from_slice(&self.ctrl_response[self.ctrl_offset..self.ctrl_offset + chunk_len]);
+                self.ctrl_offset += chunk_len;
+                if self.ctrl_offset >= self.ctrl_response.len() && self.pending_address != 0 {
+                    self.address = self.pending_address;
+                    self.pending_address = 0;
+                }
+                Some(chunk_len)
+            }
+            // Endpoint 1: Endpoint de interrupción para reportes de entrada
+            1 => {
+                if let Some(report) = self.events.pop_front() {
+                    let len = report.len().min(cap);
+                    dst[..len].copy_from_slice(&report[..len]);
+                    Some(len)
+                } else {
+                    None // NAK: no hay nuevos eventos pendientes
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Procesa una transferencia IN en el endpoint especificado.
     /// Devuelve los bytes a transferir al host, o None si no hay datos (NAK).
     pub fn handle_in(&mut self, endpoint: u8, max_len: usize) -> Option<Vec<u8>> {
@@ -421,6 +477,34 @@ mod tests {
         let data = tablet.handle_in(0, 74).unwrap();
         assert_eq!(data.len(), 74);
         assert_eq!(data[0], 0x05); // Usage Page
+    }
+
+    /// El puntero absoluto debe entregar SOLO la última posición: encolar los
+    /// movimientos intermedios hacía que el guest los reprodujera (cursor
+    /// "persiguiendo" al físico) y acumulaba retraso si no sondeaba.
+    #[test]
+    fn test_tablet_coalesces_consecutive_moves() {
+        let mut tablet = UsbTablet::new();
+        tablet.inject_event(100, 200, 0, 0);
+        tablet.inject_event(150, 250, 0, 0);
+        tablet.inject_event(200, 300, 0, 0);
+
+        let report = tablet.handle_in(1, 8).unwrap();
+        assert_eq!(u16::from_le_bytes([report[1], report[2]]), 200);
+        assert_eq!(u16::from_le_bytes([report[3], report[4]]), 300);
+        // No quedan posiciones viejas pendientes.
+        assert!(!tablet.has_pending_events());
+
+        // Un cambio de botón sí se encola aparte (flanco press/release).
+        tablet.inject_event(200, 300, 1, 0);
+        assert!(tablet.has_pending_events());
+        assert_eq!(tablet.handle_in(1, 8).unwrap()[0], 1);
+
+        // La rueda tampoco se fusiona con un movimiento.
+        tablet.inject_event(210, 310, 1, -1);
+        tablet.inject_event(220, 320, 1, 0);
+        assert!(tablet.has_pending_events());
+        assert_eq!(tablet.handle_in(1, 8).unwrap()[5], (-1i8) as u8);
     }
 
     #[test]

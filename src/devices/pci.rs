@@ -182,6 +182,8 @@ pub struct PciBus {
     pub last_vga_mmio_bar_write: Option<u32>,
     /// Última asignación detectada de BAR4 del controlador IDE PIIX3 (dev 1:1, BMDMA)
     pub last_ide_bmdma_bar_write: Option<u16>,
+    /// Última asignación detectada de BAR4 del controlador USB UHCI (dev 1:2, I/O 32 bytes)
+    pub last_usb_bar_write: Option<u16>,
     /// Última asignación detectada de BAR5 del controlador SATA AHCI (dev 5:0, MMIO 4 KiB)
     pub last_ahci_bar_write: Option<u32>,
     /// VMMDev state compartido (VirtualBox Guest Additions)
@@ -196,6 +198,12 @@ pub struct PciBus {
     pub last_ac97_nam_bar_write: Option<u16>,
     /// Última asignación detectada de BAR1 de AC'97 (dev 7:0, NABMBAR 64 bytes)
     pub last_ac97_nabm_bar_write: Option<u16>,
+    /// e1000 State compartido
+    e1000: Option<Arc<Mutex<super::e1000::E1000State>>>,
+    /// Última asignación detectada de BAR0 de e1000 (dev 8:0, MMIO 128 KiB)
+    pub last_e1000_mmio_bar_write: Option<u32>,
+    /// Última asignación detectada de BAR1 de e1000 (dev 8:0, I/O 64 bytes)
+    pub last_e1000_io_bar_write: Option<u16>,
 }
 
 impl PciBus {
@@ -213,11 +221,15 @@ impl PciBus {
             last_vga_lfb_bar_write: None,
             last_vga_mmio_bar_write: None,
             last_ide_bmdma_bar_write: None,
+            last_usb_bar_write: None,
             last_ahci_bar_write: None,
             last_vmmdev_io_bar_write: None,
             last_vmmdev_mmio_bar_write: None,
             last_ac97_nam_bar_write: None,
             last_ac97_nabm_bar_write: None,
+            e1000: None,
+            last_e1000_mmio_bar_write: None,
+            last_e1000_io_bar_write: None,
         }
     }
 
@@ -326,6 +338,22 @@ impl PciBus {
         5 // Default IRQ 5 (Standard PC Audio IRQ)
     }
 
+    /// Conecta el estado compartido del controlador Intel PRO/1000 (e1000)
+    pub fn connect_e1000(&mut self, state: Arc<Mutex<super::e1000::E1000State>>) {
+        self.e1000 = Some(state);
+    }
+
+    /// Devuelve la línea IRQ asignada a Intel e1000 (dev 8:0).
+    pub fn e1000_irq_line(&self) -> u8 {
+        if let Some(dev) = self.devices[8][0].as_ref() {
+            let irq = dev.config_regs[0x3C];
+            if irq != 0 && irq != 0xFF {
+                return irq;
+            }
+        }
+        11 // Default IRQ 11
+    }
+
     /// Registra un dispositivo en un slot/función específicos.
     pub fn add_device(&mut self, slot: usize, function: usize, dev: PciDevice) {
         eprintln!(
@@ -391,6 +419,8 @@ impl PciBus {
         let mut vmmdev_new_mmio_base: Option<u32> = None;
         let mut ac97_new_nam_iobase: Option<u16> = None;
         let mut ac97_new_nabm_iobase: Option<u16> = None;
+        let mut e1000_new_mmio_base: Option<u32> = None;
+        let mut e1000_new_iobase: Option<u16> = None;
         let mut vga_bar_write: Option<(u8, u32)> = None; // (tarea 1: reg_off, base)
 
         if let Some(dev) = self.device_at_mut(addr) {
@@ -551,6 +581,33 @@ impl PciBus {
                     }
                 }
             }
+            // Detect writes to Intel e1000 (device 8, function 0)
+            if dev_num == 8 && fn_num == 0 {
+                // BAR0 (reg 0x10): MMIO 128 KiB
+                if byte_off >= 0x10 && byte_off < 0x14 {
+                    let raw_bar = (dev.config_regs[0x10] as u32)
+                        | ((dev.config_regs[0x11] as u32) << 8)
+                        | ((dev.config_regs[0x12] as u32) << 16)
+                        | ((dev.config_regs[0x13] as u32) << 24);
+                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) == 0 {
+                        let base = raw_bar & 0xFFFE_0000;
+                        e1000_new_mmio_base = Some(base);
+                    }
+                }
+                // BAR1 (reg 0x14): I/O space 64 bytes
+                if byte_off >= 0x14 && byte_off < 0x18 {
+                    let raw_bar = (dev.config_regs[0x14] as u32)
+                        | ((dev.config_regs[0x15] as u32) << 8)
+                        | ((dev.config_regs[0x16] as u32) << 16)
+                        | ((dev.config_regs[0x17] as u32) << 24);
+                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) != 0 {
+                        let iobase = (raw_bar & 0xFFC0) as u16;
+                        if iobase != 0 && iobase >= 0x400 {
+                            e1000_new_iobase = Some(iobase);
+                        }
+                    }
+                }
+            }
         }
         // Apply side-effects after mutable borrow on dev is released
         if let Some((reg_off, base)) = vga_bar_write {
@@ -568,6 +625,7 @@ impl PciBus {
             eprintln!("[PCI] IDE BMDMA I/O base: 0x{:04X} (dev 1:1 BAR4)", new_base);
         }
         if let Some(new_base) = usb_new_iobase {
+            self.last_usb_bar_write = Some(new_base);
             if let Some(ref usb_state) = self.usb_uhci {
                 let mut state = usb_state.lock().unwrap();
                 if state.iobase != new_base {
@@ -635,6 +693,26 @@ impl PciBus {
                 if state.nabmbar != new_base {
                     state.nabmbar = new_base;
                     eprintln!("[PCI] AC'97 NABMBAR I/O base: 0x{:04X} (dev 7:0 BAR1)", new_base);
+                }
+            }
+        }
+        if let Some(new_base) = e1000_new_mmio_base {
+            self.last_e1000_mmio_bar_write = Some(new_base);
+            if let Some(ref e_state) = self.e1000 {
+                let mut state = e_state.lock().unwrap();
+                if state.mmio_base != new_base {
+                    state.mmio_base = new_base;
+                    eprintln!("[PCI] Intel e1000 MMIO base: 0x{:08X} (dev 8:0 BAR0)", new_base);
+                }
+            }
+        }
+        if let Some(new_base) = e1000_new_iobase {
+            self.last_e1000_io_bar_write = Some(new_base);
+            if let Some(ref e_state) = self.e1000 {
+                let mut state = e_state.lock().unwrap();
+                if state.iobase != new_base {
+                    state.iobase = new_base;
+                    eprintln!("[PCI] Intel e1000 I/O base: 0x{:04X} (dev 8:0 BAR1)", new_base);
                 }
             }
         }
@@ -713,7 +791,15 @@ impl PciBus {
         self.last_acpi_config_write = None;
         self.last_vga_lfb_bar_write = None;
         self.last_vga_mmio_bar_write = None;
+        self.last_ide_bmdma_bar_write = None;
+        self.last_usb_bar_write = None;
         self.last_ahci_bar_write = None;
+        self.last_vmmdev_io_bar_write = None;
+        self.last_vmmdev_mmio_bar_write = None;
+        self.last_ac97_nam_bar_write = None;
+        self.last_ac97_nabm_bar_write = None;
+        self.last_e1000_mmio_bar_write = None;
+        self.last_e1000_io_bar_write = None;
         self.devices = vec![vec![None; 8]; 32];
         self.populate_legacy_devices();
     }
@@ -758,23 +844,27 @@ impl PciBus {
         isa.config_regs[0x63] = 11;
         self.add_device(1, 0, isa);
 
-        // Function 1: IDE Controller (PIIX3)
-        // prog_if 0x80 = Legacy compatibility mode (canales fijos en ISA 0x1F0 y 0x170),
-        // con soporte Bus Master DMA (bit 7 = 1)
-        let mut ide = PciDevice::new(0x8086, 0x7010, 0x01, 0x01, 0x80);
-        ide.revision = 0x00;
+        // Function 1: IDE Controller (Intel PIIX4 8086:7111 - Estándar VirtualBox)
+        // prog_if 0x8A = Soporte Bus Master DMA + canales primario y secundario en modo compatibilidad ISA (0x1F0 y 0x170)
+        let mut ide = PciDevice::new(0x8086, 0x7111, 0x01, 0x01, 0x8A);
+        ide.revision = 0x01; // PIIX4E
         // BAR4 (reg 0x20): Bus master I/O, 16 bytes → mask 0xFFFF_FFF1
         ide.set_bar_mask(0x20, 0xFFFF_FFF1);
         ide.config_regs[0x20] = 0x01;
         ide.config_regs[0x21] = 0xC0; // default 0xC001
+        // Habilitar decodificación de puertos ISA IDE 0x1F0 y 0x170 (IDETIM bit 15 = 1, DevATA.cpp:7994)
+        ide.config_regs[0x40] = 0x11;
+        ide.config_regs[0x41] = 0x80; // 0x8011: IDE0 decode enable + fast timing
+        ide.config_regs[0x42] = 0x11;
+        ide.config_regs[0x43] = 0x80; // 0x8011: IDE1 decode enable + fast timing
         self.add_device(1, 1, ide);
 
-        // Function 2: USB UHCI
-        let mut usb = PciDevice::new(0x8086, 0x7020, 0x0C, 0x03, 0x00);
-        usb.revision = 0x00;
-        usb.interrupt_pin = 0x04; // INTD# (PIIX3 USB)
+        // Function 2: USB UHCI (Intel 82371AB/EB/MB PIIX4 USB Controller 8086:7112)
+        let mut usb = PciDevice::new(0x8086, 0x7112, 0x0C, 0x03, 0x00);
+        usb.revision = 0x01;
+        usb.interrupt_pin = 0x04; // INTD# (PIIX4 USB)
         usb.config_regs[0x3D] = 0x04; // Interrupt Pin INTD#
-        usb.config_regs[0x3C] = 11;   // Default IRQ line 11 (PIIX3 PIRQD)
+        usb.config_regs[0x3C] = 11;   // Default IRQ line 11 (PIIX4 PIRQD)
         // BAR4 (reg 0x20): I/O, 32 bytes → mask 0xFFFFFFE1
         usb.set_bar_mask(0x20, 0xFFFFFFE1);
         self.add_device(1, 2, usb);
@@ -829,6 +919,29 @@ impl PciBus {
         // ── Device 5: Intel ICH8M AHCI Controller (8086:2829) ──
         let mut ahci = PciDevice::new(0x8086, 0x2829, 0x01, 0x06, 0x01);
         ahci.revision = 0x02;
+        ahci.status = 0x0010; // Capabilities List present (bit 4)
+        ahci.config_regs[0x06] = 0x10;
+        ahci.config_regs[0x34] = 0x70; // Cap Pointer -> 0x70
+
+        // Cap 0x70: Power Management
+        ahci.config_regs[0x70] = 0x01; // PCI Power Management
+        ahci.config_regs[0x71] = 0xA8; // Next Cap -> 0xA8
+        ahci.config_regs[0x72] = 0x03;
+
+        // Registros Propietarios Intel ICH8M (DevAHCI.cpp:5791-5795)
+        ahci.config_regs[0x90] = 0x40; // MAP: Sub-Class Code = AHCI Mode (Requerido por msahci.sys)
+        ahci.config_regs[0x92] = 0x3F; // PCS: Puertos 0-5 habilitados
+        ahci.config_regs[0x94] = 0x80;
+        ahci.config_regs[0x95] = 0x01;
+        ahci.config_regs[0x97] = 0x78;
+
+        // Cap 0xA8: SATA Capabilities (SATACR)
+        ahci.config_regs[0xA8] = 0x12; // SATA Cap ID
+        ahci.config_regs[0xA9] = 0x00; // Fin de lista
+        ahci.config_regs[0xAA] = 0x10; // Revision 1.0
+        ahci.config_regs[0xAB] = 0x00;
+        ahci.config_regs[0xAC] = 0x28; // SATACR1: BAR5 en offset 0x24
+
         ahci.interrupt_pin = 0x01; // INTA#
         ahci.config_regs[0x2C] = 0x86; // Subsystem Vendor ID low (Intel)
         ahci.config_regs[0x2D] = 0x80; // Subsystem Vendor ID high
@@ -871,6 +984,22 @@ impl PciBus {
         // BAR1 (reg 0x14): NABMBAR 64 bytes I/O space -> mask 0xFFFF_FFC1
         ac97.set_bar_mask(0x14, 0xFFFF_FFC1);
         self.add_device(7, 0, ac97);
+
+        // ── Device 8: Intel PRO/1000 MT Desktop (82540EM / e1000: 8086:100E) ──
+        let mut e1000 = PciDevice::new(0x8086, 0x100E, 0x02, 0x00, 0x00);
+        e1000.revision = 0x03;
+        e1000.interrupt_pin = 0x01; // INTA#
+        e1000.config_regs[0x2C] = 0x86; // Subsystem Vendor ID low (Intel)
+        e1000.config_regs[0x2D] = 0x80; // Subsystem Vendor ID high
+        e1000.config_regs[0x2E] = 0x0E; // Subsystem Device ID low (82540EM)
+        e1000.config_regs[0x2F] = 0x10; // Subsystem Device ID high
+        e1000.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
+        e1000.config_regs[0x3C] = 11;   // Default IRQ line 11
+        // BAR0 (reg 0x10): 128 KiB MMIO -> mask 0xFFFE_0000
+        e1000.set_bar_mask(0x10, 0xFFFE_0000);
+        // BAR1 (reg 0x14): 64 bytes I/O space -> mask 0xFFFF_FFC1
+        e1000.set_bar_mask(0x14, 0xFFFF_FFC1);
+        self.add_device(8, 0, e1000);
     }
 }
 
@@ -892,12 +1021,12 @@ mod tests {
         let device = u16::from_le_bytes([id[2], id[3]]);
         assert_eq!((vendor, device), (0x8086, 0x7000));
 
-        // Read func 1 of device 1
+        // Read func 1 of device 1 (PIIX4 IDE Controller 8086:7111 como en VirtualBox)
         set_addr(&mut bus, 0x8000_0800 | (1 << 11) | (1 << 8));
         let id = bus.read(PORT_DATA, 4);
         let vendor = u16::from_le_bytes([id[0], id[1]]);
         let device = u16::from_le_bytes([id[2], id[3]]);
-        assert_eq!((vendor, device), (0x8086, 0x7010));
+        assert_eq!((vendor, device), (0x8086, 0x7111));
     }
 
     #[test]

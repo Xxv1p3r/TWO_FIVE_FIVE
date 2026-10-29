@@ -11,7 +11,10 @@
 //! - BAR1 (NABMBAR): 64 bytes de espacio I/O para Bus Master DMA (streams
 //!   PCM In, PCM Out, Mic In y registros de control/estado global).
 
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use crate::guest_mem::GuestMemory;
 
 // ─── Identificadores PCI ─────────────────────────────────────────────────────
@@ -287,28 +290,294 @@ impl Ac97State {
     }
 }
 
+/// Trait para el destino de audio (sink) del controlador AC'97.
+pub trait AudioSink: Send + Sync {
+    /// Escribe datos de audio PCM (16 bits con signo, estéreo little-endian, 4 bytes por muestra).
+    fn write_audio(&self, pcm_data: &[u8], sample_rate: u32);
+}
+
+/// Paquete de audio encolado hacia el hilo de reproducción host.
+struct AudioChunk {
+    data: Vec<u8>,
+    sample_rate: u32,
+}
+
+/// Salida de audio host no bloqueante para el controlador AC'97.
+///
+/// Gestiona un hilo en segundo plano que redirige las muestras de audio PCM
+/// crudo hacia un proceso host `aplay` mediante stdin (o las descarta limpiamente
+/// si `aplay` no está disponible o el buffer se satura), garantizando que el vCPU nunca se bloquee.
+pub struct Ac97AudioOutput {
+    tx: SyncSender<AudioChunk>,
+    _worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Ac97AudioOutput {
+    pub const QUEUE_CAPACITY: usize = 64;
+
+    pub fn new() -> Self {
+        let (tx, rx) = sync_channel::<AudioChunk>(Self::QUEUE_CAPACITY);
+        let worker = std::thread::Builder::new()
+            .name("ac97-audio".to_string())
+            .spawn(move || {
+                Self::audio_thread_loop(rx);
+            })
+            .ok();
+
+        Self {
+            tx,
+            _worker: worker,
+        }
+    }
+
+    /// Salida de audio nula (descarta todas las muestras inmediatamente).
+    pub fn null() -> Self {
+        let (tx, rx) = sync_channel::<AudioChunk>(Self::QUEUE_CAPACITY);
+        let worker = std::thread::Builder::new()
+            .name("ac97-null".to_string())
+            .spawn(move || {
+                while let Ok(_) = rx.recv() {}
+            })
+            .ok();
+
+        Self {
+            tx,
+            _worker: worker,
+        }
+    }
+
+    fn audio_thread_loop(rx: Receiver<AudioChunk>) {
+        let mut child: Option<Child> = None;
+        let mut current_rate = 0u32;
+        let mut last_spawn_attempt = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+
+        while let Ok(chunk) = rx.recv() {
+            let rate = if chunk.sample_rate == 0 {
+                48000
+            } else {
+                chunk.sample_rate
+            };
+
+            // Si cambió la frecuencia de muestreo y aplay está corriendo, reiniciarlo
+            if child.is_some() && current_rate != rate {
+                if let Some(mut c) = child.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+
+            // Si no hay proceso aplay activo, intentar lanzarlo con backoff de 1.5s
+            if child.is_none() {
+                if last_spawn_attempt.elapsed() >= Duration::from_millis(1500) {
+                    last_spawn_attempt = Instant::now();
+                    let spawn_res = Command::new("aplay")
+                        .args(&[
+                            "-q",
+                            "-t",
+                            "raw",
+                            "-f",
+                            "S16_LE",
+                            "-c",
+                            "2",
+                            "-r",
+                            &rate.to_string(),
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+
+                    match spawn_res {
+                        Ok(c) => {
+                            child = Some(c);
+                            current_rate = rate;
+                        }
+                        Err(_) => {
+                            // aplay no disponible en el host; se descartan muestras sin bloquear
+                        }
+                    }
+                }
+            }
+
+            // Escribir datos PCM a través de stdin si aplay está disponible
+            if let Some(ref mut c) = child {
+                let write_failed = if let Some(ref mut stdin) = c.stdin {
+                    use std::io::Write;
+                    stdin.write_all(&chunk.data).is_err()
+                } else {
+                    true
+                };
+
+                if write_failed {
+                    if let Some(mut old_c) = child.take() {
+                        let _ = old_c.kill();
+                        let _ = old_c.wait();
+                    }
+                }
+            }
+        }
+
+        // Limpieza final de proceso aplay al cerrar el canal
+        if let Some(mut c) = child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl AudioSink for Ac97AudioOutput {
+    fn write_audio(&self, pcm_data: &[u8], sample_rate: u32) {
+        let chunk = AudioChunk {
+            data: pcm_data.to_vec(),
+            sample_rate,
+        };
+        // Non-blocking: try_send descarta inmediatamente si la cola está llena
+        let _ = self.tx.try_send(chunk);
+    }
+}
+
+/// Sink de audio en memoria para pruebas unitarias.
+#[derive(Default)]
+pub struct MockAudioSink {
+    pub captured: Mutex<Vec<u8>>,
+    pub sample_rates: Mutex<Vec<u32>>,
+    pub chunk_count: std::sync::atomic::AtomicUsize,
+}
+
+impl MockAudioSink {
+    pub fn new() -> Self {
+        Self {
+            captured: Mutex::new(Vec::new()),
+            sample_rates: Mutex::new(Vec::new()),
+            chunk_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn captured_data(&self) -> Vec<u8> {
+        self.captured.lock().unwrap().clone()
+    }
+
+    pub fn captured_sample_rates(&self) -> Vec<u32> {
+        self.sample_rates.lock().unwrap().clone()
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn clear(&self) {
+        self.captured.lock().unwrap().clear();
+        self.sample_rates.lock().unwrap().clear();
+        self.chunk_count.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl AudioSink for MockAudioSink {
+    fn write_audio(&self, pcm_data: &[u8], sample_rate: u32) {
+        self.captured.lock().unwrap().extend_from_slice(pcm_data);
+        self.sample_rates.lock().unwrap().push(sample_rate);
+        self.chunk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Aplica atenuación de volumen y mute según los registros de volumen AC'97 (Master y PCM Out).
+pub fn apply_ac97_volume(pcm_data: &mut [u8], master_vol: u16, pcm_vol: u16) {
+    let master_muted = (master_vol & 0x8000) != 0;
+    let pcm_muted = (pcm_vol & 0x8000) != 0;
+    if master_muted || pcm_muted {
+        pcm_data.fill(0);
+        return;
+    }
+
+    let ml = (master_vol & 0x3F) as f32;
+    let mr = ((master_vol >> 8) & 0x3F) as f32;
+    let pl = (pcm_vol & 0x1F) as f32;
+    let pr = ((pcm_vol >> 8) & 0x1F) as f32;
+
+    if ml == 0.0 && mr == 0.0 && pl == 0.0 && pr == 0.0 {
+        return;
+    }
+
+    let factor_l = (1.0 - (ml / 63.0)).max(0.0) * (1.0 - (pl / 31.0)).max(0.0);
+    let factor_r = (1.0 - (mr / 63.0)).max(0.0) * (1.0 - (pr / 31.0)).max(0.0);
+
+    for sample in pcm_data.chunks_exact_mut(4) {
+        let left = i16::from_le_bytes([sample[0], sample[1]]);
+        let right = i16::from_le_bytes([sample[2], sample[3]]);
+
+        let new_left = ((left as f32) * factor_l) as i16;
+        let new_right = ((right as f32) * factor_r) as i16;
+
+        sample[0..2].copy_from_slice(&new_left.to_le_bytes());
+        sample[2..4].copy_from_slice(&new_right.to_le_bytes());
+    }
+}
+
 /// Dispositivo AC'97 conectado a los puertos de I/O
 pub struct Ac97Device {
     pub state: Arc<Mutex<Ac97State>>,
+    pub audio_sink: Arc<dyn AudioSink>,
+    pub cached_nambar: u16,
+    pub cached_nabmbar: u16,
 }
 
 impl Ac97Device {
     pub fn new(state: Arc<Mutex<Ac97State>>) -> Self {
-        Self { state }
+        let (cached_nambar, cached_nabmbar) = {
+            let s = state.lock().unwrap();
+            (s.nambar, s.nabmbar)
+        };
+        Self {
+            state,
+            audio_sink: Arc::new(Ac97AudioOutput::new()),
+            cached_nambar,
+            cached_nabmbar,
+        }
+    }
+
+    pub fn with_sink(state: Arc<Mutex<Ac97State>>, audio_sink: Arc<dyn AudioSink>) -> Self {
+        let (cached_nambar, cached_nabmbar) = {
+            let s = state.lock().unwrap();
+            (s.nambar, s.nabmbar)
+        };
+        Self {
+            state,
+            audio_sink,
+            cached_nambar,
+            cached_nabmbar,
+        }
+    }
+
+    pub fn set_audio_sink(&mut self, audio_sink: Arc<dyn AudioSink>) {
+        self.audio_sink = audio_sink;
+    }
+
+    pub fn audio_sink(&self) -> &Arc<dyn AudioSink> {
+        &self.audio_sink
+    }
+
+    pub fn process_stream(&mut self, stream_idx: usize, mem: &GuestMemory) {
+        let mut state = self.state.lock().unwrap();
+        Self::process_dma_stream(stream_idx, &mut state, mem, &self.audio_sink);
+        state.update_irq();
     }
 
     pub fn set_nambar(&mut self, base: u16) {
+        self.cached_nambar = base;
         self.state.lock().unwrap().nambar = base;
     }
 
     pub fn set_nabmbar(&mut self, base: u16) {
+        self.cached_nabmbar = base;
         self.state.lock().unwrap().nabmbar = base;
     }
 
+    #[inline]
     pub fn matches_port(&self, port: u16) -> bool {
-        let state = self.state.lock().unwrap();
-        let nam = state.nambar;
-        let nabm = state.nabmbar;
+        let nam = self.cached_nambar;
+        let nabm = self.cached_nabmbar;
         (nam != 0 && port >= nam && port < nam + 256) || (nabm != 0 && port >= nabm && port < nabm + 64)
     }
 
@@ -505,12 +774,27 @@ impl Ac97Device {
                                 if state.streams[st_idx].sr & AC97_SR_CELV != 0 {
                                     state.streams[st_idx].sr &= !(AC97_SR_DCH | AC97_SR_CELV);
                                 }
+                                if (state.streams[st_idx].cr & AC97_CR_RPBM) != 0 && (state.streams[st_idx].sr & AC97_SR_DCH) == 0 {
+                                    if let Some(guest_mem) = mem {
+                                        Self::process_dma_stream(st_idx, &mut state, guest_mem, &self.audio_sink);
+                                        state.update_irq();
+                                    }
+                                }
                             }
                             NABM_REG_SR => {
                                 // Status register: CELV (bit 1) y DCH (bit 0) son Read-Only. Solo FIFOE | BCIS | LVBCI (bits 4, 3, 2) son W1C.
                                 let clear_mask = (val as u16) & AC97_SR_WCLEAR_MASK;
                                 state.streams[st_idx].sr &= !clear_mask;
                                 state.update_irq();
+
+                                if (state.streams[st_idx].cr & AC97_CR_RPBM) != 0
+                                    && (state.streams[st_idx].sr & (AC97_SR_DCH | AC97_SR_CELV)) == 0
+                                {
+                                    if let Some(guest_mem) = mem {
+                                        Self::process_dma_stream(st_idx, &mut state, guest_mem, &self.audio_sink);
+                                        state.update_irq();
+                                    }
+                                }
                             }
                             NABM_REG_CR => {
                                 let cr = val as u8;
@@ -525,7 +809,7 @@ impl Ac97Device {
                                         state.streams[st_idx].sr &= !AC97_SR_DCH;
                                         // Ejecutar DMA para avanzar el stream
                                         if let Some(guest_mem) = mem {
-                                            Self::process_dma_stream(&mut state.streams[st_idx], guest_mem);
+                                            Self::process_dma_stream(st_idx, &mut state, guest_mem, &self.audio_sink);
                                             state.update_irq();
                                         }
                                     } else if !now_running {
@@ -544,8 +828,22 @@ impl Ac97Device {
     }
 
     /// Procesa la lista de descriptores de buffer DMA de un stream
-    fn process_dma_stream(st: &mut Ac97Stream, mem: &GuestMemory) {
-        if st.bdbar == 0 || (st.cr & AC97_CR_RPBM) == 0 {
+    fn process_dma_stream(
+        st_idx: usize,
+        state: &mut Ac97State,
+        mem: &GuestMemory,
+        sink: &Arc<dyn AudioSink>,
+    ) {
+        if st_idx >= 3 {
+            return;
+        }
+
+        let (bdbar, civ, lvi, cr, sr) = {
+            let st = &state.streams[st_idx];
+            (st.bdbar, st.civ, st.lvi, st.cr, st.sr)
+        };
+
+        if bdbar == 0 || (cr & AC97_CR_RPBM) == 0 || (sr & AC97_SR_DCH) != 0 {
             return;
         }
 
@@ -553,7 +851,7 @@ impl Ac97Device {
         // - 0..4: Dirección física de muestras (GPA)
         // - 4..6: Número de muestras (16 bits)
         // - 6..8: Banderas (bit 15 = IOC, bit 14 = BUP)
-        let bd_addr = st.bdbar as u64 + (st.civ as u64) * 8;
+        let bd_addr = bdbar as u64 + (civ as u64) * 8;
         let mut entry = [0u8; 8];
         if mem.read_bytes(bd_addr, &mut entry).is_ok() {
             let buf_addr = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
@@ -562,7 +860,25 @@ impl Ac97Device {
             let ioc = (flags & 0x8000) != 0;
 
             if buf_addr != 0 && samples > 0 {
-                // Buffer válido: se procesa
+                // Buffer válido: si es Stream 1 (PO - PCM Output), enviar audio al sink
+                if st_idx == 1 {
+                    // Cada muestra estéreo S16_LE son 4 bytes (2 canales * 2 bytes)
+                    let total_bytes = (samples as usize) * 4;
+                    let mut pcm_buf = vec![0u8; total_bytes];
+                    if mem.read_bytes(buf_addr as u64, &mut pcm_buf).is_ok() {
+                        let sample_rate = {
+                            let rate = state.mixer[(AC97_PCM_FRONT_DAC_RATE / 2) as usize] as u32;
+                            if rate == 0 {
+                                48000
+                            } else {
+                                rate
+                            }
+                        };
+                        sink.write_audio(&pcm_buf, sample_rate);
+                    }
+                }
+
+                let st = &mut state.streams[st_idx];
                 st.picb = samples;
 
                 // Si IOC (Interrupt On Completion) está activado en el descriptor:
@@ -571,11 +887,11 @@ impl Ac97Device {
                 }
 
                 // Avanzar índice circular CIV
-                if st.civ == st.lvi {
+                if civ == lvi {
                     // Alcanzó el último buffer válido: detener DMA
                     st.sr |= AC97_SR_CELV | AC97_SR_LVBCI | AC97_SR_DCH;
                 } else {
-                    st.civ = (st.civ + 1) % 32;
+                    st.civ = (civ + 1) % 32;
                 }
             }
         }
@@ -621,7 +937,7 @@ mod tests {
         dev.set_nambar(0xE000);
         dev.set_nabmbar(0xE100);
 
-        let mut raw_mem = vec![0u8; 8192];
+        let mut raw_mem = vec![0u8; 16384];
         let guest_mem = GuestMemory::new(raw_mem.as_mut_ptr(), raw_mem.len());
 
         let bd_table_gpa = 0x1000u32;
@@ -774,5 +1090,222 @@ mod tests {
         assert_eq!(s.glob_sta & GLOB_STA_PCR, GLOB_STA_PCR);
         // Bit WC AC97_GS_GSCI debe haberse limpiado
         assert_eq!(s.glob_sta & AC97_GS_GSCI, 0);
+    }
+
+    #[test]
+    fn test_ac97_audio_output_pipeline_delivery() {
+        let state = Arc::new(Mutex::new(Ac97State::new()));
+        let sink = Arc::new(MockAudioSink::new());
+        let mut dev = Ac97Device::with_sink(state.clone(), sink.clone());
+        dev.set_nambar(0xE000);
+        dev.set_nabmbar(0xE100);
+
+        let mut raw_mem = vec![0u8; 16384];
+        let guest_mem = GuestMemory::new(raw_mem.as_mut_ptr(), raw_mem.len());
+
+        let bd_table_gpa = 0x2000u32;
+        let pcm_buf_gpa = 0x3000u32;
+        let samples = 256u16; // 256 samples * 4 bytes = 1024 bytes
+        let flags = 0x8000u16; // IOC = 1
+
+        // Generar un patrón PCM reconocible (256 muestras estéreo S16_LE)
+        let mut test_pcm = Vec::with_capacity(1024);
+        for i in 0..samples {
+            let left = (i as i16) * 100;
+            let right = -(i as i16) * 100;
+            test_pcm.extend_from_slice(&left.to_le_bytes());
+            test_pcm.extend_from_slice(&right.to_le_bytes());
+        }
+        let _ = guest_mem.write_bytes(pcm_buf_gpa as u64, &test_pcm);
+
+        // Escribir BDLE 0
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 0, &pcm_buf_gpa.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 4, &samples.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 6, &flags.to_le_bytes());
+
+        // Stream 1 (PO): Configurar BDBAR, LVI=0, y arrancar CR=0x11 (RPBM | IOCE)
+        dev.write(0xE110, &bd_table_gpa.to_le_bytes(), Some(&guest_mem));
+        dev.write(0xE115, &[0u8], Some(&guest_mem));
+        dev.write(0xE11B, &[0x11u8], Some(&guest_mem));
+
+        // Verificar que el sink recibió exactamente los 1024 bytes de audio
+        assert_eq!(sink.chunk_count(), 1);
+        assert_eq!(sink.captured_sample_rates(), vec![48000]);
+        assert_eq!(sink.captured_data(), test_pcm);
+
+        // Verificar estado del stream y del controlador
+        let s = state.lock().unwrap();
+        assert_eq!(s.streams[1].sr & AC97_SR_BCIS, AC97_SR_BCIS);
+        assert_eq!(s.streams[1].sr & AC97_SR_CELV, AC97_SR_CELV);
+        assert_eq!(s.streams[1].sr & AC97_SR_DCH, AC97_SR_DCH);
+        assert!(s.irq_asserted);
+    }
+
+    #[test]
+    fn test_ac97_audio_multi_buffer_playback() {
+        let state = Arc::new(Mutex::new(Ac97State::new()));
+        let sink = Arc::new(MockAudioSink::new());
+        let mut dev = Ac97Device::with_sink(state.clone(), sink.clone());
+        dev.set_nambar(0xE000);
+        dev.set_nabmbar(0xE100);
+
+        let mut raw_mem = vec![0u8; 32768];
+        let guest_mem = GuestMemory::new(raw_mem.as_mut_ptr(), raw_mem.len());
+
+        let bd_table_gpa = 0x1000u32;
+        let buf0_gpa = 0x2000u32;
+        let buf1_gpa = 0x3000u32;
+        let samples0 = 64u16;  // 256 bytes
+        let samples1 = 128u16; // 512 bytes
+
+        let pcm0 = vec![0x11u8; (samples0 as usize) * 4];
+        let pcm1 = vec![0x22u8; (samples1 as usize) * 4];
+        let _ = guest_mem.write_bytes(buf0_gpa as u64, &pcm0);
+        let _ = guest_mem.write_bytes(buf1_gpa as u64, &pcm1);
+
+        // BDLE 0
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 0, &buf0_gpa.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 4, &samples0.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 6, &0x8000u16.to_le_bytes()); // IOC
+
+        // BDLE 1
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 8, &buf1_gpa.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 12, &samples1.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 14, &0x8000u16.to_le_bytes()); // IOC
+
+        // Configurar Stream 1 (PO): BDBAR, LVI=1, CR=RPBM | IOCE (0x11)
+        dev.write(0xE110, &bd_table_gpa.to_le_bytes(), Some(&guest_mem));
+        dev.write(0xE115, &[1u8], Some(&guest_mem));
+        dev.write(0xE11B, &[0x11u8], Some(&guest_mem));
+
+        // Buffer 0 completado
+        assert_eq!(sink.chunk_count(), 1);
+        assert_eq!(sink.captured_data(), pcm0);
+
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.streams[1].civ, 1);
+            assert_eq!(s.streams[1].sr & AC97_SR_BCIS, AC97_SR_BCIS);
+            assert_eq!(s.streams[1].sr & AC97_SR_CELV, 0); // Aún no es el último
+        }
+
+        // Simular que el manejador de interrupción del SO limpia BCIS en SR
+        dev.write(0xE110 + NABM_REG_SR, &AC97_SR_BCIS.to_le_bytes(), Some(&guest_mem));
+
+        // Buffer 1 completado
+        assert_eq!(sink.chunk_count(), 2);
+        let mut expected_all = pcm0.clone();
+        expected_all.extend_from_slice(&pcm1);
+        assert_eq!(sink.captured_data(), expected_all);
+
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.streams[1].civ, 1);
+            assert_eq!(s.streams[1].sr & AC97_SR_CELV, AC97_SR_CELV);
+            assert_eq!(s.streams[1].sr & AC97_SR_DCH, AC97_SR_DCH);
+        }
+    }
+
+    #[test]
+    fn test_ac97_audio_variable_sample_rate() {
+        let state = Arc::new(Mutex::new(Ac97State::new()));
+        let sink = Arc::new(MockAudioSink::new());
+        let mut dev = Ac97Device::with_sink(state.clone(), sink.clone());
+        dev.set_nambar(0xE000);
+        dev.set_nabmbar(0xE100);
+
+        // Habilitar VRA (Variable Rate Audio) en EACS y programar 44100 Hz (0xAC44)
+        dev.write(0xE000 + AC97_EXTENDED_AUDIO_CTRL_STAT, &AC97_EACS_VRA.to_le_bytes(), None);
+        dev.write(0xE000 + AC97_PCM_FRONT_DAC_RATE, &44100u16.to_le_bytes(), None);
+
+        let mut raw_mem = vec![0u8; 16384];
+        let guest_mem = GuestMemory::new(raw_mem.as_mut_ptr(), raw_mem.len());
+
+        let bd_table_gpa = 0x1000u32;
+        let buf_gpa = 0x2000u32;
+        let samples = 100u16;
+
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 0, &buf_gpa.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 4, &samples.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 6, &0x0000u16.to_le_bytes());
+
+        dev.write(0xE110, &bd_table_gpa.to_le_bytes(), Some(&guest_mem));
+        dev.write(0xE115, &[0u8], Some(&guest_mem));
+        dev.write(0xE11B, &[0x01u8], Some(&guest_mem));
+
+        assert_eq!(sink.chunk_count(), 1);
+        assert_eq!(sink.captured_sample_rates(), vec![44100]);
+    }
+
+    #[test]
+    fn test_ac97_non_po_stream_does_not_output_audio() {
+        let state = Arc::new(Mutex::new(Ac97State::new()));
+        let sink = Arc::new(MockAudioSink::new());
+        let mut dev = Ac97Device::with_sink(state.clone(), sink.clone());
+        dev.set_nambar(0xE000);
+        dev.set_nabmbar(0xE100);
+
+        let mut raw_mem = vec![0u8; 16384];
+        let guest_mem = GuestMemory::new(raw_mem.as_mut_ptr(), raw_mem.len());
+
+        let bd_table_gpa = 0x1000u32;
+        let buf_gpa = 0x2000u32;
+        let samples = 64u16;
+
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 0, &buf_gpa.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 4, &samples.to_le_bytes());
+        let _ = guest_mem.write_bytes(bd_table_gpa as u64 + 6, &0x8000u16.to_le_bytes());
+
+        // Stream 0 (PI - PCM In): NABMBAR + 0x00
+        dev.write(0xE100, &bd_table_gpa.to_le_bytes(), Some(&guest_mem));
+        dev.write(0xE105, &[0u8], Some(&guest_mem));
+        dev.write(0xE10B, &[0x11u8], Some(&guest_mem));
+
+        // Stream 2 (MC - Mic In): NABMBAR + 0x20
+        dev.write(0xE120, &bd_table_gpa.to_le_bytes(), Some(&guest_mem));
+        dev.write(0xE125, &[0u8], Some(&guest_mem));
+        dev.write(0xE12B, &[0x11u8], Some(&guest_mem));
+
+        // El sink de PCM Out no debe haber recibido datos de streams de entrada
+        assert_eq!(sink.chunk_count(), 0);
+        assert!(sink.captured_data().is_empty());
+    }
+
+    #[test]
+    fn test_ac97_apply_volume_and_mute() {
+        // Mute Master (bit 15 = 1)
+        let mut data = vec![10, 20, 30, 40];
+        apply_ac97_volume(&mut data, 0x8000, 0x0000);
+        assert_eq!(data, vec![0, 0, 0, 0]);
+
+        // Mute PCM (bit 15 = 1)
+        let mut data2 = vec![10, 20, 30, 40];
+        apply_ac97_volume(&mut data2, 0x0000, 0x8000);
+        assert_eq!(data2, vec![0, 0, 0, 0]);
+
+        // Sin atenuación (0x0000 = 0 dB)
+        let mut data3 = vec![10, 20, 30, 40];
+        apply_ac97_volume(&mut data3, 0x0000, 0x0000);
+        assert_eq!(data3, vec![10, 20, 30, 40]);
+
+        // Con atenuación máxima
+        let mut data4 = vec![100, 0, 100, 0];
+        apply_ac97_volume(&mut data4, 0x3F3F, 0x0000);
+        assert_eq!(data4, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_ac97_audio_output_nonblocking_and_lifecycle() {
+        let output = Ac97AudioOutput::new();
+        let test_chunk = vec![0x42u8; 1024];
+
+        // Escribir múltiples chunks de audio de forma no bloqueante
+        for _ in 0..10 {
+            output.write_audio(&test_chunk, 48000);
+        }
+
+        // Null sink
+        let null_output = Ac97AudioOutput::null();
+        null_output.write_audio(&test_chunk, 44100);
     }
 }

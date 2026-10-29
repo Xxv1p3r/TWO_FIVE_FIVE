@@ -319,6 +319,10 @@ pub fn build_udp_packet(
     let final_csum = if udp_csum == 0 { 0xFFFF } else { udp_csum };
     frame[40..42].copy_from_slice(&final_csum.to_be_bytes());
 
+    if frame.len() < 60 {
+        frame.resize(60, 0);
+    }
+
     frame
 }
 
@@ -386,6 +390,10 @@ pub fn build_tcp_packet(
     let tcp_csum = ip_checksum(&pseudo);
     let final_csum = if tcp_csum == 0 { 0xFFFF } else { tcp_csum };
     frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&final_csum.to_be_bytes());
+
+    if frame.len() < 60 {
+        frame.resize(60, 0);
+    }
 
     frame
 }
@@ -501,7 +509,7 @@ fn open_tap_device(ifname: &str) -> Option<std::fs::File> {
 }
 
 // ─── Worker de Red Asíncrono en Segundo Plano ──────────────────────
-fn spawn_net_worker(
+pub fn spawn_net_worker(
     tx_receiver: mpsc::Receiver<Vec<u8>>,
     rx_sender: mpsc::Sender<Vec<u8>>,
 ) {
@@ -910,23 +918,8 @@ impl VirtioNetState {
     }
 
     fn handle_tx_frame(&mut self, frame: &[u8]) {
-        if frame.len() < 14 {
-            return;
-        }
-        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-
-        match ethertype {
-            0x0806 => {
-                if let Some(reply) = self.handle_arp(frame) {
-                    self.rx_queue.push_back(reply);
-                }
-            }
-            0x0800 => {
-                if let Some(reply) = self.handle_ipv4(frame) {
-                    self.rx_queue.push_back(reply);
-                }
-            }
-            _ => {}
+        if let Some(reply) = process_local_frame(frame) {
+            self.rx_queue.push_back(reply);
         }
 
         // Reenviar al worker para TAP o DNS upstream
@@ -934,163 +927,175 @@ impl VirtioNetState {
             let _ = tx_tx.send(frame.to_vec());
         }
     }
+}
 
-    fn handle_arp(&self, frame: &[u8]) -> Option<Vec<u8>> {
-        if frame.len() < 42 {
-            return None;
-        }
-        let opcode = u16::from_be_bytes([frame[20], frame[21]]);
-        if opcode != 1 {
-            return None;
-        }
-        let sender_mac: [u8; 6] = frame[22..28].try_into().ok()?;
-        let sender_ip: [u8; 4] = frame[28..32].try_into().ok()?;
-        let target_ip: [u8; 4] = frame[38..42].try_into().ok()?;
+pub fn process_local_frame(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    match ethertype {
+        0x0806 => handle_arp(frame),
+        0x0800 => handle_ipv4(frame),
+        _ => None,
+    }
+}
 
-        if target_ip == GATEWAY_IP || target_ip == DNS_IP {
-            crate::tui::log(&format!(
-                "[VIRTIO-NET] Solicitud ARP de {}.{}.{}.{} para {}.{}.{}.{} -> Respondiendo",
-                sender_ip[0], sender_ip[1], sender_ip[2], sender_ip[3],
-                target_ip[0], target_ip[1], target_ip[2], target_ip[3]
-            ));
-            Some(build_arp_reply(GATEWAY_MAC, target_ip, sender_mac, sender_ip))
-        } else {
-            None
+pub fn handle_arp(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 42 {
+        return None;
+    }
+    let opcode = u16::from_be_bytes([frame[20], frame[21]]);
+    if opcode != 1 {
+        return None;
+    }
+    let sender_mac: [u8; 6] = frame[22..28].try_into().ok()?;
+    let sender_ip: [u8; 4] = frame[28..32].try_into().ok()?;
+    let target_ip: [u8; 4] = frame[38..42].try_into().ok()?;
+
+    if target_ip == GATEWAY_IP || target_ip == DNS_IP {
+        crate::tui::log(&format!(
+            "[NET] Solicitud ARP de {}.{}.{}.{} para {}.{}.{}.{} -> Respondiendo",
+            sender_ip[0], sender_ip[1], sender_ip[2], sender_ip[3],
+            target_ip[0], target_ip[1], target_ip[2], target_ip[3]
+        ));
+        Some(build_arp_reply(GATEWAY_MAC, target_ip, sender_mac, sender_ip))
+    } else {
+        None
+    }
+}
+
+pub fn handle_ipv4(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 34 {
+        return None;
+    }
+    let ihl = ((frame[14] & 0x0F) * 4) as usize;
+    if frame.len() < 14 + ihl {
+        return None;
+    }
+    let protocol = frame[23];
+    let dst_ip: [u8; 4] = frame[30..34].try_into().ok()?;
+
+    match protocol {
+        1 => {
+            // ICMP
+            if dst_ip == GATEWAY_IP || dst_ip == DNS_IP {
+                crate::tui::log("[NET] Solicitud ICMP Echo Request -> Respondiendo Echo Reply");
+                build_icmp_echo_reply(frame)
+            } else {
+                None
+            }
         }
+        17 => {
+            // UDP
+            let udp_offset = 14 + ihl;
+            if frame.len() < udp_offset + 8 {
+                return None;
+            }
+            let dst_port = u16::from_be_bytes([frame[udp_offset + 2], frame[udp_offset + 3]]);
+            if dst_port == 67 {
+                handle_dhcp(&frame[udp_offset + 8..], frame)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn handle_dhcp(dhcp_payload: &[u8], full_frame: &[u8]) -> Option<Vec<u8>> {
+    if dhcp_payload.len() < 240 || dhcp_payload[0] != 1 {
+        return None;
+    }
+    if dhcp_payload[236..240] != [0x63, 0x82, 0x53, 0x63] {
+        return None;
     }
 
-    fn handle_ipv4(&self, frame: &[u8]) -> Option<Vec<u8>> {
-        if frame.len() < 34 {
-            return None;
-        }
-        let ihl = ((frame[14] & 0x0F) * 4) as usize;
-        if frame.len() < 14 + ihl {
-            return None;
-        }
-        let protocol = frame[23];
-        let dst_ip: [u8; 4] = frame[30..34].try_into().ok()?;
+    let xid: [u8; 4] = dhcp_payload[4..8].try_into().ok()?;
+    let client_mac: [u8; 6] = dhcp_payload[28..34].try_into().ok()?;
 
-        match protocol {
-            1 => {
-                // ICMP
-                if dst_ip == GATEWAY_IP || dst_ip == DNS_IP {
-                    crate::tui::log("[VIRTIO-NET] Solicitud ICMP Echo Request -> Respondiendo Echo Reply");
-                    build_icmp_echo_reply(frame)
-                } else {
-                    None
-                }
-            }
-            17 => {
-                // UDP
-                let udp_offset = 14 + ihl;
-                if frame.len() < udp_offset + 8 {
-                    return None;
-                }
-                let dst_port = u16::from_be_bytes([frame[udp_offset + 2], frame[udp_offset + 3]]);
-                if dst_port == 67 {
-                    self.handle_dhcp(&frame[udp_offset + 8..], frame)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+    let mut msg_type: Option<u8> = None;
+    let mut idx = 240;
+    while idx < dhcp_payload.len() {
+        let tag = dhcp_payload[idx];
+        if tag == 255 {
+            break;
         }
+        if tag == 0 {
+            idx += 1;
+            continue;
+        }
+        if idx + 1 >= dhcp_payload.len() {
+            break;
+        }
+        let len = dhcp_payload[idx + 1] as usize;
+        idx += 2;
+        if idx + len > dhcp_payload.len() {
+            break;
+        }
+        if tag == 53 && len >= 1 {
+            msg_type = Some(dhcp_payload[idx]);
+        }
+        idx += len;
     }
 
-    fn handle_dhcp(&self, dhcp_payload: &[u8], full_frame: &[u8]) -> Option<Vec<u8>> {
-        if dhcp_payload.len() < 240 || dhcp_payload[0] != 1 {
-            return None;
+    let response_type = match msg_type {
+        Some(1) => {
+            crate::tui::log("[NET] DHCP Discover recibido -> Enviando DHCPOFFER (10.0.2.15)");
+            2 // DHCPOFFER
         }
-        if dhcp_payload[236..240] != [0x63, 0x82, 0x53, 0x63] {
-            return None;
+        Some(3) => {
+            crate::tui::log("[NET] DHCP Request recibido -> Enviando DHCPACK (10.0.2.15)");
+            5 // DHCPACK
         }
+        _ => return None,
+    };
 
-        let xid: [u8; 4] = dhcp_payload[4..8].try_into().ok()?;
-        let client_mac: [u8; 6] = dhcp_payload[28..34].try_into().ok()?;
+    let mut offer = vec![0u8; 240];
+    offer[0] = 2; // BOOTREPLY
+    offer[1] = 1; // Ethernet
+    offer[2] = 6; // Hw len
+    offer[3] = 0;
+    offer[4..8].copy_from_slice(&xid);
+    offer[16..20].copy_from_slice(&GUEST_IP);
+    offer[20..24].copy_from_slice(&GATEWAY_IP);
+    offer[28..34].copy_from_slice(&client_mac);
+    offer[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
 
-        let mut msg_type: Option<u8> = None;
-        let mut idx = 240;
-        while idx < dhcp_payload.len() {
-            let tag = dhcp_payload[idx];
-            if tag == 255 {
-                break;
-            }
-            if tag == 0 {
-                idx += 1;
-                continue;
-            }
-            if idx + 1 >= dhcp_payload.len() {
-                break;
-            }
-            let len = dhcp_payload[idx + 1] as usize;
-            idx += 2;
-            if idx + len > dhcp_payload.len() {
-                break;
-            }
-            if tag == 53 && len >= 1 {
-                msg_type = Some(dhcp_payload[idx]);
-            }
-            idx += len;
-        }
+    let mut opt = Vec::new();
+    opt.extend_from_slice(&[53, 1, response_type]);
+    opt.extend_from_slice(&[54, 4]);
+    opt.extend_from_slice(&GATEWAY_IP);
+    opt.extend_from_slice(&[51, 4]);
+    opt.extend_from_slice(&86400u32.to_be_bytes()); // Lease time: 1 día
+    opt.extend_from_slice(&[1, 4]);
+    opt.extend_from_slice(&SUBNET_MASK);
+    opt.extend_from_slice(&[3, 4]);
+    opt.extend_from_slice(&GATEWAY_IP);
+    opt.extend_from_slice(&[6, 4]);
+    opt.extend_from_slice(&DNS_IP);
+    opt.push(255); // End
 
-        let response_type = match msg_type {
-            Some(1) => {
-                crate::tui::log("[VIRTIO-NET] DHCP Discover recibido -> Enviando DHCPOFFER (10.0.2.15)");
-                2 // DHCPOFFER
-            }
-            Some(3) => {
-                crate::tui::log("[VIRTIO-NET] DHCP Request recibido -> Enviando DHCPACK (10.0.2.15)");
-                5 // DHCPACK
-            }
-            _ => return None,
-        };
-
-        let mut offer = vec![0u8; 240];
-        offer[0] = 2; // BOOTREPLY
-        offer[1] = 1; // Ethernet
-        offer[2] = 6; // Hw len
-        offer[3] = 0;
-        offer[4..8].copy_from_slice(&xid);
-        offer[16..20].copy_from_slice(&GUEST_IP);
-        offer[20..24].copy_from_slice(&GATEWAY_IP);
-        offer[28..34].copy_from_slice(&client_mac);
-        offer[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
-
-        let mut opt = Vec::new();
-        opt.extend_from_slice(&[53, 1, response_type]);
-        opt.extend_from_slice(&[54, 4]);
-        opt.extend_from_slice(&GATEWAY_IP);
-        opt.extend_from_slice(&[51, 4]);
-        opt.extend_from_slice(&86400u32.to_be_bytes()); // Lease time: 1 día
-        opt.extend_from_slice(&[1, 4]);
-        opt.extend_from_slice(&SUBNET_MASK);
-        opt.extend_from_slice(&[3, 4]);
-        opt.extend_from_slice(&GATEWAY_IP);
-        opt.extend_from_slice(&[6, 4]);
-        opt.extend_from_slice(&DNS_IP);
-        opt.push(255); // End
-
-        offer.extend_from_slice(&opt);
-        while offer.len() < 300 {
-            offer.push(0);
-        }
-
-        let dst_mac = if full_frame[0..6] == BROADCAST_MAC {
-            BROADCAST_MAC
-        } else {
-            client_mac
-        };
-
-        Some(build_udp_packet(
-            GATEWAY_MAC,
-            dst_mac,
-            GATEWAY_IP,
-            [255, 255, 255, 255],
-            67,
-            68,
-            &offer,
-        ))
+    offer.extend_from_slice(&opt);
+    while offer.len() < 300 {
+        offer.push(0);
     }
+
+    let dst_mac = if full_frame[0..6] == BROADCAST_MAC {
+        BROADCAST_MAC
+    } else {
+        client_mac
+    };
+
+    Some(build_udp_packet(
+        GATEWAY_MAC,
+        dst_mac,
+        GATEWAY_IP,
+        [255, 255, 255, 255],
+        67,
+        68,
+        &offer,
+    ))
 }
 
 /// Dispositivo VirtIO-Net registrado en el bus I/O del VMM.

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo_200px.png" alt="Two Five Five Logo" width="180">
+</p>
+
 # TWO FIVE FIVE (255)
 
 Hipervisor Tipo-2 minimalista de alto rendimiento sobre **KVM** y **Rust**.

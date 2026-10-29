@@ -46,12 +46,13 @@ impl FwCfg {
         vga_rom: Option<Vec<u8>>,
     ) -> Self {
         let mut items: HashMap<u16, Vec<u8>> = HashMap::new();
+        let ram_below_4g = ram_size.min(0xE000_0000);
         items.insert(FW_CFG_SIGNATURE, b"QEMU".to_vec());
         // id: sin DMA (SeaBIOS usará lecturas PIO byte a byte).
         items.insert(FW_CFG_ID, vec![0x00]);
         items.insert(
             FW_CFG_RAM_SIZE,
-            ram_size.to_le_bytes().to_vec(),
+            ram_below_4g.to_le_bytes().to_vec(),
         );
         items.insert(
             FW_CFG_NB_CPUS,
@@ -78,7 +79,6 @@ impl FwCfg {
         // 3. Video RAM y ROMs de BIOS: 0xA0000..0x100000 (384 KiB)
         add_e820(0xA0000, 0x60000, 2);
         // 4. RAM principal por debajo de 4GB: 0x100000..(ram_size.min(0xE000_0000))
-        let ram_below_4g = ram_size.min(0xE000_0000);
         if ram_below_4g > 0x100000 {
             add_e820(0x100000, ram_below_4g - 0x100000, 1);
         }
@@ -88,7 +88,7 @@ impl FwCfg {
         }
 
         let mut files: Vec<(&str, Vec<u8>)> = vec![
-            ("etc/ram-size", ram_size.to_le_bytes().to_vec()),
+            ("etc/ram-size", ram_below_4g.to_le_bytes().to_vec()),
             ("etc/e820", e820_data),
         ];
         if let Some(rom) = &vga_rom {

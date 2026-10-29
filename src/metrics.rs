@@ -47,6 +47,7 @@ pub struct VmmMetrics {
 
     // Estado de VM
     pub is_paused: AtomicBool,
+    pub mouse_abs_available: AtomicBool,
 
     // Pantalla / Resolución
     pub display_width: AtomicU32,
@@ -110,6 +111,7 @@ impl VmmMetrics {
             disk_sectors_read: AtomicU64::new(0),
             disk_sectors_written: AtomicU64::new(0),
             is_paused: AtomicBool::new(false),
+            mouse_abs_available: AtomicBool::new(false),
             display_width: AtomicU32::new(640),
             display_height: AtomicU32::new(480),
             display_bpp: AtomicU32::new(32),

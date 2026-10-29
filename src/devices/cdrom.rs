@@ -7,7 +7,8 @@
 
 use super::IoDevice;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 // ─── Puertos canal secundario ATA (CD-ROM) ─────────────────────────
@@ -66,10 +67,24 @@ const SCSI_READ_TOC: u8 = 0x43;
 const SCSI_GET_CONFIGURATION: u8 = 0x46;
 const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
 const SCSI_READ_DISC_INFO: u8 = 0x51;
+const SCSI_READ_TRACK_INFO: u8 = 0x52;
 const SCSI_MODE_SENSE_10: u8 = 0x5A;
 const SCSI_READ_12: u8 = 0xA8;
+const SCSI_READ_DVD_STRUCTURE: u8 = 0xAD;
 const SCSI_MECHANISM_STATUS: u8 = 0xBD;
 const SCSI_READ_CD: u8 = 0xBE;
+
+/// Copia una cadena de texto en formato ATA (intercambiando bytes en cada palabra de 16 bits).
+fn copy_ata_string(dst: &mut [u8], src: &[u8]) {
+    for i in (0..dst.len()).step_by(2) {
+        let b0 = src.get(i).copied().unwrap_or(b' ');
+        let b1 = src.get(i + 1).copied().unwrap_or(b' ');
+        dst[i] = b1;
+        if i + 1 < dst.len() {
+            dst[i + 1] = b0;
+        }
+    }
+}
 
 // ─── Estado del CD-ROM ATAPI ───────────────────────────────────────
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -334,61 +349,68 @@ impl CdRom {
     fn do_identify_packet(&mut self) {
         let mut pkt = [0u8; 512];
 
-        // Word 0: ATAPI flag + removable + CD-ROM device (0x8580)
-        // Bit 15=1 (ATAPI device: Linux ata_id_is_ata() comprueba bit 15 == 0; si es 0 falla con 'invalid type')
-        // Bits 12:8 = 0x05 (CD-ROM: SeaBIOS comprueba ((word0 >> 8) & 0x1f) == 0x05 para iscd=true)
-        // Bit 7 = 1 (removable device)
-        // Bits 1:0 = 0 (12-byte CDB)
+        // Word 0: CD-ROM device (0x8580: ATAPI, CD-ROM, 12-byte CDB, removable)
         pkt[0] = 0x80;
         pkt[1] = 0x85;
 
-        // Word 1: cylindros = 0 (ignored for ATAPI)
-        // Word 49: capabilities: Bit 9 = LBA (0x0200), Bit 11 = IORDY (0x0800) -> 0x0A00
+        // Words 10..19: Serial number (20 bytes)
+        copy_ata_string(&mut pkt[20..40], b"VB1234-5678         ");
+        // Words 23..26: Firmware revision (8 bytes)
+        copy_ata_string(&mut pkt[46..54], b"1.0     ");
+        // Words 27..46: Model number (40 bytes)
+        copy_ata_string(&mut pkt[54..94], b"VBOX CD-ROM                             ");
+
+        // Word 49: DMA, LBA, IORDY soportados (0x0B00)
         pkt[98] = 0x00;
-        pkt[99] = 0x0A;
+        pkt[99] = 0x0B;
 
-        // Word 53: fields valid
-        pkt[106] = 0x06; // words 88 and 70 valid
+        // Word 53: Palabras 64-70 y 88 son válidas (0x0006)
+        pkt[106] = 0x06;
+        pkt[107] = 0x00;
 
-        // Word 63: multiword DMA
-        pkt[126] = 0x07; // mode 0,1,2
+        // Word 63: Multiword DMA modos 0, 1, 2 soportados y activos (0x0007)
+        pkt[126] = 0x07;
+        pkt[127] = 0x00;
 
-        // Word 64: PIO mode
-        pkt[128] = 0x03; // mode 3,4
+        // Word 64: Modos PIO avanzados 3 y 4 (0x0003)
+        pkt[128] = 0x03;
+        pkt[129] = 0x00;
 
-        // Word 76-79: serial
-        pkt[152..160].copy_from_slice(b"VMM0001 ");
+        // Words 65..68: Tiempos mínimos de ciclo (120 ns)
+        pkt[130] = 120; pkt[132] = 120; pkt[134] = 120; pkt[136] = 120;
 
-        // Word 80: Major version (bits 1..6 = ATA/ATAPI-1 a ATA/ATAPI-6)
+        // Word 80: Versión mayor ATA/ATAPI-4..6 (0x007E)
         pkt[160] = 0x7E;
         pkt[161] = 0x00;
+        // Word 81: Versión menor (0x0022)
+        pkt[162] = 0x22;
+        pkt[163] = 0x00;
 
-        // Word 82-84: command set (nop, atapi pkt, atapi mgr, generic)
-        pkt[164] = 0x00;
-        pkt[165] = 0x00;
-        pkt[166] = 0x20; // ATAPI PACKET command
-        pkt[167] = 0x40; // Word 83 bit 14=1
+        // Words 82..87: Command sets
+        pkt[164] = 0x10; pkt[165] = 0x02; // Word 82: 0x0210
+        pkt[166] = 0x00; pkt[167] = 0x40; // Word 83: 0x4000
+        pkt[168] = 0x00; pkt[169] = 0x40; // Word 84: 0x4000
+        pkt[170] = 0x10; pkt[171] = 0x02; // Word 85: 0x0210
+        pkt[172] = 0x00; pkt[173] = 0x40; // Word 86: 0x4000
+        pkt[174] = 0x00; pkt[175] = 0x40; // Word 87: 0x4000
 
-        // Word 100-103: total LBA (48-bit, we use 32-bit)
-        let total_lba = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
-        pkt[200..204].copy_from_slice(&total_lba.to_le_bytes());
+        // Word 88: Ultra DMA modos 0..5 soportados y modo 5 activo (0x207F)
+        pkt[176] = 0x7F;
+        pkt[177] = 0x20;
 
-        // Word 93 (offset 186): hardware reset result. SeaBIOS usa esto en
-        // ata_detect(): (resetresult & 0xdf61) == 0x4041 significa que device 0
-        // responde a device 1 → no hay device 1 en el canal → no lo vuelve a probe.
+        // Word 93 (offset 186): Resultado de reset de hardware (0x4041)
         pkt[186] = 0x40;
         pkt[187] = 0x41;
 
-        // Word 126: vendor specific
-        // Word 127: removable status
+        // Words 100..103: Total LBA (48-bit)
+        let total_lba = (self.iso_size / CD_SECTOR_SIZE as u64).max(1);
+        pkt[200..208].copy_from_slice(&total_lba.to_le_bytes());
 
-        // Word 128-159: model (40 chars, space-padded, byte-swapped)
-        let model_str = b"Two Five Five CD-ROM ATAPI   ";
-        for (i, slot) in pkt[256..296].chunks_mut(2).enumerate() {
-            let get = |k: usize| -> u8 { model_str.get(k).copied().unwrap_or(b' ') };
-            slot[0] = get(i * 2 + 1);
-            slot[1] = get(i * 2);
-        }
+        // Word 255: Checksum de integridad ATA
+        let sum: u8 = pkt[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let csum = 0u8.wrapping_sub(sum);
+        pkt[510] = 0xA5;
+        pkt[511] = csum;
 
         self.state.reg_sc = 0x02; // Interrupt reason: IO=1, CoD=0
         self.state.byte_count_limit = 512;
@@ -460,27 +482,59 @@ impl CdRom {
                 self.start_data_in(sense[..len].to_vec());
             }
             SCSI_INQUIRY => {
-                let alloc = self.state.cdb[4] as usize;
-                let mut inq = [0u8; 96];
-                // Peripheral qualifier=0, device type=5 (CD-ROM)
-                inq[0] = 0x05;
-                // RMB=1 (removable)
-                inq[1] = 0x80;
-                // Version: SPC-2
-                inq[2] = 0x02;
-                // Response data format=2
-                inq[3] = 0x02;
-                // Additional length
-                inq[4] = 91;
-                // Vendor ID (8 bytes, space-padded)
-                inq[8..16].copy_from_slice(b"TWO555  ");
-                // Product ID (16 bytes, space-padded)
-                inq[16..32].copy_from_slice(b"CD-ROM Drive    ");
-                // Product revision (4 bytes)
-                inq[32..36].copy_from_slice(b"1.0 ");
-                let len = alloc.min(96);
-                self.start_data_in(inq[..len].to_vec());
-                eprintln!("[CDROM] SCSI INQUIRY → CD-ROM, 96 bytes");
+                let evpd = (self.state.cdb[1] & 0x01) != 0;
+                let page_code = self.state.cdb[2];
+                let alloc = if self.state.cdb[4] == 0 && self.state.cdb[3] != 0 {
+                    self.state.cdb[3] as usize
+                } else {
+                    self.state.cdb[4] as usize
+                };
+                let resp = if evpd {
+                    match page_code {
+                        0x00 => {
+                            // Supported VPD Pages
+                            vec![0x05, 0x00, 0x00, 0x03, 0x00, 0x80, 0x83]
+                        }
+                        0x80 => {
+                            // Unit Serial Number
+                            let serial = b"VB1234-5678";
+                            let mut p = vec![0x05, 0x80, 0x00, serial.len() as u8];
+                            p.extend_from_slice(serial);
+                            p
+                        }
+                        0x83 => {
+                            // Device Identification
+                            let mut p = vec![0x05, 0x83, 0x00, 0x14, 0x02, 0x01, 0x00, 0x10];
+                            p.extend_from_slice(b"VBOX    VB123456");
+                            p
+                        }
+                        _ => {
+                            vec![0x05, page_code, 0x00, 0x00]
+                        }
+                    }
+                } else {
+                    let mut inq = [0u8; 96];
+                    // Peripheral qualifier=0, device type=5 (CD-ROM)
+                    inq[0] = 0x05;
+                    // RMB=1 (removable)
+                    inq[1] = 0x80;
+                    // Version: SPC-2
+                    inq[2] = 0x02;
+                    // Response data format=2
+                    inq[3] = 0x02;
+                    // Additional length
+                    inq[4] = 91;
+                    // Vendor ID (8 bytes, space-padded)
+                    inq[8..16].copy_from_slice(b"VBOX    ");
+                    // Product ID (16 bytes, space-padded)
+                    inq[16..32].copy_from_slice(b"CD-ROM          ");
+                    // Product revision (4 bytes)
+                    inq[32..36].copy_from_slice(b"1.0 ");
+                    inq.to_vec()
+                };
+                let len = alloc.min(resp.len());
+                self.start_data_in(resp[..len].to_vec());
+                eprintln!("[CDROM] SCSI INQUIRY (evpd={}) → {} bytes", evpd, len);
             }
             SCSI_MODE_SENSE_6 => {
                 let alloc = self.state.cdb[4] as usize;
@@ -548,10 +602,8 @@ impl CdRom {
                 }
 
                 let mut buf = vec![0u8; byte_count as usize];
-                if let Some(ref mut f) = self.iso_file {
-                    if f.seek(SeekFrom::Start(offset)).is_ok() {
-                        let _ = f.read_exact(&mut buf);
-                    }
+                if let Some(ref f) = self.iso_file {
+                    let _ = f.read_exact_at(&mut buf, offset);
                 }
                 if self.unattended {
                     crate::unattended::patch_unattended_iso_sectors(&mut buf);
@@ -628,7 +680,7 @@ impl CdRom {
                 let send_len = alloc.min(buf.len());
                 self.start_data_in(buf[..send_len].to_vec());
             }
-            0x52 => {
+            SCSI_READ_TRACK_INFO => {
                 // READ TRACK INFORMATION (MMC)
                 let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
                 let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
@@ -679,16 +731,86 @@ impl CdRom {
             }
             SCSI_GET_CONFIGURATION => {
                 let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
-                let mut conf = [0u8; 8];
-                let len: u32 = 4;
-                conf[0..4].copy_from_slice(&len.to_be_bytes());
-                conf[6] = 0x00;
-                conf[7] = 0x08; // Profile 0x08: CD-ROM
-                let send_len = alloc.min(8);
+                let is_dvd = self.iso_size > 700 * 1024 * 1024;
+                let cur_profile: u16 = if is_dvd { 0x0010 } else { 0x0008 };
+                let mut conf = vec![0u8; 88];
+                let data_len: u32 = 84; // 88 - 4
+                conf[0..4].copy_from_slice(&data_len.to_be_bytes());
+                conf[6..8].copy_from_slice(&cur_profile.to_be_bytes());
+
+                let mut off = 8;
+                // Feature 0000h: Profile List
+                conf[off..off+2].copy_from_slice(&0x0000u16.to_be_bytes());
+                conf[off+2] = 0x03; // Version 0, persistent, current
+                conf[off+3] = 8;    // 8 additional bytes
+                conf[off+4..off+6].copy_from_slice(&0x0010u16.to_be_bytes()); // DVD-ROM
+                conf[off+6] = if is_dvd { 1 } else { 0 }; // Current
+                conf[off+8..off+10].copy_from_slice(&0x0008u16.to_be_bytes()); // CD-ROM
+                conf[off+10] = if is_dvd { 0 } else { 1 }; // Current
+                off += 12;
+
+                // Feature 0001h: Core Feature
+                conf[off..off+2].copy_from_slice(&0x0001u16.to_be_bytes());
+                conf[off+2] = (2 << 2) | 0x03; // Version 2, persistent, current
+                conf[off+3] = 8;
+                conf[off+4..off+8].copy_from_slice(&2u32.to_be_bytes()); // Physical ATAPI
+                conf[off+8] = 1; // DBE
+                off += 12;
+
+                // Feature 0002h: Morphing
+                conf[off..off+2].copy_from_slice(&0x0002u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                conf[off+4] = 2; // ASYNCH
+                off += 8;
+
+                // Feature 0003h: Removable Medium
+                conf[off..off+2].copy_from_slice(&0x0003u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                conf[off+4] = 0x20; // Lockable
+                off += 8;
+
+                // Feature 0010h: Random Readable
+                conf[off..off+2].copy_from_slice(&0x0010u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 8;
+                conf[off+4..off+8].copy_from_slice(&2048u32.to_be_bytes()); // Block size 2048
+                conf[off+8..off+10].copy_from_slice(&1u16.to_be_bytes());   // Blocking 1
+                off += 12;
+
+                // Feature 001Eh: CD Read
+                conf[off..off+2].copy_from_slice(&0x001Eu16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                conf[off+4] = 0x03; // CD-Text, DAP
+                off += 8;
+
+                // Feature 001Fh: DVD Read
+                conf[off..off+2].copy_from_slice(&0x001Fu16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                off += 8;
+
+                // Feature 0100h: Power Management
+                conf[off..off+2].copy_from_slice(&0x0100u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 0;
+                off += 4;
+
+                // Feature 0105h: Timeout
+                conf[off..off+2].copy_from_slice(&0x0105u16.to_be_bytes());
+                conf[off+2] = 0x03;
+                conf[off+3] = 4;
+                off += 8;
+
+                let actual_len = off.min(conf.len());
+                let send_len = alloc.min(actual_len);
                 self.start_data_in(conf[..send_len].to_vec());
             }
             SCSI_READ_DISC_INFO => {
                 let alloc = u16::from_be_bytes([self.state.cdb[7], self.state.cdb[8]]) as usize;
+                let is_dvd = self.iso_size > 700 * 1024 * 1024;
                 let mut info = [0u8; 34];
                 let len: u16 = 32;
                 info[0..2].copy_from_slice(&len.to_be_bytes());
@@ -698,7 +820,7 @@ impl CdRom {
                 info[5] = 1;
                 info[6] = 1;
                 info[7] = 0x20;
-                info[8] = 0x00;
+                info[8] = if is_dvd { 0x10 } else { 0x00 };
                 let send_len = alloc.min(34);
                 self.start_data_in(info[..send_len].to_vec());
             }
@@ -732,10 +854,8 @@ impl CdRom {
                 }
 
                 let mut buf = vec![0u8; byte_count as usize];
-                if let Some(ref mut f) = self.iso_file {
-                    if f.seek(SeekFrom::Start(offset)).is_ok() {
-                        let _ = f.read_exact(&mut buf);
-                    }
+                if let Some(ref f) = self.iso_file {
+                    let _ = f.read_exact_at(&mut buf, offset);
                 }
                 if self.unattended {
                     crate::unattended::patch_unattended_iso_sectors(&mut buf);
@@ -764,10 +884,8 @@ impl CdRom {
                 }
 
                 let mut buf = vec![0u8; byte_count as usize];
-                if let Some(ref mut f) = self.iso_file {
-                    if f.seek(SeekFrom::Start(offset)).is_ok() {
-                        let _ = f.read_exact(&mut buf);
-                    }
+                if let Some(ref f) = self.iso_file {
+                    let _ = f.read_exact_at(&mut buf, offset);
                 }
                 if self.unattended {
                     crate::unattended::patch_unattended_iso_sectors(&mut buf);
@@ -813,10 +931,8 @@ impl CdRom {
                 }
 
                 let mut buf = vec![0u8; byte_count as usize];
-                if let Some(ref mut f) = self.iso_file {
-                    if f.seek(SeekFrom::Start(offset)).is_ok() {
-                        let _ = f.read_exact(&mut buf);
-                    }
+                if let Some(ref f) = self.iso_file {
+                    let _ = f.read_exact_at(&mut buf, offset);
                 }
                 if self.unattended {
                     crate::unattended::patch_unattended_iso_sectors(&mut buf);
@@ -830,6 +946,51 @@ impl CdRom {
                 resp[5] = 1; // 1 slot
                 let len = alloc.min(8);
                 self.start_data_in(resp[..len].to_vec());
+            }
+            SCSI_READ_DVD_STRUCTURE => {
+                let format = self.state.cdb[7];
+                let alloc = u16::from_be_bytes([self.state.cdb[8], self.state.cdb[9]]) as usize;
+                let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
+                match format {
+                    0x00 => {
+                        // Physical format information (MMC-2 / VirtualBox vscsiLunMmcReadDvdStructure)
+                        let mut buf = vec![0u8; 2048 + 4];
+                        let data_len = 2048u16 + 2u16;
+                        buf[0..2].copy_from_slice(&data_len.to_be_bytes());
+                        buf[2] = 0;
+                        buf[3] = 0;
+                        buf[4] = 0x01; // DVD-ROM, part version 1
+                        buf[5] = 0x0F; // 120mm disc, minimum rate unspecified
+                        buf[6] = 0x01; // One layer, read-only
+                        buf[7] = 0x00; // Default densities
+
+                        // Starting PSN: 0x00030000 per MMC spec
+                        buf[8..12].copy_from_slice(&0x0003_0000u32.to_be_bytes());
+                        let end_psn = 0x0003_0000u32.saturating_add(total_sectors.saturating_sub(1));
+                        buf[12..16].copy_from_slice(&end_psn.to_be_bytes());
+                        buf[16..20].copy_from_slice(&end_psn.to_be_bytes());
+
+                        let send_len = alloc.min(buf.len());
+                        self.start_data_in(buf[..send_len].to_vec());
+                    }
+                    0x01 => {
+                        // DVD copyright information
+                        let mut buf = vec![0u8; 8];
+                        let data_len = 4u16 + 2u16;
+                        buf[0..2].copy_from_slice(&data_len.to_be_bytes());
+                        buf[2] = 0;
+                        buf[3] = 0;
+                        buf[4] = 0; // No copyright data
+                        buf[5] = 0; // No region restrictions
+                        let send_len = alloc.min(8);
+                        self.start_data_in(buf[..send_len].to_vec());
+                    }
+                    _ => {
+                        let buf = vec![0u8; 4];
+                        let send_len = alloc.min(4);
+                        self.start_data_in(buf[..send_len].to_vec());
+                    }
+                }
             }
             _ => {
                 eprintln!(
@@ -851,7 +1012,9 @@ impl CdRom {
 /// Estado de un dispositivo ATA en el canal primario.
 /// Soporta IDENTIFY DEVICE, READ SECTORS/EXT, WRITE SECTORS/EXT.
 pub struct PrimaryIde {
-    /// Archivo de disco (raw, 512-byte sectors)
+    /// Soporte para discos virtuales VDI y RAW
+    pub vdisk: Option<crate::vdisk::VirtualDisk>,
+    /// Archivo de disco de respaldo (raw, 512-byte sectors)
     disk_file: Option<File>,
     /// Tamaño en bytes del disco (0 si no hay disco)
     disk_size: u64,
@@ -879,6 +1042,7 @@ pub struct PrimaryIde {
 impl PrimaryIde {
     pub fn new() -> Self {
         Self {
+            vdisk: None,
             disk_file: None,
             disk_size: 0,
             status: ST_DRDY,
@@ -912,27 +1076,37 @@ impl PrimaryIde {
         self.status = s;
     }
 
-    /// Carga un disco duro raw (.img) para el canal primario.
-    ///
-    /// Se abre en modo lectura+escritura: un guest (p. ej. Linux) escribe
-    /// sectores durante el arranque (journal, etc.). Antes se abría con
-    /// `File::open` (solo lectura) y las escrituras fallaban en silencio.
+    /// Carga un disco duro (VDI o RAW) para el canal primario.
     pub fn with_disk(disk_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(disk_path)?;
-        let metadata = file.metadata()?;
-        let size = metadata.len();
+        let vdisk;
+        let mut disk_file = None;
+        let size;
 
-        eprintln!(
-            "[ATA] Disco duro cargado: {} ({:.1} MB, rw)",
-            disk_path,
-            size as f64 / (1024.0 * 1024.0)
-        );
+        if let Ok(vd) = crate::vdisk::VirtualDisk::open(disk_path) {
+            size = vd.logical_size();
+            eprintln!(
+                "[ATA] Disco duro cargado (VDisk): {} ({:.1} MB, {})",
+                disk_path,
+                size as f64 / (1024.0 * 1024.0),
+                vd.format().label()
+            );
+            vdisk = Some(vd);
+        } else if let Ok(file) = OpenOptions::new().read(true).write(true).open(disk_path) {
+            size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "[ATA] Disco duro cargado (RAW): {} ({:.1} MB, rw)",
+                disk_path,
+                size as f64 / (1024.0 * 1024.0)
+            );
+            disk_file = Some(file);
+            vdisk = None;
+        } else {
+            return Err(format!("No se pudo abrir el disco '{}'", disk_path).into());
+        }
 
         Ok(Self {
-            disk_file: Some(file),
+            vdisk,
+            disk_file,
             disk_size: size,
             status: ST_DRDY,
             lba: 0,
@@ -951,7 +1125,7 @@ impl PrimaryIde {
 
     /// Indica si hay un disco conectado
     pub fn has_disk(&self) -> bool {
-        self.disk_file.is_some()
+        self.vdisk.is_some() || self.disk_file.is_some()
     }
 
     pub fn take_irq(&mut self) -> bool {
@@ -962,6 +1136,7 @@ impl PrimaryIde {
 
     /// Reset del dispositivo ATA: borra el estado de la transferencia actual.
     pub fn reset(&mut self) {
+        self.flush();
         self.status = ST_DRDY;
         self.lba = 0;
         self.sector_count = 1;
@@ -972,6 +1147,15 @@ impl PrimaryIde {
         self.dma_active = false;
         self.dma_is_write = false;
         self.irq_pending = false;
+    }
+
+    /// Sincroniza la caché de escritura con el almacenamiento del host (`FLUSH CACHE`).
+    pub fn flush(&mut self) {
+        if let Some(ref mut vd) = self.vdisk {
+            let _ = vd.flush();
+        } else if let Some(ref f) = self.disk_file {
+            let _ = f.sync_data();
+        }
     }
 
     /// Construye un IDENTIFY DEVICE response (512 bytes) para un disco duro ATA
@@ -1036,35 +1220,40 @@ impl PrimaryIde {
     /// Lee n sectores del disco a partir del LBA
     pub fn read_sectors(&mut self, lba: u64, count: u16) -> Vec<u8> {
         let mut buf = vec![0u8; (count as usize) * 512];
-        if let Some(ref mut f) = self.disk_file {
-            if let Ok(_) = f.seek(SeekFrom::Start(lba * 512)) {
-                let _ = f.read_exact(&mut buf);
+        if let Some(ref mut vd) = self.vdisk {
+            if vd.read_sectors(lba, count as u32, &mut buf).is_ok() {
+                self.sectors_read_total += count as u64;
+            }
+        } else if let Some(ref f) = self.disk_file {
+            if f.read_exact_at(&mut buf, lba * 512).is_ok() {
                 self.sectors_read_total += count as u64;
             }
         }
         buf
     }
 
-    /// Escribe n sectores al disco y hace fsync (sync_data) para que los
-    /// datos queden persistidos en el archivo antes de devolver status OK.
+    /// Escribe n sectores al disco en la caché de páginas del SO antes de devolver status OK.
     /// Devuelve false si el archivo no está abierto, los datos no cubren
-    /// `count*512` bytes o la escritura/fsync falla (el guest verá ST_ERR).
+    /// `count*512` bytes o la escritura falla (el guest verá ST_ERR).
     pub fn write_sectors(&mut self, lba: u64, count: u16, data: &[u8]) -> bool {
-        let Some(file) = self.disk_file.as_mut() else {
-            eprintln!("[ATA] WRITE sin archivo de disco (LBA={:#x})", lba);
-            return false;
-        };
         let len = (count as usize) * 512;
         if data.len() < len {
             eprintln!("[ATA] WRITE corto: pidió {} bytes, recibió {}", len, data.len());
             return false;
         }
-        let result = (|| -> std::io::Result<()> {
-            file.seek(SeekFrom::Start(lba * 512))?;
-            file.write_all(&data[..len])?;
-            file.sync_data()
-        })();
-        if let Err(e) = result {
+        if let Some(ref mut vd) = self.vdisk {
+            if let Err(e) = vd.write_sectors(lba, count as u32, &data[..len]) {
+                eprintln!("[ATA] ERROR escribiendo VDisk LBA={:#x} count={}: {}", lba, count, e);
+                return false;
+            }
+            self.sectors_written_total += count as u64;
+            return true;
+        }
+        let Some(file) = self.disk_file.as_ref() else {
+            eprintln!("[ATA] WRITE sin archivo de disco (LBA={:#x})", lba);
+            return false;
+        };
+        if let Err(e) = file.write_all_at(&data[..len], lba * 512) {
             eprintln!("[ATA] ERROR escribiendo LBA={:#x} count={}: {}", lba, count, e);
             return false;
         }
@@ -1105,11 +1294,11 @@ impl IoDevice for PrimaryIde {
                 if total == 0 {
                     return; // escritura fuera de transferencia: ignorar
                 }
-                for &b in data.iter() {
-                    if self.data_offset < total {
-                        self.data_buf[self.data_offset] = b;
-                        self.data_offset += 1;
-                    }
+                let copy_len = data.len().min(total.saturating_sub(self.data_offset));
+                if copy_len > 0 {
+                    self.data_buf[self.data_offset..self.data_offset + copy_len]
+                        .copy_from_slice(&data[..copy_len]);
+                    self.data_offset += copy_len;
                 }
                 if self.data_offset >= total {
                     let count = (total / 512) as u16;
@@ -1118,7 +1307,7 @@ impl IoDevice for PrimaryIde {
                     if self.write_sectors(self.lba, count, &buf) {
                         self.status = ST_DRDY;
                         self.irq_pending = true;
-                        eprintln!("[ATA] WRITE SECTORS LBA={:#x} count={} (fsync ok)", self.lba, count);
+                        eprintln!("[ATA] WRITE SECTORS LBA={:#x} count={} (ok)", self.lba, count);
                     } else {
                         self.status = ST_DRDY | ST_ERR;
                         self.irq_pending = true;
@@ -1219,6 +1408,12 @@ impl IoDevice for PrimaryIde {
                             self.irq_pending = true;
                         }
                     }
+                    0xE7 | 0xEA => {
+                        // FLUSH CACHE / FLUSH CACHE EXT
+                        self.flush();
+                        self.status = ST_DRDY;
+                        self.irq_pending = true;
+                    }
                     0x90 => {
                         self.status = ST_DRDY;
                         self.irq_pending = true;
@@ -1261,14 +1456,14 @@ impl IoDevice for PrimaryIde {
                 // PIO rápido multisector: KVM entrega un REP INSW coalescido
                 // como un solo IoIn de `count` bytes. Antes se devolvían
                 // SIEMPRE 2 bytes y las lecturas de >1 sector truncaban.
-                let mut result = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if self.data_offset < self.data_buf.len() {
-                        result.push(self.data_buf[self.data_offset]);
-                        self.data_offset += 1;
-                    } else {
-                        result.push(0x00);
-                    }
+                let mut result = vec![0u8; count];
+                let avail = self.data_buf.len().saturating_sub(self.data_offset);
+                let copy_len = count.min(avail);
+                if copy_len > 0 {
+                    result[..copy_len].copy_from_slice(
+                        &self.data_buf[self.data_offset..self.data_offset + copy_len],
+                    );
+                    self.data_offset += copy_len;
                 }
                 if self.data_offset >= self.data_buf.len() && !self.data_buf.is_empty() {
                     self.status = ST_DRDY;
