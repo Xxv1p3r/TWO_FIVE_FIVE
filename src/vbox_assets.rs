@@ -405,10 +405,6 @@ fn find_assets_dir() -> Option<PathBuf> {
             }
         }
     }
-    let abs = Path::new("/home/v1p3r/Escritorio/255_ver_0.80").join(rel);
-    if abs.is_dir() {
-        return Some(abs);
-    }
     None
 }
 

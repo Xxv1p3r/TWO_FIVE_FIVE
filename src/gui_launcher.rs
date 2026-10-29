@@ -279,12 +279,44 @@ pub fn load_vm_profiles(available_isos: &[String], available_disks: &[String]) -
                 let iso_path = if parts[4].trim().is_empty() {
                     None
                 } else {
-                    Some(normalize_rel_path(parts[4]))
+                    let raw = normalize_rel_path(parts[4]);
+                    if Path::new(&raw).exists() {
+                        Some(raw)
+                    } else if let Some(fname) = Path::new(&raw).file_name() {
+                        let fname_str = fname.to_string_lossy();
+                        if let Some(matched) = available_isos.iter().find(|iso| {
+                            Path::new(iso).file_name().map(|f| f.to_string_lossy() == fname_str).unwrap_or(false)
+                        }) {
+                            Some(matched.clone())
+                        } else if Path::new(&fname_str.as_ref()).exists() {
+                            Some(fname_str.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 };
                 let disk_path = if parts[5].trim().is_empty() {
                     None
                 } else {
-                    Some(normalize_rel_path(parts[5]))
+                    let raw = normalize_rel_path(parts[5]);
+                    if Path::new(&raw).exists() {
+                        Some(raw)
+                    } else if let Some(fname) = Path::new(&raw).file_name() {
+                        let fname_str = fname.to_string_lossy();
+                        if let Some(matched) = available_disks.iter().find(|d| {
+                            Path::new(d).file_name().map(|f| f.to_string_lossy() == fname_str).unwrap_or(false)
+                        }) {
+                            Some(matched.clone())
+                        } else if Path::new(&fname_str.as_ref()).exists() {
+                            Some(fname_str.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 };
                 let unattended = parts
                     .get(6)
@@ -370,24 +402,35 @@ pub fn save_vm_profiles(profiles: &[VmProfile]) -> std::io::Result<()> {
 pub fn default_iso_browse_dir(current_iso: Option<&str>) -> String {
     if let Some(cur) = current_iso {
         let p = Path::new(cur);
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() && parent.is_dir() {
-                if let Ok(canon) = fs::canonicalize(parent) {
-                    return format!("{}/", canon.to_string_lossy());
+        if p.exists() {
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() && parent.is_dir() {
+                    if let Ok(canon) = fs::canonicalize(parent) {
+                        return format!("{}/", canon.to_string_lossy());
+                    }
                 }
             }
         }
     }
-    let candidates = [
-        "/home/v1p3r/Escritorio/isos",
-        "../isos",
-        "/home/v1p3r/Descargas",
-        ".",
-    ];
-    for c in &candidates {
-        let p = Path::new(c);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let h = Path::new(&home);
+        candidates.push(h.join("Escritorio").join("isos"));
+        candidates.push(h.join("Desktop").join("isos"));
+        candidates.push(h.join("isos"));
+        candidates.push(h.join("Descargas"));
+        candidates.push(h.join("Downloads"));
+        candidates.push(h.join("Escritorio"));
+        candidates.push(h.join("Desktop"));
+        candidates.push(h.to_path_buf());
+    }
+    candidates.push(PathBuf::from("./isos"));
+    candidates.push(PathBuf::from("../isos"));
+    candidates.push(PathBuf::from("."));
+
+    for p in candidates {
         if p.is_dir() {
-            if let Ok(canon) = fs::canonicalize(p) {
+            if let Ok(canon) = fs::canonicalize(&p) {
                 return format!("{}/", canon.to_string_lossy());
             }
         }
@@ -396,7 +439,7 @@ pub fn default_iso_browse_dir(current_iso: Option<&str>) -> String {
 }
 
 /// Abre el gestor de archivos nativo del sistema (`zenity`, `kdialog` o `tkinter`)
-/// para seleccionar cualquier imagen `.iso` del equipo (por defecto en `/home/v1p3r/Escritorio/isos`).
+/// para seleccionar cualquier imagen `.iso` del equipo.
 pub fn open_iso_file_dialog(current_iso: Option<&str>) -> Option<String> {
     let start_dir = default_iso_browse_dir(current_iso);
 
@@ -510,7 +553,7 @@ pub fn open_disk_file_dialog(current_disk: Option<&str>) -> Option<String> {
 }
 
 /// Si el archivo seleccionado reside dentro del directorio de trabajo actual, devuelve su nombre relativo;
-/// si está en otra carpeta (p. ej. `/home/v1p3r/Escritorio/isos/kali.iso`), conserva su ruta completa.
+/// si está en otra carpeta, conserva su ruta completa.
 fn normalize_selected_file_path(chosen: &str) -> String {
     if let (Ok(cwd), Ok(full)) = (std::env::current_dir().and_then(fs::canonicalize), fs::canonicalize(chosen)) {
         if let Ok(rel) = full.strip_prefix(&cwd) {
@@ -520,22 +563,31 @@ fn normalize_selected_file_path(chosen: &str) -> String {
     normalize_rel_path(chosen)
 }
 
-/// Escanea archivos `.iso` tanto en el directorio del proyecto como en carpetas de ISOs habituales (`/home/v1p3r/Escritorio/isos`).
+/// Escanea archivos `.iso` tanto en el directorio del proyecto como en carpetas de ISOs del usuario.
 pub fn scan_iso_files() -> Vec<String> {
     let mut isos = Vec::new();
-    let search_dirs = [".", "/home/v1p3r/Escritorio/isos", "../isos"];
-    for dir in &search_dirs {
-        let dir_path = Path::new(dir);
+    let mut search_dirs: Vec<PathBuf> = vec![PathBuf::from(".")];
+    if let Ok(home) = std::env::var("HOME") {
+        let h = Path::new(&home);
+        search_dirs.push(h.join("Escritorio").join("isos"));
+        search_dirs.push(h.join("Desktop").join("isos"));
+        search_dirs.push(h.join("isos"));
+    }
+    search_dirs.push(PathBuf::from("./isos"));
+    search_dirs.push(PathBuf::from("../isos"));
+
+    for dir_path in &search_dirs {
         if !dir_path.is_dir() {
             continue;
         }
+        let is_current = dir_path.as_os_str() == ".";
         if let Ok(entries) = fs::read_dir(dir_path) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_file() {
                     if let Some(ext) = p.extension() {
                         if ext.eq_ignore_ascii_case("iso") {
-                            let formatted = if *dir == "." {
+                            let formatted = if is_current {
                                 p.file_name()
                                     .map(|n| normalize_rel_path(&n.to_string_lossy()))
                                     .unwrap_or_default()
@@ -2926,9 +2978,9 @@ mod tests {
         assert_eq!(friendly_vm_name_from_iso("en_windows_7_professional_x64_dvd.iso", 0), "Windows 7 Pro x64");
         assert_eq!(friendly_vm_name_from_iso("ubuntu-24.04-desktop-amd64.iso", 1), "Ubuntu Linux x64");
         assert_eq!(friendly_vm_name_from_iso("CorePlus-current.iso", 2), "TinyCore Linux");
-        assert_eq!(friendly_vm_name_from_iso("/home/v1p3r/Escritorio/isos/kali.iso", 3), "Kali Linux x64");
-        assert_eq!(friendly_vm_name_from_iso("/home/v1p3r/Escritorio/isos/mint.iso", 4), "Linux Mint x64");
-        assert_eq!(detect_os_type_from_iso("/home/v1p3r/Escritorio/isos/kali.iso"), "Debian (64-bit)");
+        assert_eq!(friendly_vm_name_from_iso("kali.iso", 3), "Kali Linux x64");
+        assert_eq!(friendly_vm_name_from_iso("mint.iso", 4), "Linux Mint x64");
+        assert_eq!(detect_os_type_from_iso("kali.iso"), "Debian (64-bit)");
         assert!(default_iso_browse_dir(None).ends_with('/'));
     }
 
