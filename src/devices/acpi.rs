@@ -95,9 +95,9 @@ fn build_fadt(facs_off: u32, dsdt_off: u32) -> Vec<u8> {
     t[96..98].copy_from_slice(&0xFFFu16.to_le_bytes());  // plvl2_lat: C2 no soportado (offset 96)
     t[98..100].copy_from_slice(&0xFFFu16.to_le_bytes()); // plvl3_lat: C3 no soportado (offset 98)
     t[108] = 0x32; // century (offset 108)
-    t[109..111].copy_from_slice(&0x0002u16.to_le_bytes()); // iapc_boot_arch: 8042 presente (offset 109)
-    // flags (offset 112): WBINVD | PROC_C1 | SLP_BUTTON | RTC_S4 | TMR_VAL_EXT (0) | USE_PLATFORM_CLOCK
-    t[112..116].copy_from_slice(&0x80A5u32.to_le_bytes());
+    t[109..111].copy_from_slice(&0x0003u16.to_le_bytes()); // iapc_boot_arch: LEGACY_DEVICES | 8042 (offset 109)
+    // flags (offset 112): WBINVD | PROC_C1 | SLP_BUTTON | RTC_S4 (NO USE_PLATFORM_CLOCK para no invalidar TSC/kvmclock)
+    t[112..116].copy_from_slice(&0x00A5u32.to_le_bytes());
     t
 }
 
@@ -148,11 +148,10 @@ fn build_dsdt() -> Vec<u8> {
     t
 }
 
-/// MADT (Multiple APIC): un LAPIC por vCPU + IOAPIC. Sin IRQ0 override:
-/// el irqchip del kernel enruta la línea 0 al pin 0 del IOAPIC, así que
-/// IRQ0 (PIT) debe quedar en GSI 0.
+/// MADT (Multiple APIC): un LAPIC por vCPU + IOAPIC + SCI IRQ 9 ISO + Local APIC NMI.
+/// Sin IRQ0 override: el irqchip del kernel enruta la línea 0 al pin 0 del IOAPIC.
 fn build_madt(num_cpus: u32) -> Vec<u8> {
-    let len = 44 + 8 * num_cpus as usize + 12;
+    let len = 44 + 8 * num_cpus as usize + 12 + 10 + 6;
     let mut t = acpi_header(b"APIC", len as u32, b"MI-APIC ");
     t.resize(len, 0);
     t[36..40].copy_from_slice(&0xFEE0_0000u32.to_le_bytes()); // LAPIC base
@@ -166,12 +165,29 @@ fn build_madt(num_cpus: u32) -> Vec<u8> {
         t[off + 4..off + 8].copy_from_slice(&1u32.to_le_bytes()); // flags: enabled
         off += 8;
     }
-    // IOAPIC
+    // IOAPIC (ID distinto de cualquier LAPIC ID 0..num_cpus-1)
     t[off] = 1; // type: io apic
     t[off + 1] = 12; // length
-    t[off + 2] = 0x01; // ioapic id
+    t[off + 2] = if num_cpus < 16 { 0x0F } else { 0x10 }; // ioapic id
     t[off + 4..off + 8].copy_from_slice(&0xFEC0_0000u32.to_le_bytes()); // address
     t[off + 8..off + 12].copy_from_slice(&0u32.to_le_bytes()); // gsi base
+    off += 12;
+
+    // Interrupt Source Override para ACPI SCI (IRQ 9 -> GSI 9, Active-High Level-Triggered = 0x000D)
+    t[off] = 2; // type: interrupt source override
+    t[off + 1] = 10; // length
+    t[off + 2] = 0; // bus: ISA
+    t[off + 3] = 9; // source IRQ 9
+    t[off + 4..off + 8].copy_from_slice(&9u32.to_le_bytes()); // global system interrupt 9
+    t[off + 8..off + 10].copy_from_slice(&0x000Du16.to_le_bytes()); // Active High, Level Triggered
+    off += 10;
+
+    // Local APIC NMI (todos los procesadores, LINT1)
+    t[off] = 4; // type: local apic nmi
+    t[off + 1] = 6; // length
+    t[off + 2] = 0xFF; // all processors
+    t[off + 3..off + 5].copy_from_slice(&0x0000u16.to_le_bytes()); // conforms to bus
+    t[off + 5] = 1; // LINT1
     t
 }
 
@@ -246,8 +262,9 @@ pub fn build_acpi_files(num_cpus: u32) -> AcpiFiles {
     let dsdt = build_dsdt();
     let dsdt_len = dsdt.len() as u32;
     let madt_off = (DSDT_OFF + dsdt_len + 15) & !15; // alinear a 16
-    let madt_len = (44 + 8 * num_cpus as usize + 12) as u32;
-    let facs_off = (madt_off + madt_len + 15) & !15; // alinear a 16
+    let madt = build_madt(num_cpus);
+    let madt_len = madt.len() as u32;
+    let facs_off = (madt_off + madt_len + 63) & !63; // FACS debe alinearse a 64 bytes (ACPI §5.2.10)
     let total = (facs_off + 64) as usize;
 
     let mut tables = Vec::with_capacity(total);
@@ -257,7 +274,7 @@ pub fn build_acpi_files(num_cpus: u32) -> AcpiFiles {
     tables.resize(DSDT_OFF as usize, 0);
     tables.extend_from_slice(&dsdt);
     tables.resize(madt_off as usize, 0);
-    tables.extend_from_slice(&build_madt(num_cpus));
+    tables.extend_from_slice(&madt);
     tables.resize(facs_off as usize, 0);
     tables.extend_from_slice(&build_facs());
     debug_assert_eq!(tables.len(), total);
@@ -387,8 +404,9 @@ mod tests {
         let (tables, rsdp) = simulate_loader(&files);
         let dsdt_len = build_dsdt().len();
         let madt_off = (0xC0 + dsdt_len + 15) & !15;
-        let madt_len = 44 + 16 + 12;
-        let facs_off = (madt_off + madt_len + 15) & !15;
+        let madt_len = build_madt(2).len();
+        let facs_off = (madt_off + madt_len + 63) & !63;
+        assert_eq!(facs_off % 64, 0, "FACS debe estar alineado a 64 bytes");
 
         // RSDP: firma + checksum del bloque de 20 bytes + puntero al RSDT.
         assert_eq!(&rsdp[0..8], b"RSD PTR ");
@@ -409,9 +427,14 @@ mod tests {
             "RSDT[1] apunta al MADT"
         );
 
-        // FADT: checksum + punteros a DSDT y FACS.
+        // FADT: checksum + punteros a DSDT y FACS + flags sin USE_PLATFORM_CLOCK.
         assert_eq!(sig(&tables, 0x40), *b"FACP");
         assert_eq!(checksum(&tables[0x40..0x40 + 116]), 0, "checksum FADT");
+        assert_eq!(
+            u32::from_le_bytes(tables[0x40 + 112..0x40 + 116].try_into().unwrap()) & 0x8000,
+            0,
+            "USE_PLATFORM_CLOCK debe estar desactivado"
+        );
         assert_eq!(
             u32::from_le_bytes(tables[0x40 + 40..0x40 + 44].try_into().unwrap()),
             0x0010_0000 + 0xC0,
@@ -434,11 +457,12 @@ mod tests {
             &[0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x04, 0, 0, 0, 0]
         );
 
-        // MADT: checksum, LAPIC base y flags PCAT.
+        // MADT: checksum, LAPIC base, flags PCAT e IOAPIC ID != 0/1.
         assert_eq!(sig(&tables, madt_off), *b"APIC");
         assert_eq!(checksum(&tables[madt_off..madt_off + madt_len]), 0, "checksum MADT");
         assert_eq!(u32::from_le_bytes(tables[madt_off + 36..madt_off + 40].try_into().unwrap()), 0xFEE0_0000);
         assert_eq!(u32::from_le_bytes(tables[madt_off + 40..madt_off + 44].try_into().unwrap()), 1);
+        assert_eq!(tables[madt_off + 44 + 16 + 2], 0x0F, "IOAPIC ID no colisiona con LAPICs");
 
         // FACS presente con longitud correcta.
         assert_eq!(sig(&tables, facs_off), *b"FACS");
@@ -449,10 +473,9 @@ mod tests {
         let files = build_acpi_files(8);
         let dsdt_len = build_dsdt().len();
         let madt_off = (0xC0 + dsdt_len + 15) & !15;
-        // 8 LAPIC + IOAPIC: MADT = 44 + 64 + 12 = 120 bytes.
         let (tables, _) = simulate_loader(&files);
-        let madt_len = 44 + 64 + 12;
-        let facs_off = (madt_off + madt_len + 15) & !15;
+        let madt_len = build_madt(8).len();
+        let facs_off = (madt_off + madt_len + 63) & !63;
         assert_eq!(checksum(&tables[madt_off..madt_off + madt_len]), 0, "checksum MADT 8 cpus");
         assert_eq!(sig(&tables, facs_off), *b"FACS");
     }

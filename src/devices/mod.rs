@@ -135,19 +135,17 @@ pub struct DeviceBus {
     pub e1000: e1000::E1000Device,
     pub e1000_state: std::sync::Arc<std::sync::Mutex<e1000::E1000State>>,
     pub guest_mem: Option<std::sync::Arc<crate::guest_mem::GuestMemory>>,
-    // (tarea 1) Ventana de high RAM de KVM (slot 2): necesaria para
-    // re-apuntar el framebuffer cuando el guest asigna el BAR0 VGA dentro
-    // de RAM respaldada (esos accesos no generan exits MMIO).
-    high_mem_ptr: *mut u8,
-    high_mem_gpa: u64,
-    high_mem_size: usize,
-    /// (tarea 1) Contador de exits MMIO no enrutados (log limitado).
+    /// Solicitud pendiente de remapeo de BAR0 VGA (slot 3 KVM de 64 MiB VRAM).
+    pub pending_vga_bar0_remap: Option<u32>,
+    /// GPA actual mapeada para el slot 3 de VRAM.
+    pub mapped_vram_gpa: Option<u64>,
+    /// Dirección base GPA de la flash CFI UEFI (pflash).
+    pub pflash_base: u64,
+    /// Contador de exits MMIO no enrutados (log limitado).
     unknown_mmio_events: u64,
     /// Estado cacheado de las líneas IRQ PCI ya subidas en el irqchip del
-    /// kernel (bit `line` = 1). `sync_pci_irqs` consulta este cache antes de
-    /// emitir `KVM_IRQ_LINE`: re-emitir el mismo nivel costaba ~480 ns de
-    /// ioctl por línea y por cada VM-exit (y había 4 líneas por exit).
-    pci_irq_high: u16,
+    /// kernel (bit `line` = 1).
+    pci_irq_high: u32,
 }
 
 // Safety (tarea 6): DeviceBus se comparte entre los hilos de todos los
@@ -167,25 +165,41 @@ impl DeviceBus {
         vram_size: usize,
         ram_size: u64,
         num_cpus: u32,
-        high_mem_ptr: *mut u8,
-        high_mem_gpa: u64,
-        high_mem_size: usize,
         vga_rom: Option<Vec<u8>>,
     ) -> Result<(Self, std::sync::Arc<std::sync::Mutex<vga::VgaState>>), Box<dyn std::error::Error>> {
-        // `num_cpus` (tarea 6): se anuncia al guest por fw_cfg
-        // (FW_CFG_NB_CPUS/FW_CFG_MAX_CPUS) para que SeaBIOS acote su
-        // sondeo SIPI y construya la tabla MP con el nº real de vCPUs.
+        Self::new_with_net(
+            iso_path,
+            disk_path,
+            vram_ptr,
+            vram_size,
+            ram_size,
+            num_cpus,
+            vga_rom,
+            None,
+        )
+    }
+
+    pub fn new_with_net(
+        iso_path: Option<&str>,
+        disk_path: Option<&str>,
+        vram_ptr: *mut u8,
+        vram_size: usize,
+        ram_size: u64,
+        num_cpus: u32,
+        vga_rom: Option<Vec<u8>>,
+        net_cfg: Option<virtio_net::NetConfig>,
+    ) -> Result<(Self, std::sync::Arc<std::sync::Mutex<vga::VgaState>>), Box<dyn std::error::Error>> {
         // ─── Controlador SATA AHCI (Estándar VirtualBox ICH8M/ICH9) ───
         // Conecta el disco duro al Puerto 0 y el medio óptico ISO al Puerto 1.
         let ahci = ahci::AhciController::with_files(disk_path, iso_path);
+        let mut pci = pci::PciBus::with_legacy_ide();
 
         // ─── Canales IDE legados (0x1F0 y 0x170) ───
-        // En arquitectura PC/VirtualBox, si el almacenamiento está asignado al bus SATA AHCI,
-        // los canales IDE legados deben permanecer vacíos/stub para evitar que el SO invitado
-        // (ej. Windows 7) detecte discos duplicados en ambos controladores, lo cual provocaría
-        // colisión de firmas de disco (Disk Signature Collision) e inconsistencia de particiones.
+        // Si AHCI maneja los medios, desactivamos IDE en PIIX3 y dejamos cdrom=None
+        // para evitar stubs fantasma o colisiones con AHCI Port 0/1.
         let (primary_ide, cdrom) = if ahci.ports[0].present || ahci.ports[1].present {
-            (cdrom::PrimaryIde::new(), Some(cdrom::CdRom::stub()))
+            pci.set_ide_channels_enabled(false, false);
+            (cdrom::PrimaryIde::new(), None)
         } else {
             let p_ide = if let Some(p) = disk_path {
                 cdrom::PrimaryIde::with_disk(p).unwrap_or_else(|_| cdrom::PrimaryIde::new())
@@ -194,7 +208,7 @@ impl DeviceBus {
             };
             let cd = match iso_path {
                 Some(p) => Some(cdrom::CdRom::new(p)?),
-                None => Some(cdrom::CdRom::stub()),
+                None => None,
             };
             (p_ide, cd)
         };
@@ -202,9 +216,11 @@ impl DeviceBus {
         let usb = UsbUhci::new();
         let virtio_serial_state = std::sync::Arc::new(std::sync::Mutex::new(VirtioSerialState::new()));
         let virtio_serial = VirtioSerialDevice::new(virtio_serial_state.clone());
-        let virtio_net_state = std::sync::Arc::new(std::sync::Mutex::new(VirtioNetState::new()));
+        let virtio_net_state = std::sync::Arc::new(std::sync::Mutex::new(match net_cfg {
+            Some(cfg) => VirtioNetState::with_config(cfg),
+            None => VirtioNetState::new(),
+        }));
         let virtio_net = VirtioNetDevice::new(virtio_net_state.clone());
-        let mut pci = pci::PciBus::with_legacy_ide();
         pci.connect_usb(usb.state.clone());
         pci.connect_virtio_serial(virtio_serial_state.clone());
         pci.connect_virtio_net(virtio_net_state.clone());
@@ -260,9 +276,9 @@ impl DeviceBus {
                 e1000,
                 e1000_state,
                 guest_mem: None,
-                high_mem_ptr,
-                high_mem_gpa,
-                high_mem_size,
+                pending_vga_bar0_remap: None,
+                mapped_vram_gpa: Some(vga::VRAM_DEFAULT_BASE_GPA),
+                pflash_base: 0xFFC0_0000,
                 unknown_mmio_events: 0,
                 pci_irq_high: 0,
             },
@@ -278,19 +294,19 @@ impl DeviceBus {
     /// Nivel cacheado de una línea IRQ PCI en el irqchip del kernel.
     #[inline]
     pub fn pci_irq_level(&self, line: u8) -> bool {
-        line < 16 && (self.pci_irq_high & (1u16 << line)) != 0
+        line < 32 && (self.pci_irq_high & (1u32 << line)) != 0
     }
 
     /// Actualiza el nivel cacheado de una línea IRQ PCI tras emitir el ioctl.
     #[inline]
     pub fn set_pci_irq_level(&mut self, line: u8, high: bool) {
-        if line >= 16 {
+        if line >= 32 {
             return;
         }
         if high {
-            self.pci_irq_high |= 1u16 << line;
+            self.pci_irq_high |= 1u32 << line;
         } else {
-            self.pci_irq_high &= !(1u16 << line);
+            self.pci_irq_high &= !(1u32 << line);
         }
     }
 
@@ -313,19 +329,19 @@ impl DeviceBus {
         self.pci.reset();
         self.bmdma.reset();
         self.ahci.reset();
-        self.vmmdev_state.lock().unwrap().reset();
+        self.vmmdev_state.lock().unwrap_or_else(|p| p.into_inner()).reset();
         self.vmmdev.set_iobase(0);
         self.vmmdev.set_mmio_base(0);
-        self.ac97_state.lock().unwrap().reset();
+        self.ac97_state.lock().unwrap_or_else(|p| p.into_inner()).reset();
         self.ac97.set_nambar(0);
         self.ac97.set_nabmbar(0);
-        self.e1000_state.lock().unwrap().reset();
+        self.e1000_state.lock().unwrap_or_else(|p| p.into_inner()).reset();
         self.e1000.set_iobase(0);
         self.e1000.set_mmio_base(0);
         self.hpet.reset();
         self.usb.reset();
-        self.virtio_serial_state.lock().unwrap().reset();
-        self.virtio_net_state.lock().unwrap().reset();
+        self.virtio_serial_state.lock().unwrap_or_else(|p| p.into_inner()).reset();
+        self.virtio_net_state.lock().unwrap_or_else(|p| p.into_inner()).reset();
         self.debugcon.reset();
         self.post.reset();
         self.cmos.reset();
@@ -334,11 +350,15 @@ impl DeviceBus {
         self.a20.reset();
         self.acpi_pm.reset();
         self.vga.reset();
+        self.pending_vga_bar0_remap = Some(vga::VRAM_DEFAULT_BASE_GPA as u32);
         self.floppy.reset();
         self.platform.reset();
         self.dma.reset();
         self.apm.reset();
         self.cpu_hotplug.reset(1);
+        if self.ahci.ports[0].present || self.ahci.ports[1].present {
+            self.pci.set_ide_channels_enabled(false, false);
+        }
         if let Some(pf) = self.pflash.as_mut() {
             pf.mode = pflash::PFlashMode::ReadArray;
             pf.status = pflash::ParallelFlash::STATUS_READY;
@@ -378,27 +398,28 @@ impl DeviceBus {
             self.e1000.io_write(port, data, self.guest_mem.as_deref());
             return true;
         }
+        if self.fw_cfg.matches_port(port) {
+            self.fw_cfg.write_with_mem(port, data, self.guest_mem.as_deref());
+            return true;
+        }
         io_dispatch_out!(self, port, data;
             debugcon,
             post,
             a20,
             acpi_pm,
             cmos,
-            fw_cfg,
             uart,
             pci => {
                 // Check for PIIX3 ACPI PM config writes and update AcpiPm
                 if let Some((reg, val)) = self.pci.last_acpi_config_write.take() {
                     self.acpi_pm.update_pci_config(reg, val);
                 }
-                // (tarea 1) Asignaciones de BARs VGA detectadas en el config
-                // space: registrarlas y (si caen en RAM respaldada del slot 2)
-                // re-apuntar el framebuffer del renderizador.
                 if let Some(base) = self.pci.last_vga_lfb_bar_write.take() {
-                    self.apply_vga_bar_assignment(base, true);
+                    self.vga.set_lfb_bar(base);
+                    self.pending_vga_bar0_remap = Some(base);
                 }
                 if let Some(base) = self.pci.last_vga_mmio_bar_write.take() {
-                    self.apply_vga_bar_assignment(base, false);
+                    self.vga.set_mmio_bar(base);
                 }
                 if let Some(base) = self.pci.last_ide_bmdma_bar_write.take() {
                     self.bmdma.set_iobase(base);
@@ -446,7 +467,11 @@ impl DeviceBus {
             floppy,
             vga,
             usb,
-            virtio_serial,
+            virtio_serial => {
+                if let Some(mem) = self.guest_mem.clone() {
+                    self.step_virtio_serial(&mem);
+                }
+            },
             virtio_net => {
                 if let Some(mem) = self.guest_mem.clone() {
                     self.step_virtio_net(&mem);
@@ -458,40 +483,23 @@ impl DeviceBus {
         )
     }
 
-    // ─── MMIO (tarea 1 & 22) ───────────────────────────────────
+    // ─── MMIO ──────────────────────────────────────────────────
 
-    /// (tarea 1) Aplica la asignación de un BAR VGA detectada en el config
-    /// space. Si el BAR0 (framebuffer) cae dentro de la ventana de high RAM
-    /// (slot 2 de KVM), los accesos del guest son RAM normal y NO generan
-    /// exits MMIO: re-apuntamos el puntero host del framebuffer para que el
-    /// renderizador (display.rs) lea la zona donde el guest escribe de verdad.
-    /// Si cae fuera, los accesos llegarán como exits MmioRead/MmioWrite y los
-    /// atiende `VgaDevice::mmio_read/mmio_write`.
-    fn apply_vga_bar_assignment(&mut self, base: u32, is_lfb: bool) {
-        if !is_lfb {
-            self.vga.set_mmio_bar(base);
-            return;
-        }
-        self.vga.set_lfb_bar(base);
-        let vram_size = { self.vga.state.lock().unwrap().vram_size } as u64;
-        let gpa = (base & 0xFFFF_FFF0) as u64;
-        if base != 0
-            && gpa >= self.high_mem_gpa
-            && gpa + vram_size <= self.high_mem_gpa + self.high_mem_size as u64
-        {
-            let off = (gpa - self.high_mem_gpa) as usize;
-            let ptr = unsafe { self.high_mem_ptr.add(off) };
-            self.vga.set_vram_host_ptr(ptr);
-            eprintln!(
-                "[VGA] Framebuffer RAM-backed: vram re-apuntado a high_mem+{:#x} (GPA {:#x})",
-                off, gpa
-            );
-        }
+    /// Consume la petición pendiente de remapeo de BAR0 VGA para KVM slot 3.
+    pub fn take_vga_bar0_remap(&mut self) -> Option<u32> {
+        self.pending_vga_bar0_remap.take()
     }
 
-    /// (tarea 1 & 22) Despacha una escritura MMIO del guest (exit MmioWrite).
-    /// Enruta a VGA (BAR2 dispi + BAR0 framebuffer) y PFlash (UEFI/OVMF VarStore).
+    /// Despacha una escritura MMIO del guest (exit MmioWrite).
     pub fn mmio_write(&mut self, addr: u64, data: &[u8]) {
+        if (0xA0000..=0xB7FFF).contains(&addr) {
+            self.vga
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mmio_vga_window_write(addr, data);
+            return;
+        }
         if self.vga.mmio_write(addr, data) {
             return;
         }
@@ -513,10 +521,12 @@ impl DeviceBus {
             return;
         }
         if let Some(pf) = self.pflash.as_mut() {
-            let flash_offset = addr.saturating_sub(0xFFC0_0000);
-            if flash_offset < pf.data.len() as u64 {
-                pf.write(flash_offset as usize, data);
-                return;
+            if addr >= self.pflash_base {
+                let flash_offset = addr - self.pflash_base;
+                if flash_offset < pf.data.len() as u64 {
+                    pf.write(flash_offset as usize, data);
+                    return;
+                }
             }
         }
         self.unknown_mmio_events += 1;
@@ -528,9 +538,19 @@ impl DeviceBus {
         }
     }
 
-    /// (tarea 1 & 22) Despacha una lectura MMIO del guest (exit MmioRead).
+    /// Despacha una lectura MMIO del guest (exit MmioRead).
     /// Devuelve exactamente `size` bytes (0xFF si nadie atiende la dirección).
     pub fn mmio_read(&mut self, addr: u64, size: usize) -> Vec<u8> {
+        if (0xA0000..=0xB7FFF).contains(&addr) {
+            if let Some(bytes) = self.vga
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mmio_vga_window_read(addr, size)
+            {
+                return bytes;
+            }
+        }
         if let Some(bytes) = self.vga.mmio_read(addr, size) {
             return bytes;
         }
@@ -549,11 +569,13 @@ impl DeviceBus {
             return self.e1000.mmio_read(addr, size);
         }
         if let Some(pf) = self.pflash.as_ref() {
-            let flash_offset = addr.saturating_sub(0xFFC0_0000);
-            if flash_offset < pf.data.len() as u64 {
-                let mut bytes = pf.read(flash_offset as usize, size);
-                bytes.resize(size, 0xFF);
-                return bytes;
+            if addr >= self.pflash_base {
+                let flash_offset = addr - self.pflash_base;
+                if flash_offset < pf.data.len() as u64 {
+                    let mut bytes = pf.read(flash_offset as usize, size);
+                    bytes.resize(size, 0xFF);
+                    return bytes;
+                }
             }
         }
         self.unknown_mmio_events += 1;
@@ -616,8 +638,9 @@ impl DeviceBus {
         self.cpu_hotplug.take_sci()
     }
 
-    /// Asigna una instancia emulada de flash paralela CFI / VarStore (Item 22).
-    pub fn set_pflash(&mut self, pflash: ParallelFlash) {
+    /// Asigna una instancia emulada de flash paralela CFI / VarStore y su base GPA.
+    pub fn set_pflash(&mut self, pflash: ParallelFlash, base: u64) {
+        self.pflash_base = base;
         self.pflash = Some(pflash);
     }
 
@@ -756,12 +779,12 @@ impl DeviceBus {
 
     /// Avanza las virtqueues del VirtIO-Serial y despacha mensajes de resolución.
     pub fn step_virtio_serial(&mut self, mem: &crate::guest_mem::GuestMemory) {
-        self.virtio_serial_state.lock().unwrap().step(mem);
+        self.virtio_serial_state.lock().unwrap_or_else(|p| p.into_inner()).step(mem);
     }
 
     /// Extrae el flag de pulso de interrupción de VirtIO-Serial.
     pub fn take_virtio_serial_irq_pulse(&mut self) -> bool {
-        self.virtio_serial_state.lock().unwrap().take_irq_pulse()
+        self.virtio_serial_state.lock().unwrap_or_else(|p| p.into_inner()).take_irq_pulse()
     }
 
     /// Devuelve la línea IRQ asignada a VirtIO-Serial (dev 3:0).
@@ -771,12 +794,12 @@ impl DeviceBus {
 
     /// Comprueba si la línea de interrupción de VirtIO-Serial está activa.
     pub fn is_virtio_serial_irq_asserted(&self) -> bool {
-        self.virtio_serial_state.lock().unwrap().isr_status != 0
+        self.virtio_serial_state.lock().unwrap_or_else(|p| p.into_inner()).isr_status != 0
     }
 
     /// Devuelve `(irq_asserted, fresh_pulse)` de VirtIO-Serial con un único lock.
     pub fn poll_virtio_serial_irq(&self) -> (bool, bool) {
-        let mut st = self.virtio_serial_state.lock().unwrap();
+        let mut st = self.virtio_serial_state.lock().unwrap_or_else(|p| p.into_inner());
         let asserted = st.isr_status != 0;
         let pulse = st.take_irq_pulse();
         (asserted, pulse)
@@ -784,7 +807,7 @@ impl DeviceBus {
 
     /// Solicita un cambio de resolución dinámica a VirtIO-Serial y VirtualBox VMMDev.
     pub fn request_resolution(&mut self, width: u32, height: u32) {
-        self.virtio_serial_state.lock().unwrap().request_resolution(width, height);
+        self.virtio_serial_state.lock().unwrap_or_else(|p| p.into_inner()).request_resolution(width, height);
         if let Ok(mut vmm) = self.vmmdev_state.try_lock() {
             vmm.request_display_resize(width, height, 32);
         }
@@ -794,22 +817,22 @@ impl DeviceBus {
 
     /// Avanza las virtqueues del VirtIO-Net (procesa TX y despacha tramas RX pendientes).
     pub fn step_virtio_net(&mut self, mem: &crate::guest_mem::GuestMemory) {
-        self.virtio_net_state.lock().unwrap().step(mem);
+        self.virtio_net_state.lock().unwrap_or_else(|p| p.into_inner()).step(mem);
     }
 
     /// Extrae el flag de pulso de interrupción de VirtIO-Net.
     pub fn take_virtio_net_irq_pulse(&mut self) -> bool {
-        self.virtio_net_state.lock().unwrap().take_irq_pulse()
+        self.virtio_net_state.lock().unwrap_or_else(|p| p.into_inner()).take_irq_pulse()
     }
 
     /// Comprueba si la línea de interrupción de VirtIO-Net está activa.
     pub fn is_virtio_net_irq_asserted(&self) -> bool {
-        self.virtio_net_state.lock().unwrap().isr_status != 0
+        self.virtio_net_state.lock().unwrap_or_else(|p| p.into_inner()).isr_status != 0
     }
 
     /// Devuelve `(irq_asserted, fresh_pulse)` de VirtIO-Net con un único lock.
     pub fn poll_virtio_net_irq(&self) -> (bool, bool) {
-        let mut st = self.virtio_net_state.lock().unwrap();
+        let mut st = self.virtio_net_state.lock().unwrap_or_else(|p| p.into_inner());
         let asserted = st.isr_status != 0;
         let pulse = st.take_irq_pulse();
         (asserted, pulse)
@@ -841,7 +864,7 @@ impl DeviceBus {
 
     /// Comprueba si la línea de interrupción del VMMDev está activa.
     pub fn is_vmmdev_irq_asserted(&self) -> bool {
-        self.vmmdev_state.lock().unwrap().irq_asserted
+        self.vmmdev_state.lock().unwrap_or_else(|p| p.into_inner()).irq_asserted
     }
 
     // ─── Intel 82801AA AC'97 Audio (dev 7:0) ─────────────────────────
@@ -853,7 +876,26 @@ impl DeviceBus {
 
     /// Comprueba si la línea de interrupción del AC'97 está activa.
     pub fn is_ac97_irq_asserted(&self) -> bool {
-        self.ac97_state.lock().unwrap().irq_asserted
+        self.ac97_state.lock().unwrap_or_else(|p| p.into_inner()).irq_asserted
+    }
+
+    /// Avanza los flujos DMA de audio AC'97 hacia el sink de host.
+    pub fn step_ac97(&mut self, mem: &crate::guest_mem::GuestMemory) {
+        self.ac97.step_streams(mem);
+    }
+
+    /// Avanza el contador HPET en nanosegundos reales y retorna IRQs disparadas.
+    pub fn step_hpet(&mut self, elapsed_ns: u64) -> Vec<u8> {
+        self.hpet.advance_ticks(elapsed_ns / 10);
+        self.hpet.check_irqs()
+    }
+
+    pub fn is_acpi_sci_asserted(&self) -> bool {
+        self.acpi_pm.sci_asserted()
+    }
+
+    pub fn set_uart_suppress_stdout(&mut self, suppress: bool) {
+        self.uart.suppress_stdout = suppress;
     }
 
     // ─── Intel PRO/1000 MT Desktop (e1000 dev 8:0) ───────────────────
@@ -865,12 +907,12 @@ impl DeviceBus {
 
     /// Comprueba si la línea de interrupción del e1000 está activa.
     pub fn is_e1000_irq_asserted(&self) -> bool {
-        self.e1000_state.lock().unwrap().irq_asserted
+        self.e1000_state.lock().unwrap_or_else(|p| p.into_inner()).irq_asserted
     }
 
     /// Avanza el e1000 recogiendo paquetes recibidos desde el host / NAT
     pub fn step_e1000(&mut self, mem: &crate::guest_mem::GuestMemory) {
-        self.e1000_state.lock().unwrap().step(mem);
+        self.e1000_state.lock().unwrap_or_else(|p| p.into_inner()).step(mem);
     }
 
     /// True si el guest pidió apagado limpio vía ACPI: escribió SLP_EN en
@@ -879,39 +921,38 @@ impl DeviceBus {
         self.acpi_pm.sleep_requested()
     }
 
-    /// Comprueba si algún dispositivo del sistema (8042 port 0x64 o Fast A20 port 0x92)
+    /// Comprueba si algún dispositivo del sistema (8042, Fast A20 o PCI 0xCF9)
     /// solicitó un reinicio por hardware del procesador.
     pub fn take_reset_requested(&mut self) -> bool {
         let r1 = self.legacy_irq.take_reset_requested();
         let r2 = self.a20.take_reset_requested();
-        r1 || r2
+        let r3 = self.pci.take_reset_requested();
+        r1 || r2 || r3
     }
 
-    /// Expulsa el CD-ROM en caliente.
+    /// Expulsa el CD-ROM en caliente (AHCI Port 1 y/o IDE secundario).
     pub fn eject_cdrom(&mut self) {
+        self.ahci.eject_iso();
         if let Some(cd) = self.cdrom.as_mut() {
             cd.eject();
         }
     }
 
-    /// Inserta una nueva imagen ISO en caliente.
+    /// Inserta una nueva imagen ISO en caliente (AHCI Port 1 o IDE secundario).
     pub fn insert_cdrom(&mut self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
         if let Some(cd) = self.cdrom.as_mut() {
             cd.insert(path)
         } else {
-            let cd = cdrom::CdRom::new(path)?;
-            let size = cd.iso_size;
-            self.cdrom = Some(cd);
-            Ok(size)
+            self.ahci.insert_iso(path)
         }
     }
 
     pub fn is_cdrom_inserted(&self) -> bool {
-        self.cdrom.as_ref().map(|c| c.is_inserted()).unwrap_or(false)
+        self.ahci.is_iso_inserted() || self.cdrom.as_ref().map(|c| c.is_inserted()).unwrap_or(false)
     }
 
     pub fn cdrom_sectors_read(&self) -> u64 {
-        self.cdrom.as_ref().map(|c| c.sectors_read_total).unwrap_or(0)
+        self.ahci.cdrom_sectors_read_total + self.cdrom.as_ref().map(|c| c.sectors_read_total).unwrap_or(0)
     }
 
     pub fn disk_sectors_read(&self) -> u64 {

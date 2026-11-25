@@ -28,10 +28,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// (tarea 2) Tope de seguridad para offsets planares: el estándar VGA
-/// direcciona 256 KiB de VRAM (4 planos × 64 KiB).
-const VGA_ADDRABLE: usize = 256 * 1024;
-
 /// Altura en píxeles de la barra de herramientas superior estilo VirtualBox.
 pub const TOP_BAR_H: usize = 24;
 
@@ -174,10 +170,27 @@ fn draw_char_8x16(buf: &mut [u32], buf_w: usize, buf_h: usize, x: usize, y: usiz
     }
 }
 
+fn unicode_to_cp437(c: char) -> u8 {
+    if c.is_ascii() {
+        return c as u8;
+    }
+    match c {
+        'á' => 0xA0, 'é' => 0x82, 'í' => 0xA1, 'ó' => 0xA2, 'ú' => 0xA3,
+        'Á' => b'A', 'É' => 0x90, 'Í' => b'I', 'Ó' => b'O', 'Ú' => b'U',
+        'ñ' => 0xA4, 'Ñ' => 0xA5,
+        'ü' => 0x81, 'Ü' => 0x9A,
+        'ç' => 0x87, 'Ç' => 0x80,
+        '¿' => 0xA8, '¡' => 0xAD,
+        '—' | '–' => 0xC4,
+        '°' | 'º' => 0xA7, 'ª' => 0xA6,
+        _ => b'?',
+    }
+}
+
 fn draw_string_8x16(buf: &mut [u32], buf_w: usize, buf_h: usize, x: usize, y: usize, s: &str, fg: u32, bg: Option<u32>) {
     let mut cx = x;
-    for b in s.bytes() {
-        draw_char_8x16(buf, buf_w, buf_h, cx, y, b, fg, bg);
+    for ch in s.chars() {
+        draw_char_8x16(buf, buf_w, buf_h, cx, y, unicode_to_cp437(ch), fg, bg);
         cx += 8;
     }
 }
@@ -885,6 +898,7 @@ pub fn save_bmp_screenshot_buffer(buf: &[u32], w: usize, h: usize, path: &str) -
 /// los valores positivos (+Y) indican movimiento hacia ARRIBA y los negativos (-Y) hacia ABAJO.
 /// Por tanto, dy se calcula como `(ly - my)` para que el movimiento hacia abajo en la ventana del
 /// host resulte en un delta negativo en PS/2 y el cursor del sistema operativo virtualizado se mueva hacia abajo.
+#[allow(dead_code)]
 #[inline]
 pub fn compute_mouse_deltas(lx: f32, ly: f32, mx: f32, my: f32) -> (i16, i16) {
     let dx = (mx - lx) as i16;
@@ -989,25 +1003,15 @@ impl DisplayManager {
             let mut last_size_change = std::time::Instant::now();
             let mut size_pending = false;
 
-            // ── Entrada de teclado (tarea 19) ─────────────────────────
-            let caps_on = Arc::new(AtomicBool::new(false));
-            let numpad_on = Arc::new(AtomicBool::new(false));
-            let ctrl_held = Arc::new(AtomicBool::new(false));
-            let lalt_held = Arc::new(AtomicBool::new(false));
-
-            window.set_input_callback(Box::new(CharInput {
-                kbd_queue: kbd_queue.clone(),
-                ctrl_held: ctrl_held.clone(),
-                lalt_held: lalt_held.clone(),
-                caps_on: caps_on.clone(),
-            }));
-
-            // Teclas de control actualmente pulsadas → break al soltar.
+            // ── Entrada de teclado físico PS/2 Set 1 ──────────────────
             let mut held: HashMap<Key, Vec<u8>> = HashMap::new();
+            let mut right_ctrl_was_down = false;
+            let mut host_combo_used = false;
             let mut logged_desktop = false;
             let mut frame_count = 0u32;
             let mut last_fps_time = std::time::Instant::now();
-            let mut last_mode = (false, false, false, 0usize, 0usize);
+            let mut last_mode = (false, false, false, 0usize, 0usize, 0usize);
+            let mut last_vbe_params = (0usize, 0usize, 0usize, 0usize, false, 0u64);
             let mut preserve_aspect = true;
             let mut auto_resize_guest = true;
             let mut current_viewport = (0usize, TOP_BAR_H, initial_width, initial_height.saturating_sub(TOP_BAR_H));
@@ -1040,8 +1044,6 @@ impl DisplayManager {
                     last_mouse = None;
                     accum_mouse_x = 0.0;
                     accum_mouse_y = 0.0;
-                    // Al pasar a absoluto hay que re-afirmar la posición sí o
-                    // sí: el cursor del guest puede estar en cualquier sitio.
                     last_tablet = None;
                     toast = Some(("Integración de ratón activa (Puntero absoluto detectado)".to_string(), std::time::Instant::now()));
                     force_full_redraw = true;
@@ -1057,8 +1059,31 @@ impl DisplayManager {
                     window.set_cursor_visibility(true);
                     cursor_hidden = false;
                 }
-                // ── Snapshot del modo actual ────────────────────────
-                let (is_vbe, is_std_gfx, is_vbe_active, lw, lh, bpp, virt_w, x_off, y_off, dac8) = {
+
+                // ── Snapshot único de VgaState por frame ────────────────
+                struct FrameVgaSnap {
+                    is_vbe: bool,
+                    is_std_gfx: bool,
+                    is_vbe_active: bool,
+                    lw: usize,
+                    lh: usize,
+                    bpp: usize,
+                    virt_w: usize,
+                    x_off: usize,
+                    y_off: usize,
+                    dac8: bool,
+                    palette_gen: u64,
+                    vram_ptr: *mut u8,
+                    vram_size: usize,
+                    dac_palette: [u8; 768],
+                    std_vga_state: Option<VgaState>,
+                    crtc_start_addr: usize,
+                    cursor_pos: usize,
+                    cursor_start: u8,
+                    cursor_end: u8,
+                }
+
+                let snap = {
                     let st = vga_state.lock().unwrap();
                     let (w, h, b) = st.get_resolution();
                     let is_vbe = st.is_vbe_enabled();
@@ -1067,24 +1092,49 @@ impl DisplayManager {
                     let (lw, lh) = if is_vbe {
                         (w, h)
                     } else if is_std_gfx {
-                        let (gw, gh) = st.standard_vga_geometry();
-                        (gw, gh)
+                        st.standard_vga_geometry()
                     } else {
                         (640, 400)
                     };
-                    (
+                    let dac_palette = if is_vbe && b <= 8 { st.dac_palette } else { [0u8; 768] };
+                    let std_vga_state = if is_std_gfx { Some(st.clone()) } else { None };
+                    let crtc_start_addr = ((st.crtc_regs[0x0C] as usize) << 8) | (st.crtc_regs[0x0D] as usize);
+                    let cursor_pos = ((st.crtc_regs[0x0E] as usize) << 8) | (st.crtc_regs[0x0F] as usize);
+                    FrameVgaSnap {
                         is_vbe,
                         is_std_gfx,
                         is_vbe_active,
                         lw,
                         lh,
-                        b,
-                        st.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] as usize,
-                        st.dispi_regs[VBE_DISPI_INDEX_X_OFFSET as usize] as usize,
-                        st.dispi_regs[VBE_DISPI_INDEX_Y_OFFSET as usize] as usize,
-                        st.dispi_regs[VBE_DISPI_INDEX_ENABLE as usize] & VBE_DISPI_8BIT_DAC != 0,
-                    )
+                        bpp: b,
+                        virt_w: st.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] as usize,
+                        x_off: st.dispi_regs[VBE_DISPI_INDEX_X_OFFSET as usize] as usize,
+                        y_off: st.dispi_regs[VBE_DISPI_INDEX_Y_OFFSET as usize] as usize,
+                        dac8: st.dispi_regs[VBE_DISPI_INDEX_ENABLE as usize] & VBE_DISPI_8BIT_DAC != 0,
+                        palette_gen: st.palette_gen,
+                        vram_ptr: st.vram_ptr,
+                        vram_size: st.vram_size,
+                        dac_palette,
+                        std_vga_state,
+                        crtc_start_addr,
+                        cursor_pos,
+                        cursor_start: st.crtc_regs[0x0A],
+                        cursor_end: st.crtc_regs[0x0B],
+                    }
                 };
+
+                let (is_vbe, is_std_gfx, is_vbe_active, lw, lh, bpp, virt_w, x_off, y_off, dac8) = (
+                    snap.is_vbe,
+                    snap.is_std_gfx,
+                    snap.is_vbe_active,
+                    snap.lw,
+                    snap.lh,
+                    snap.bpp,
+                    snap.virt_w,
+                    snap.x_off,
+                    snap.y_off,
+                    snap.dac8,
+                );
 
                 metrics.display_width.store(lw as u32, Ordering::Relaxed);
                 metrics.display_height.store(lh as u32, Ordering::Relaxed);
@@ -1097,7 +1147,7 @@ impl DisplayManager {
                 }
 
                 // Limpiar el buffer al cambiar de modo para evitar artefactos visuales
-                let current_mode = (is_vbe, is_std_gfx, is_vbe_active, lw, lh);
+                let current_mode = (is_vbe, is_std_gfx, is_vbe_active, lw, lh, bpp);
                 if current_mode != last_mode {
                     render_buf.fill(0);
                     scanline_hashes.clear();
@@ -1106,50 +1156,38 @@ impl DisplayManager {
                     force_full_redraw = true;
                     last_mode = current_mode;
                     let mode_desc = if is_vbe { "VBE Lineal" } else if is_std_gfx { "VGA Estándar" } else { "VGA Texto" };
-                    let title = format!("Two Five Five — Pantalla Virtual [{}x{}@{}bpp, {}]", lw, lh, bpp, mode_desc);
+                    let title = format!("{} [{}x{}@{}bpp, {}]", win_title, lw, lh, bpp, mode_desc);
                     window.set_title(&title);
+                }
+
+                let cur_vbe_params = (bpp, virt_w, x_off, y_off, dac8, snap.palette_gen);
+                if cur_vbe_params != last_vbe_params {
+                    last_vbe_params = cur_vbe_params;
+                    force_full_redraw = true;
                 }
 
                 let mut is_dirty = false;
                 if is_vbe {
-                    // Modo gráfico VBE: leer directamente de VRAM con dirty tracking por scanline.
-                    // Se copian los datos necesarios y se SUELTA el mutex antes de
-                    // recorrer el framebuffer: retenerlo bloqueaba al vCPU en cada
-                    // acceso a puertos VGA durante todo el frame.
-                    // Para bpp >= 15 (caso habitual en Windows/Linux), no copiamos los 768 bytes de dac_palette.
-                    let vbe_snapshot = {
-                        let st = vga_state.lock().unwrap();
-                        if st.vram_ptr.is_null() {
-                            None
-                        } else if bpp <= 8 {
-                            Some((st.vram_ptr, st.vram_size, st.dac_palette))
-                        } else {
-                            Some((st.vram_ptr, st.vram_size, [0u8; 768]))
-                        }
-                    };
-                    if let Some((vram_ptr, vram_size, dac_palette)) = vbe_snapshot {
+                    if !snap.vram_ptr.is_null() {
                         if scanline_hashes.len() != lh {
                             scanline_hashes.resize(lh, 0);
                             force_full_redraw = true;
                         }
                         is_dirty = render_vbe_framebuffer(
                             &mut render_buf,
-                            vram_ptr,
-                            vram_size,
+                            snap.vram_ptr,
+                            snap.vram_size,
                             lw,
                             lh,
                             bpp,
                             virt_w,
                             x_off,
                             y_off,
-                            &dac_palette,
+                            &snap.dac_palette,
                             dac8,
                             &mut scanline_hashes,
                             force_full_redraw,
                         );
-                        // El sondeo de "escritorio gráfico" recorre TODO el
-                        // framebuffer (2 MP a 1080p) en cada frame; solo hace
-                        // falta hasta emitir el log una vez.
                         if !logged_desktop {
                             let non_zeros = render_buf.iter().filter(|&&p| p != 0).count();
                             if non_zeros > (lw * lh) / 100 {
@@ -1163,25 +1201,23 @@ impl DisplayManager {
                         }
                     }
                 } else if is_std_gfx {
-                    // (tarea 2) Modo gráfico VGA estándar: clonar registros y soltar el mutex antes de decodificar planos
-                    let st_snap = {
-                        let st = vga_state.lock().unwrap();
-                        if st.vram_ptr.is_null() {
-                            None
-                        } else {
-                            Some(st.clone())
-                        }
-                    };
-                    if let Some(st) = st_snap {
-                        is_dirty = render_vga_graphics(&mut render_buf, &st, lw, lh, &mut last_planar_hash, force_full_redraw);
+                    if let Some(ref st) = snap.std_vga_state {
+                        is_dirty = render_vga_graphics(&mut render_buf, st, lw, lh, &mut last_planar_hash, force_full_redraw);
                     }
                 } else if is_vbe_active {
-                    // VBE activo pero temporalmente deshabilitado (transición de modo KMS / monitor blanking)
                     render_buf.fill(0);
                     is_dirty = true;
                 } else {
-                    // Modo texto VGA: renderizar buffer 80x25 desde 0xB8000 con dirty tracking
-                    is_dirty = render_vga_text_mode(&mut render_buf, &mem, &mut last_text_hash, force_full_redraw);
+                    is_dirty = render_vga_text_mode(
+                        &mut render_buf,
+                        &mem,
+                        snap.crtc_start_addr,
+                        snap.cursor_pos,
+                        snap.cursor_start,
+                        snap.cursor_end,
+                        &mut last_text_hash,
+                        force_full_redraw,
+                    );
                 }
 
                 // ── Escalar al tamaño actual de la ventana ──
@@ -1210,12 +1246,15 @@ impl DisplayManager {
                 // ── Atajos con Host Key (VirtualBox default: Tecla RightCtrl) ──
                 let host_down = window.is_key_down(Key::RightCtrl);
                 if host_down {
+                    right_ctrl_was_down = true;
                     if window.is_key_pressed(Key::Delete, KeyRepeat::No) {
+                        host_combo_used = true;
                         let mut q = kbd_queue.lock().unwrap();
                         push_bytes(&mut q, &[0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D]);
                         toast = Some(("Ctrl+Alt+Del inyectado en el SO huésped".to_string(), std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::I, KeyRepeat::No) {
+                        host_combo_used = true;
                         user_mouse_integration = !user_mouse_integration;
                         mouse_captured = false;
                         last_mouse = None;
@@ -1228,25 +1267,31 @@ impl DisplayManager {
                         }, std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::P, KeyRepeat::No) {
+                        host_combo_used = true;
                         let cur = metrics.is_paused.load(Ordering::Relaxed);
                         metrics.is_paused.store(!cur, Ordering::Relaxed);
                         toast = Some((if !cur { "Máquina virtual pausada".to_string() } else { "Máquina virtual reanudada".to_string() }, std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::R, KeyRepeat::No) {
+                        host_combo_used = true;
                         crate::RESET_REQUESTED.store(true, Ordering::Relaxed);
                         toast = Some(("Reiniciando máquina virtual...".to_string(), std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::H, KeyRepeat::No) {
+                        host_combo_used = true;
                         crate::ACPI_SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
                         toast = Some(("Enviando señal de apagado ACPI al SO...".to_string(), std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::Q, KeyRepeat::No) {
+                        host_combo_used = true;
                         toggle_or_open_floating_window(&mut floating_windows, FloatingKind::CloseVm, 460, 240, ww, wh);
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::G, KeyRepeat::No) {
+                        host_combo_used = true;
                         toggle_or_open_floating_window(&mut floating_windows, FloatingKind::Preferences, 520, 310, ww, wh);
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::E, KeyRepeat::No) {
+                        host_combo_used = true;
                         let now_sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                         let fname = format!("screenshot_{}.bmp", now_sec);
                         if let Err(e) = save_bmp_screenshot_buffer(&render_buf, lw, lh, &fname) {
@@ -1257,10 +1302,12 @@ impl DisplayManager {
                         }
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::C, KeyRepeat::No) {
+                        host_combo_used = true;
                         preserve_aspect = !preserve_aspect;
                         toast = Some((format!("Aspecto: {}", if preserve_aspect { "Preservar" } else { "Estirar" }), std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::A, KeyRepeat::No) {
+                        host_combo_used = true;
                         auto_resize_guest = !auto_resize_guest;
                         toast = Some((if auto_resize_guest {
                             "Auto-redimensionar pantalla de invitado: Habilitado (Host+A)".to_string()
@@ -1269,9 +1316,21 @@ impl DisplayManager {
                         }, std::time::Instant::now()));
                         force_full_redraw = true;
                     } else if window.is_key_pressed(Key::F1, KeyRepeat::No) {
+                        host_combo_used = true;
                         toggle_or_open_floating_window(&mut floating_windows, FloatingKind::Hud, 500, 200, ww, wh);
                         force_full_redraw = true;
                     }
+                } else if right_ctrl_was_down {
+                    right_ctrl_was_down = false;
+                    if !host_combo_used && mouse_captured {
+                        mouse_captured = false;
+                        last_mouse = None;
+                        accum_mouse_x = 0.0;
+                        accum_mouse_y = 0.0;
+                        toast = Some(("Ratón liberado".to_string(), std::time::Instant::now()));
+                        force_full_redraw = true;
+                    }
+                    host_combo_used = false;
                 }
 
                 // Alternar aspecto con F11 (clásico)
@@ -1367,6 +1426,7 @@ impl DisplayManager {
                         }
                     }
 
+                    let mut click_consumed_by_ui = false;
                     if left_just_clicked {
                         let mut clicked_fw_idx = None;
                         for (i, fw) in floating_windows.iter().enumerate().rev() {
@@ -1377,6 +1437,7 @@ impl DisplayManager {
                         }
 
                         if let Some(i) = clicked_fw_idx {
+                            click_consumed_by_ui = true;
                             let mut fw = floating_windows.remove(i);
 
                             if fw.is_in_close_btn(imx, imy) {
@@ -1472,6 +1533,7 @@ impl DisplayManager {
                                 }
                             }
                         } else if imy < TOP_BAR_H {
+                            click_consumed_by_ui = true;
                             let header_rects = get_menu_header_rects();
                             let mut clicked_menu = None;
                             for (i, &(hx, hw)) in header_rects.iter().enumerate() {
@@ -1528,6 +1590,7 @@ impl DisplayManager {
                                 }
                             }
                         } else if let Some(menu_idx) = active_menu {
+                            click_consumed_by_ui = true;
                             if let Some(action) = find_dropdown_action_at(menu_idx, ww, imx, imy) {
                                 match action {
                                     MenuAction::TogglePause => {
@@ -1672,6 +1735,7 @@ impl DisplayManager {
                             active_menu = None;
                             force_full_redraw = true;
                         } else if !mouse_integration && !mouse_captured && floating_windows.is_empty() {
+                            click_consumed_by_ui = true;
                             mouse_captured = true;
                             last_mouse = None;
                             accum_mouse_x = 0.0;
@@ -1687,7 +1751,7 @@ impl DisplayManager {
                     // atendiéndolo aunque el puntero cruce la barra superior
                     // (si no, el release nunca llega y el botón queda pegado).
                     let guest_button_down = last_tablet.map_or(false, |(_, _, b)| b != 0);
-                    if active_menu.is_none() && !is_mouse_over_floating {
+                    if !click_consumed_by_ui && active_menu.is_none() && !is_mouse_over_floating {
                         if mouse_captured {
                             // En modo capturado PS/2, recibe todos los deltas del puntero sin importar la barra superior
                             let buttons = (window.get_mouse_down(MouseButton::Left) as u8)
@@ -1779,6 +1843,25 @@ impl DisplayManager {
                     }
                 } else {
                     last_mouse = None;
+                    // Si se soltó el botón tras arrastrar fuera de la ventana, liberar botón en el guest
+                    if !curr_left_down
+                        && !window.get_mouse_down(MouseButton::Right)
+                        && !window.get_mouse_down(MouseButton::Middle)
+                    {
+                        if mouse_captured && last_buttons != 0 {
+                            let mut q = mouse_queue.lock().unwrap();
+                            q.push_back((0, 0, 0));
+                            last_buttons = 0;
+                        } else if mouse_integration {
+                            if let Some((lx, ly, lb)) = last_tablet {
+                                if lb != 0 {
+                                    last_tablet = Some((lx, ly, 0));
+                                    let mut tq = tablet_queue.lock().unwrap();
+                                    tq.push_back((lx, ly, 0, 0));
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // ── Renderizado y Refresco de la Ventana ──
@@ -1917,7 +2000,6 @@ impl DisplayManager {
                     force_full_redraw = false;
                 } else {
                     window.update();
-                    thread::sleep(std::time::Duration::from_millis(16));
                 }
 
                 frame_count += 1;
@@ -1929,86 +2011,45 @@ impl DisplayManager {
                     last_fps_time = std::time::Instant::now();
                 }
 
-                // ── Entrada del host: make/break de teclas estándar (sin Host Key) ──
-                if !host_down {
-                    for key in window.get_keys_pressed(KeyRepeat::Yes) {
-                        if is_printable_key(key) {
-                            if ctrl_held.load(Ordering::Relaxed) || lalt_held.load(Ordering::Relaxed) {
-                                let makes = key_to_ps2_scancodes(key);
-                                if !makes.is_empty() {
-                                    let mut q = kbd_queue.lock().unwrap();
-                                    push_bytes(&mut q, &makes);
-                                    held.insert(key, makes);
-                                }
-                            }
-                            continue;
-                        }
-                        if key == Key::Pause {
-                            let mut q = kbd_queue.lock().unwrap();
-                            push_bytes(&mut q, &[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]);
-                            continue;
-                        }
-                        if matches!(
-                            key,
-                            Key::NumPad0 | Key::NumPad1 | Key::NumPad2 | Key::NumPad3 | Key::NumPad4
-                                | Key::NumPad5 | Key::NumPad6 | Key::NumPad7 | Key::NumPad8
-                                | Key::NumPad9 | Key::NumPadDot
-                        ) && numpad_on.load(Ordering::Relaxed)
-                        {
-                            continue;
-                        }
-                        if matches!(
-                            key,
-                            Key::NumPadSlash | Key::NumPadAsterisk | Key::NumPadMinus | Key::NumPadPlus
-                        ) {
-                            continue;
-                        }
-                        let Some((scan, ext)) = control_scancode(key) else { continue };
-                        let is_new = !held.contains_key(&key);
-                        if is_new {
-                            match key {
-                                Key::CapsLock => {
-                                    caps_on.fetch_xor(true, Ordering::Relaxed);
-                                }
-                                Key::NumLock => {
-                                    numpad_on.fetch_xor(true, Ordering::Relaxed);
-                                }
-                                Key::LeftCtrl | Key::RightCtrl => {
-                                    ctrl_held.store(true, Ordering::Relaxed);
-                                }
-                                Key::LeftAlt => {
-                                    lalt_held.store(true, Ordering::Relaxed);
-                                }
-                                _ => {}
-                            }
-                        }
-                        let mut makes = Vec::with_capacity(3);
-                        if ext {
-                            makes.push(0xE0);
-                        }
-                        makes.push(scan);
+                // ── Entrada del host: scancodes físicos Set 1 (make/break) ──
+                if !window.is_active() {
+                    // Al perder el foco, soltar todas las teclas pulsadas para evitar mods pegados
+                    if !held.is_empty() {
                         let mut q = kbd_queue.lock().unwrap();
-                        push_bytes(&mut q, &makes);
-                        held.insert(key, makes);
+                        for (_, makes) in held.drain() {
+                            let mut breaks = makes;
+                            if let Some(last) = breaks.last_mut() {
+                                *last |= 0x80;
+                            }
+                            push_break_bytes(&mut q, &breaks);
+                        }
                     }
-                }
-
-                for key in window.get_keys_released() {
-                    if let Some(makes) = held.remove(&key) {
-                        let mut breaks = makes.clone();
-                        if let Some(last) = breaks.last_mut() {
-                            *last |= 0x80; // break = make | 0x80 (Set 1)
+                } else {
+                    if !host_down {
+                        for key in window.get_keys_pressed(KeyRepeat::Yes) {
+                            if key == Key::Pause {
+                                let mut q = kbd_queue.lock().unwrap();
+                                push_bytes(&mut q, &[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]);
+                                continue;
+                            }
+                            let makes = key_to_ps2_set1(key);
+                            if makes.is_empty() {
+                                continue;
+                            }
+                            let mut q = kbd_queue.lock().unwrap();
+                            push_bytes(&mut q, &makes);
+                            held.insert(key, makes);
                         }
-                        let mut q = kbd_queue.lock().unwrap();
-                        push_bytes(&mut q, &breaks);
-                        match key {
-                            Key::LeftCtrl | Key::RightCtrl => {
-                                ctrl_held.store(false, Ordering::Relaxed);
+                    }
+
+                    for key in window.get_keys_released() {
+                        if let Some(makes) = held.remove(&key) {
+                            let mut breaks = makes;
+                            if let Some(last) = breaks.last_mut() {
+                                *last |= 0x80; // break = make | 0x80 (Set 1)
                             }
-                            Key::LeftAlt => {
-                                lalt_held.store(false, Ordering::Relaxed);
-                            }
-                            _ => {}
+                            let mut q = kbd_queue.lock().unwrap();
+                            push_break_bytes(&mut q, &breaks);
                         }
                     }
                 }
@@ -2079,13 +2120,22 @@ pub fn save_ppm_screenshot(
             );
         }
     } else if is_std_gfx {
-        if !st.vram_ptr.is_null() {
-            let mut hash = 0u64;
-            render_vga_graphics(&mut render_buf, &st, lw, lh, &mut hash, true);
-        }
+        let mut hash = 0u64;
+        render_vga_graphics(&mut render_buf, &st, lw, lh, &mut hash, true);
     } else {
         let mut hash = 0u64;
-        render_vga_text_mode(&mut render_buf, guest_mem, &mut hash, true);
+        let start_addr = ((st.crtc_regs[0x0C] as usize) << 8) | (st.crtc_regs[0x0D] as usize);
+        let cursor_pos = ((st.crtc_regs[0x0E] as usize) << 8) | (st.crtc_regs[0x0F] as usize);
+        render_vga_text_mode(
+            &mut render_buf,
+            guest_mem,
+            start_addr,
+            cursor_pos,
+            st.crtc_regs[0x0A],
+            st.crtc_regs[0x0B],
+            &mut hash,
+            true,
+        );
     }
     drop(st);
 
@@ -2126,9 +2176,14 @@ pub fn fast_scanline_hash(bytes: &[u8]) -> u64 {
 
 /// Renderiza la memoria de texto VGA en 0xB8000 a un buffer RGB de 640x400.
 /// Devuelve true si el contenido cambió respecto al último frame.
+#[allow(clippy::too_many_arguments)]
 fn render_vga_text_mode(
     buffer: &mut [u32],
     mem: &GuestMemory,
+    start_addr: usize,
+    cursor_pos: usize,
+    cursor_start: u8,
+    cursor_end: u8,
     last_text_hash: &mut u64,
     force_full: bool,
 ) -> bool {
@@ -2137,27 +2192,47 @@ fn render_vga_text_mode(
     const CHAR_W: usize = 8;
     const CHAR_H: usize = 16;
     const WIDTH: usize = COLS * CHAR_W; // 640
-    const TEXT_OFFSET: usize = 0xB8000;
+    const TEXT_BASE: usize = 0xB8000;
+    const TEXT_WINDOW: usize = 0x8000;
     const TEXT_SIZE: usize = COLS * ROWS * 2;
 
-    if mem.size() < TEXT_OFFSET + TEXT_SIZE {
-        buffer.fill(0);
-        return false;
+    let page_byte_off = (start_addr * 2) & 0x7FFF;
+    let text_offset = TEXT_BASE + page_byte_off;
+    if mem.size() < TEXT_BASE + TEXT_WINDOW {
+        if mem.size() < TEXT_BASE + TEXT_SIZE {
+            buffer.fill(0);
+            return false;
+        }
     }
+
+    let safe_offset = if text_offset + TEXT_SIZE <= mem.size() {
+        text_offset
+    } else {
+        TEXT_BASE
+    };
 
     // Copia acotada de la pantalla de texto (el guest la escribe en paralelo).
     let mut text = [0u8; TEXT_SIZE];
-    let _ = mem.copy_from(TEXT_OFFSET, &mut text);
-    let hash = fast_scanline_hash(&text);
+    let _ = mem.copy_from(safe_offset, &mut text);
+    let mut hash = fast_scanline_hash(&text);
+    hash ^= ((start_addr as u64) << 40)
+        ^ ((cursor_pos as u64) << 16)
+        ^ ((cursor_start as u64) << 8)
+        ^ (cursor_end as u64);
 
     if !force_full && *last_text_hash == hash {
         return false;
     }
     *last_text_hash = hash;
 
+    let cursor_enabled = (cursor_start & 0x20) == 0;
+    let c_y0 = (cursor_start & 0x1F) as usize;
+    let c_y1 = (cursor_end & 0x1F) as usize;
+
     for row in 0..ROWS {
         for col in 0..COLS {
-            let cell_idx = (row * COLS + col) * 2;
+            let linear_cell = row * COLS + col;
+            let cell_idx = linear_cell * 2;
             let ch = text[cell_idx] as usize;
             let attr = text[cell_idx + 1] as usize;
 
@@ -2165,15 +2240,23 @@ fn render_vga_text_mode(
             let bg_color = VGA_PALETTE[(attr >> 4) & 0x0F];
 
             let glyph_offset = ch * CHAR_H;
+            let is_cursor_cell = cursor_enabled
+                && cursor_pos >= start_addr
+                && (cursor_pos - start_addr) == linear_cell;
 
             for y in 0..CHAR_H {
                 let font_byte = FONT_8X16[glyph_offset + y];
                 let py = row * CHAR_H + y;
+                let draw_cursor_line = is_cursor_cell && c_y0 <= c_y1 && y >= c_y0 && y <= c_y1;
 
                 for x in 0..CHAR_W {
                     let px = col * CHAR_W + x;
                     let bit = (font_byte >> (7 - x)) & 1;
-                    let pixel_color = if bit != 0 { fg_color } else { bg_color };
+                    let pixel_color = if draw_cursor_line || bit != 0 {
+                        fg_color
+                    } else {
+                        bg_color
+                    };
                     let buf_idx = py * WIDTH + px;
                     if buf_idx < buffer.len() {
                         buffer[buf_idx] = pixel_color;
@@ -2187,17 +2270,10 @@ fn render_vga_text_mode(
 
 // ─── (tarea 2) Renderizado de modos gráficos VGA estándar ──────────
 
-/// Lee un byte de VRAM con el addressing planar clásico: el offset de 16 bits
-/// del modo se interpreta dentro del plano indicado (cada plano empieza en
-/// su propio bloque de 64 KiB). Con bounds-check para no leer fuera de VRAM.
 #[inline]
-fn vga_plane_read(vram: *const u8, addr: usize, plane: usize, vram_size: usize) -> u8 {
+fn vga_plane_slice_read(planes: &[u8], addr: usize, plane: usize) -> u8 {
     let off = (addr & 0xFFFF) + 0x10000 * plane;
-    if off < vram_size.min(VGA_ADDRABLE) {
-        unsafe { *vram.add(off) }
-    } else {
-        0xFF
-    }
+    planes.get(off).copied().unwrap_or(0)
 }
 
 /// Construye la LUT de 256 colores del DAC (0x00RRGGBB) para los modos
@@ -2263,10 +2339,7 @@ fn render_vga_graphics(
         return false;
     };
 
-    let vram = st.vram_ptr;
-    let vram_size = st.vram_size;
-    let raw = unsafe { std::slice::from_raw_parts(vram, vram_size.min(VGA_ADDRABLE)) };
-    let hash = fast_scanline_hash(raw);
+    let hash = fast_scanline_hash(&st.planes) ^ st.palette_gen;
     if !force_full && *last_planar_hash == hash {
         return false;
     }
@@ -2280,10 +2353,10 @@ fn render_vga_graphics(
             }
             let color: u32 = match addr_mode {
                 AddrMode::Packed => {
-                    let a = (row * width + col) & 0xFFFF;
-                    let b = (row * width + col) >> 16;
-                    let off = (((a & !3) << 2) + (b << 14) + (a & 3)) & 0xFFFF;
-                    lut[vga_plane_read(vram, off, 0, vram_size) as usize]
+                    let p_idx = row * width + col;
+                    let plane = p_idx & 3;
+                    let p_off = (p_idx >> 2) & 0xFFFF;
+                    lut[vga_plane_slice_read(&st.planes, p_off, plane) as usize]
                 }
                 AddrMode::Planar4 => {
                     let row_bytes = if row_bytes >= width / 8 { row_bytes } else { width / 8 };
@@ -2291,7 +2364,7 @@ fn render_vga_graphics(
                     let bit = 7 - (col & 7);
                     let mut pal = 0u8;
                     for plane in 0..4usize {
-                        let b = vga_plane_read(vram, off, plane, vram_size);
+                        let b = vga_plane_slice_read(&st.planes, off, plane);
                         pal |= ((b >> bit) & 1) << plane;
                     }
                     lut[palette_idx(st.attr_regs[pal as usize])]
@@ -2299,8 +2372,8 @@ fn render_vga_graphics(
                 AddrMode::Cga2 => {
                     let row_bytes = if row_bytes >= width / 8 { row_bytes } else { width / 8 };
                     let off = (row >> 1) * row_bytes + (col >> 3) + ((row & 1) << 13);
-                    let b0 = vga_plane_read(vram, off, 0, vram_size);
-                    let b1 = vga_plane_read(vram, off, 1, vram_size);
+                    let b0 = vga_plane_slice_read(&st.planes, off, 0);
+                    let b1 = vga_plane_slice_read(&st.planes, off, 1);
                     let bit = 7 - (col & 7);
                     let pal = (((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1)) as usize;
                     lut[palette_idx(st.attr_regs[pal])]
@@ -2344,9 +2417,9 @@ fn render_vbe_framebuffer(
             return false;
         }
     };
-    let row_bytes = vw * bytes_pp;
+    let row_bytes = if bpp == 4 { vw.div_ceil(2) } else { vw * bytes_pp };
     let row_bytes = if y_offset + height > 0 && (y_offset + height - 1) * row_bytes + row_bytes > vram_size {
-        width * bytes_pp
+        if bpp == 4 { width.div_ceil(2) } else { width * bytes_pp }
     } else {
         row_bytes
     };
@@ -2371,10 +2444,9 @@ fn render_vbe_framebuffer(
                 scanline_hashes[y] = hash;
                 any_dirty = true;
 
-                let src_slice =
-                    unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u32, width) };
                 let dst_slice = &mut buffer[y * width..(y + 1) * width];
-                for (dst_px, &src_px) in dst_slice.iter_mut().zip(src_slice.iter()) {
+                for (dst_px, chunk) in dst_slice.iter_mut().zip(raw_line.chunks_exact(4)) {
+                    let src_px = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     *dst_px = src_px & 0x00FF_FFFF;
                 }
             }
@@ -2422,12 +2494,13 @@ fn render_vbe_framebuffer(
                 scanline_hashes[y] = hash;
                 any_dirty = true;
 
-                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u16, width) };
-                for (x, &p) in src.iter().enumerate() {
+                let dst_slice = &mut buffer[y * width..(y + 1) * width];
+                for (dst_px, chunk) in dst_slice.iter_mut().zip(raw_line.chunks_exact(2)) {
+                    let p = u16::from_le_bytes([chunk[0], chunk[1]]);
                     let r = (((p >> 11) & 0x1F) * 255 / 31) as u32;
                     let g = (((p >> 5) & 0x3F) * 255 / 63) as u32;
                     let b = ((p & 0x1F) * 255 / 31) as u32;
-                    buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                    *dst_px = (r << 16) | (g << 8) | b;
                 }
             }
         }
@@ -2448,12 +2521,13 @@ fn render_vbe_framebuffer(
                 scanline_hashes[y] = hash;
                 any_dirty = true;
 
-                let src = unsafe { std::slice::from_raw_parts(vram_ptr.add(src_row) as *const u16, width) };
-                for (x, &p) in src.iter().enumerate() {
+                let dst_slice = &mut buffer[y * width..(y + 1) * width];
+                for (dst_px, chunk) in dst_slice.iter_mut().zip(raw_line.chunks_exact(2)) {
+                    let p = u16::from_le_bytes([chunk[0], chunk[1]]);
                     let r = (((p >> 10) & 0x1F) * 255 / 31) as u32;
                     let g = (((p >> 5) & 0x1F) * 255 / 31) as u32;
                     let b = ((p & 0x1F) * 255 / 31) as u32;
-                    buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                    *dst_px = (r << 16) | (g << 8) | b;
                 }
             }
         }
@@ -2518,6 +2592,7 @@ fn render_vbe_framebuffer(
 
 /// Escalado bilineal de alta velocidad en espacio de color RGB (8:8:8:8).
 /// Elimina el efecto pixelado/pixelation suavizando los bordes mediante interpolación 2D.
+#[allow(dead_code)]
 pub fn scale_bilinear(dst: &mut [u32], dw: usize, dh: usize, src: &[u32], sw: usize, sh: usize) {
     if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
         dst.fill(0);
@@ -2791,6 +2866,7 @@ pub fn scale_framebuffer_with_offset(
 /// de relación de aspecto y centrado con bandas negras (VirtualBox letterbox/pillarbox).
 ///
 /// Devuelve la tupla `(vp_x, vp_y, vp_w, vp_h)` que delimita el viewport efectivo en `dst`.
+#[allow(dead_code)]
 pub fn scale_framebuffer(
     dst: &mut [u32],
     dw: usize,
@@ -2831,13 +2907,17 @@ pub fn scale_framebuffer(
 
 /// Capacidad de la cola intermedia host→8042. Las secuencias se insertan
 /// de forma atómica (nunca a medias) y se descartan si no caben enteras.
-const KBD_QUEUE_CAP: usize = 16;
+const KBD_QUEUE_CAP: usize = 256;
 
 /// Make/break del Shift izquierdo (Set 1).
+#[allow(dead_code)]
 const SCAN_LSHIFT_MAKE: u8 = 0x2A;
+#[allow(dead_code)]
 const SCAN_LSHIFT_BREAK: u8 = 0xAA;
 /// Make/break de AltGr (RightAlt): teclas extendidas con prefijo 0xE0.
+#[allow(dead_code)]
 const SCAN_RALT_MAKE: [u8; 2] = [0xE0, 0x38];
+#[allow(dead_code)]
 const SCAN_RALT_BREAK: [u8; 2] = [0xE0, 0xB8];
 
 /// Empuja bytes a la cola intermedia solo si cabe la secuencia entera.
@@ -2845,6 +2925,16 @@ fn push_bytes(q: &mut VecDeque<u8>, bytes: &[u8]) {
     if q.len() + bytes.len() <= KBD_QUEUE_CAP {
         q.extend(bytes);
     }
+}
+
+/// Las secuencias BREAK nunca se descartan para evitar teclas atascadas.
+fn push_break_bytes(q: &mut VecDeque<u8>, bytes: &[u8]) {
+    while q.len() + bytes.len() > KBD_QUEUE_CAP * 2 {
+        if q.pop_front().is_none() {
+            break;
+        }
+    }
+    q.extend(bytes);
 }
 
 /// Un "toque": scancode base + modificadores que deben estar activos
@@ -3009,6 +3099,7 @@ fn char_to_es_taps(c: char) -> Option<Vec<Tap>> {
 /// host, en la distribución española. Cada toque aplica/libera los
 /// modificadores que necesite (Shift sintetizado con XOR de CapsLock para
 /// letras; AltGr sintetizado siempre).
+#[allow(dead_code)]
 fn build_char_sequence(c: char, caps_on: bool) -> Option<Vec<u8>> {
     let taps = char_to_es_taps(c)?;
     let mut seq = Vec::with_capacity(8);
@@ -3045,32 +3136,25 @@ fn build_char_sequence(c: char, caps_on: bool) -> Option<Vec<u8>> {
 /// Callback de minifb: recibe el carácter Unicode ya compuesto por el host
 /// (AltGr, teclas muertas, mayúsculas) y lo traduce a scancodes PS/2 de la
 /// distribución española, empujándolos a la cola del 8042.
-struct CharInput {
-    kbd_queue: Arc<Mutex<VecDeque<u8>>>,
-    ctrl_held: Arc<AtomicBool>,
-    lalt_held: Arc<AtomicBool>,
-    caps_on: Arc<AtomicBool>,
-}
-
-impl minifb::InputCallback for CharInput {
-    fn add_char(&mut self, uni_char: u32) {
-        // Con Ctrl/Alt pulsado la tecla se reenvía posicionalmente desde el
-        // bucle (atajos tipo Ctrl+C); aquí se descarta para no duplicarla.
-        if self.ctrl_held.load(Ordering::Relaxed) || self.lalt_held.load(Ordering::Relaxed) {
-            return;
-        }
-        // Caracteres de control (add_char no debería reportarlos, pero por
-        // robustez se descartan).
-        if uni_char < 0x20 || uni_char == 0x7F {
-            return;
-        }
-        let Some(c) = char::from_u32(uni_char) else { return };
-        let caps = self.caps_on.load(Ordering::Relaxed);
-        let Some(seq) = build_char_sequence(c, caps) else { return };
-        if let Ok(mut q) = self.kbd_queue.lock() {
-            push_bytes(&mut q, &seq);
-        }
+/// Mapeo directo tecla física -> scancodes Set 1 (make).
+fn key_to_ps2_set1(key: Key) -> Vec<u8> {
+    if let Some((scan, ext)) = control_scancode(key) {
+        return if ext { vec![0xE0, scan] } else { vec![scan] };
     }
+    let plain = match key {
+        Key::LeftShift => Some(0x2A),
+        Key::RightShift => Some(0x36),
+        Key::RightAlt => return vec![0xE0, 0x38],
+        Key::NumPadSlash => return vec![0xE0, 0x35],
+        Key::NumPadAsterisk => Some(0x37),
+        Key::NumPadMinus => Some(0x4A),
+        Key::NumPadPlus => Some(0x4E),
+        _ => None,
+    };
+    if let Some(sc) = plain {
+        return vec![sc];
+    }
+    key_to_ps2_scancodes(key)
 }
 
 /// Teclas NO imprimibles que se reenvían con make/break completos:
@@ -3119,8 +3203,8 @@ fn control_scancode(key: Key) -> Option<(u8, bool)> {
         .map(|(_, s, e)| (*s, *e))
 }
 
-/// Teclas imprimibles: las entrega `add_char` (con el layout del host ya
-/// aplicado). Solo se reenvían posicionalmente con Ctrl/Alt pulsado.
+/// Teclas imprimibles (mantenido para utilidades/tests).
+#[allow(dead_code)]
 fn is_printable_key(key: Key) -> bool {
     // Los discriminantes 0..=35 son explícitos en minifb (Key0..Key9 = 0-9,
     // A..Z = 10-35): cubren dígitos y letras sin depender de los
@@ -3613,6 +3697,29 @@ mod tests {
         toggle_or_open_floating_window(&mut list, FloatingKind::Hud, 480, 180, ww, wh);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].kind, FloatingKind::Preferences);
+    }
+
+    #[test]
+    fn test_unicode_to_cp437_and_push_break_bytes() {
+        assert_eq!(unicode_to_cp437('A'), b'A');
+        assert_eq!(unicode_to_cp437('á'), 0xA0);
+        assert_eq!(unicode_to_cp437('é'), 0x82);
+        assert_eq!(unicode_to_cp437('í'), 0xA1);
+        assert_eq!(unicode_to_cp437('ó'), 0xA2);
+        assert_eq!(unicode_to_cp437('ú'), 0xA3);
+        assert_eq!(unicode_to_cp437('ñ'), 0xA4);
+        assert_eq!(unicode_to_cp437('Ñ'), 0xA5);
+
+        // Even when the queue is at KBD_QUEUE_CAP, BREAK bytes must never be dropped
+        let mut q = VecDeque::new();
+        for _ in 0..KBD_QUEUE_CAP {
+            push_bytes(&mut q, &[0x1E]);
+        }
+        assert_eq!(q.len(), KBD_QUEUE_CAP);
+        push_bytes(&mut q, &[0x30]);
+        assert_eq!(q.len(), KBD_QUEUE_CAP);
+        push_break_bytes(&mut q, &[0x9E]);
+        assert_eq!(q.back().copied(), Some(0x9E));
     }
 }
 

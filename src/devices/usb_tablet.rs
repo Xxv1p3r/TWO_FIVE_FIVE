@@ -16,7 +16,7 @@ pub const TABLET_DEVICE_DESC: [u8; 18] = [
     0x00, // bDeviceClass: Definido a nivel de interfaz
     0x00, // bDeviceSubClass
     0x00, // bDeviceProtocol
-    0x08, // bMaxPacketSize0: 8 bytes
+    0x40, // bMaxPacketSize0: 64 bytes
     0x27, 0x06, // idVendor: 0x0627 (QEMU USB)
     0x01, 0x00, // idProduct: 0x0001 (QEMU USB Tablet)
     0x00, 0x00, // bcdDevice: 0.00
@@ -122,7 +122,8 @@ fn string_descriptor(s: &str) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct UsbTablet {
     pub address: u8,
-    pub pending_address: u8,
+    pub pending_address: Option<u8>,
+    pub ctrl_stalled: bool,
     pub configured: bool,
     pub idle_rate: u8,
     pub protocol: u8,
@@ -145,7 +146,8 @@ impl UsbTablet {
     pub fn new() -> Self {
         Self {
             address: 0,
-            pending_address: 0,
+            pending_address: None,
+            ctrl_stalled: false,
             configured: false,
             idle_rate: 0,
             protocol: 1, // Report protocol por defecto
@@ -162,7 +164,8 @@ impl UsbTablet {
     /// Reinicia el dispositivo a su estado inicial tras un reset de puerto USB.
     pub fn reset(&mut self) {
         self.address = 0;
-        self.pending_address = 0;
+        self.pending_address = None;
+        self.ctrl_stalled = false;
         self.configured = false;
         self.idle_rate = 0;
         self.protocol = 1;
@@ -230,25 +233,26 @@ impl UsbTablet {
 
         self.ctrl_response.clear();
         self.ctrl_offset = 0;
+        self.ctrl_stalled = false;
 
         // Tipo de petición: Standard (0x00), Class (0x20), Vendor (0x40)
         let req_type = (bm_request_type >> 5) & 0x03;
 
-        match req_type {
+        let ok = match req_type {
             0 => {
                 // Petición Estándar USB
                 match b_request {
-                    // GET_STATUS
+                    // GET_STATUS (bus-powered)
                     0x00 => {
-                        self.ctrl_response = vec![0x01, 0x00]; // Self-powered
+                        self.ctrl_response = vec![0x00, 0x00];
+                        true
                     }
                     // CLEAR_FEATURE / SET_FEATURE
-                    0x01 | 0x03 => {
-                        // Aceptado sin datos
-                    }
+                    0x01 | 0x03 => true,
                     // SET_ADDRESS
                     0x05 => {
-                        self.pending_address = (w_value & 0x7F) as u8;
+                        self.pending_address = Some((w_value & 0x7F) as u8);
+                        true
                     }
                     // GET_DESCRIPTOR
                     0x06 => {
@@ -258,60 +262,55 @@ impl UsbTablet {
                             // DEVICE
                             0x01 => {
                                 self.ctrl_response = TABLET_DEVICE_DESC.to_vec();
+                                true
                             }
                             // CONFIGURATION
                             0x02 => {
                                 self.ctrl_response = TABLET_CONFIG_DESC.to_vec();
+                                true
                             }
                             // STRING
                             0x03 => {
-                                match desc_index {
-                                    0 => {
-                                        // Language ID: English (US) 0x0409
-                                        self.ctrl_response = vec![0x04, 0x03, 0x09, 0x04];
-                                    }
-                                    1 => {
-                                        self.ctrl_response = string_descriptor("Antigravity");
-                                    }
-                                    2 => {
-                                        self.ctrl_response = string_descriptor("QEMU USB Tablet");
-                                    }
-                                    3 => {
-                                        self.ctrl_response = string_descriptor("1");
-                                    }
-                                    _ => {
-                                        self.ctrl_response = string_descriptor("");
-                                    }
-                                }
+                                self.ctrl_response = match desc_index {
+                                    0 => vec![0x04, 0x03, 0x09, 0x04],
+                                    1 => string_descriptor("Antigravity"),
+                                    2 => string_descriptor("QEMU USB Tablet"),
+                                    3 => string_descriptor("1"),
+                                    _ => string_descriptor(""),
+                                };
+                                true
                             }
                             // HID
                             0x21 => {
                                 self.ctrl_response = TABLET_CONFIG_DESC[18..27].to_vec();
+                                true
                             }
                             // REPORT
                             0x22 => {
                                 self.ctrl_response = TABLET_REPORT_DESC.to_vec();
+                                true
                             }
-                            _ => {}
+                            _ => false,
                         }
                     }
                     // GET_CONFIGURATION
                     0x08 => {
                         self.ctrl_response = vec![if self.configured { 1 } else { 0 }];
+                        true
                     }
                     // SET_CONFIGURATION
                     0x09 => {
                         self.configured = (w_value & 0xFF) == 1;
+                        true
                     }
                     // GET_INTERFACE
                     0x0A => {
                         self.ctrl_response = vec![0x00];
+                        true
                     }
                     // SET_INTERFACE
-                    0x0B => {
-                        // Interfaz 0 aceptada
-                    }
-                    _ => return false,
+                    0x0B => true,
+                    _ => false,
                 }
             }
             1 => {
@@ -328,31 +327,39 @@ impl UsbTablet {
                             self.cur_wheel as u8,
                         ];
                         self.ctrl_response = report.to_vec();
+                        true
                     }
                     // GET_IDLE
                     0x02 => {
                         self.ctrl_response = vec![self.idle_rate];
+                        true
                     }
                     // GET_PROTOCOL
                     0x03 => {
                         self.ctrl_response = vec![self.protocol];
+                        true
                     }
                     // SET_REPORT
-                    0x09 => {
-                        // Aceptado
-                    }
+                    0x09 => true,
                     // SET_IDLE
                     0x0A => {
                         self.idle_rate = (w_value >> 8) as u8;
+                        true
                     }
                     // SET_PROTOCOL
                     0x0B => {
                         self.protocol = (w_value & 0xFF) as u8;
+                        true
                     }
-                    _ => return false,
+                    _ => false,
                 }
             }
-            _ => return false,
+            _ => false,
+        };
+
+        if !ok {
+            self.ctrl_stalled = true;
+            return false;
         }
 
         // Truncar la respuesta si el host pidió menos bytes que el descriptor completo
@@ -371,9 +378,8 @@ impl UsbTablet {
             // Endpoint 0: Fase de datos o estado de control
             0 => {
                 if self.ctrl_offset >= self.ctrl_response.len() {
-                    if self.pending_address != 0 {
-                        self.address = self.pending_address;
-                        self.pending_address = 0;
+                    if let Some(addr) = self.pending_address.take() {
+                        self.address = addr;
                     }
                     return Some(0);
                 }
@@ -382,9 +388,10 @@ impl UsbTablet {
                 dst[..chunk_len]
                     .copy_from_slice(&self.ctrl_response[self.ctrl_offset..self.ctrl_offset + chunk_len]);
                 self.ctrl_offset += chunk_len;
-                if self.ctrl_offset >= self.ctrl_response.len() && self.pending_address != 0 {
-                    self.address = self.pending_address;
-                    self.pending_address = 0;
+                if self.ctrl_offset >= self.ctrl_response.len() {
+                    if let Some(addr) = self.pending_address.take() {
+                        self.address = addr;
+                    }
                 }
                 Some(chunk_len)
             }
@@ -409,9 +416,8 @@ impl UsbTablet {
             // Endpoint 0: Fase de datos o estado de control
             0 => {
                 if self.ctrl_offset >= self.ctrl_response.len() {
-                    if self.pending_address != 0 {
-                        self.address = self.pending_address;
-                        self.pending_address = 0;
+                    if let Some(addr) = self.pending_address.take() {
+                        self.address = addr;
                     }
                     // Paquete vacío (ZLP) o fin de transferencia
                     return Some(Vec::new());
@@ -420,9 +426,10 @@ impl UsbTablet {
                 let chunk_len = remaining.min(max_len);
                 let chunk = self.ctrl_response[self.ctrl_offset..self.ctrl_offset + chunk_len].to_vec();
                 self.ctrl_offset += chunk_len;
-                if self.ctrl_offset >= self.ctrl_response.len() && self.pending_address != 0 {
-                    self.address = self.pending_address;
-                    self.pending_address = 0;
+                if self.ctrl_offset >= self.ctrl_response.len() {
+                    if let Some(addr) = self.pending_address.take() {
+                        self.address = addr;
+                    }
                 }
                 Some(chunk)
             }

@@ -1,11 +1,17 @@
 //! Two Five Five (255) — Hipervisor Tipo-2 minimalista sobre KVM/Linux.
 
+pub mod agent;
+pub mod chat_ui;
 mod devices;
 mod display;
 mod guest_mem;
 pub mod gui_launcher;
+pub mod json;
 mod metrics;
+pub mod network;
+pub mod ollama;
 mod snapshot;
+pub mod ssh_client;
 pub mod tui;
 pub mod unattended;
 pub mod vbox_assets;
@@ -20,7 +26,7 @@ use std::io::Read;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[allow(dead_code)]
@@ -43,12 +49,16 @@ pub fn get_vmm_env(key: &str) -> Result<String, std::env::VarError> {
 
 /// Resetea la VM entera al POST (equivalente a un reset por hardware tras
 /// un crash del guest) e incrementa el contador de reboots.
+#[allow(clippy::too_many_arguments)]
 fn crash_reboot(
     vcpu: &kvm_ioctls::VcpuFd,
     vm: &kvm_ioctls::VmFd,
-    bus: &mut DeviceBus,
+    bus: &Arc<Mutex<DeviceBus>>,
     guest_mem: &mut [u8],
-    high_mem: Option<&mut [u8]>,
+    vram_mem: &mut [u8],
+    ram_below_4g: u64,
+    kernel_pit_init: Option<&kvm_bindings::kvm_pit_state2>,
+    metrics: &metrics::VmmMetrics,
     bios: Option<&[u8]>,
     vga_rom: Option<&[u8]>,
     total_reboots: &mut u32,
@@ -56,7 +66,18 @@ fn crash_reboot(
     *total_reboots += 1;
     eprintln!("[VMM] Crash/Reset del guest — reseteando VM a POST (reboot {} de {})...",
         total_reboots, MAX_CRASH_REBOOTS);
-    reset_vcpu_to_post(vcpu, vm, bus, guest_mem, high_mem, bios, vga_rom);
+    reset_vcpu_to_post(
+        vcpu,
+        vm,
+        bus,
+        guest_mem,
+        vram_mem,
+        ram_below_4g,
+        kernel_pit_init,
+        metrics,
+        bios,
+        vga_rom,
+    );
 }
 
 fn bios_load_addr(bios_len: usize) -> u64 {
@@ -74,6 +95,10 @@ fn usage() -> ! {
     eprintln!("  -g, --gui, --launcher         Abrir el Administrador Grafico de VMs y Discos VDI");
     eprintln!("  --startvm, --vm-name <nombre> Iniciar la VM especificada directamente");
     eprintln!("  --no-gui                      Omitir el lanzador grafico inicial");
+    eprintln!("  --tui / --no-tui              Forzar / desactivar dashboard TUI en terminal");
+    eprintln!("  --efi, --uefi                 Arrancar con firmware UEFI (OVMF x64)");
+    eprintln!("  --no-disk                     No adjuntar ni autodetectar disco duro");
+    eprintln!("  --no-iso, --no-cdrom          Arrancar sin CD-ROM");
     eprintln!("  --cpus <1..16>                Numero de vCPUs para la VM (def: 4)");
     eprintln!("  --ram <MiB>                   Memoria RAM en MiB para la VM (def: 4096)");
     eprintln!("  --disk, --drive <archivo.vdi> Especificar imagen de disco virtual");
@@ -87,11 +112,53 @@ fn usage() -> ! {
     eprintln!("  --unattended-pass <password>  Contraseña de usuario y root (def: two55)");
     eprintln!("  --unattended-host <hostname>  Hostname de la máquina virtual (def: two55-vm)");
     eprintln!("  --cdrom, --iso <archivo.iso>  Especificar imagen de instalación ISO");
+    eprintln!("Opciones de Red Virtual y Agente IA (Ollama):");
+    eprintln!("  --net <nombre>                Red virtual de networks.conf (def: nat-default)");
+    eprintln!("  --net-mode <nat|hostonly|internal|tap>   Modo de red");
+    eprintln!("  --net-subnet <CIDR>           Subred CIDR (ej. 10.0.20.0/24)");
+    eprintln!("  --tap <interfaz>              Interfaz TAP Linux");
+    eprintln!("  --mac <XX:XX:XX:XX:XX:XX>     Direccion MAC de VirtIO-Net");
+    eprintln!("  --hostfwd <host>:<guest>      Redirigir puerto TCP (ej. 2222:22)");
+    eprintln!("  --agent-status                Comprobar servidor Ollama (bogo Tailscale / local)");
+    eprintln!("  --agent-prompt <texto>        Ejecutar orden en el agente IA Ollama");
+    eprintln!("  --bogo-only                   Exigir servidor GPU bogo por Tailscale sin fallback local");
+    eprintln!("  --ollama-model <modelo>       Modelo Ollama a usar");
+    eprintln!("  --ollama-url <url>            URL HTTP de Ollama");
     eprintln!("Ejemplos:");
     eprintln!("  two-five-five --gui");
     eprintln!("  two-five-five --create-vdi mi_disco.vdi 20");
     eprintln!("  two-five-five CorePlus-current.iso mi_disco.vdi");
     exit(1);
+}
+
+fn find_ovmf_bios() -> Option<PathBuf> {
+    let candidates = [
+        "bios/OVMF_CODE.fd",
+        "OVMF_CODE.fd",
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+        "/usr/share/edk2/x64/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/qemu/OVMF.fd",
+    ];
+    for c in &candidates {
+        let p = Path::new(c);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let root = exe_dir.join("../..");
+            for c in &candidates {
+                let p = root.join(c);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn find_default_bios() -> Option<PathBuf> {
@@ -425,9 +492,12 @@ const KERNEL_IRQCHIP_HOLES: [(u64, u64); 2] = [
 /// Ventana PCI MMIO no respaldada por RAM para que los accesos a BARs MMIO
 /// (como el BAR2 de VGA en 0xFE01F000) generen exits MMIO a userspace en vez
 /// de ser resueltos silenciosamente como memoria física en RAM por la EPT.
+#[cfg(test)]
 pub const PCI_MMIO_HOLE_START: u64 = 0xFE00_0000;
+#[cfg(test)]
 pub const PCI_MMIO_HOLE_SIZE: u64 = 0x00C0_0000; // 12 MiB hasta 0xFEC0_0000 (IOAPIC)
 
+#[cfg(test)]
 pub const HIGH_MEM_HOLES: [(u64, u64); 3] = [
     (PCI_MMIO_HOLE_START, PCI_MMIO_HOLE_SIZE),
     (0xFEC0_0000, 0x1000), // IOAPIC: página de 4 KiB
@@ -437,6 +507,7 @@ pub const HIGH_MEM_HOLES: [(u64, u64); 3] = [
 /// Resta `holes` del rango `[base, base+size)` y devuelve los sub-rangos
 /// libres resultantes. Función pura para poder testear el layout de
 /// memslots sin KVM.
+#[cfg(test)]
 fn carve_reserved_holes(base: u64, size: u64, holes: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let end = base.saturating_add(size);
     let mut regions: Vec<(u64, u64)> = vec![(base, end)];
@@ -463,20 +534,7 @@ fn carve_reserved_holes(base: u64, size: u64, holes: &[(u64, u64)]) -> Vec<(u64,
     regions
 }
 
-/// BDA tick counter physical address (BIOS Data Area, offset 0x400 base + 0x6C).
-const BDA_TICK_ADDR: usize = 0x46C;
-
-// ─── Temporización del PIT (tarea 16) ──────────────────────────────
-// Antes el PIT dependía de un setitimer(1ms)+SIGALRM: la señal es global
-// (podía caer en cualquier hilo, no solo el BSP), obligaba a interrumpir
-// vcpu.run() con EINTR cada milisegundo y era el único reloj del sistema.
-// Ahora un hilo dedicado duerme con clock_nanosleep ABSOLUTO sobre
-// CLOCK_MONOTONIC (sin deriva acumulada) y cada 1 ms:
-//   - avanza el PIT emulado por el tiempo real transcurrido y pulsa IRQ0
-//     en el PIC del kernel (el irqchip despierta al vCPU aunque esté en HLT),
-//   - mantiene el tick del BDA (0x46C) a 18.2 Hz para los wait_ms() de SeaBIOS,
-//   - inyecta el input del host (teclado/ratón/UART) aunque el BSP esté
-//     bloqueado dentro de vcpu.run().
+// ─── Temporización del PIT / HPET / Audio / Red ──────────────────
 
 /// Tiempo monotónico actual (CLOCK_MONOTONIC).
 fn mono_now() -> libc::timespec {
@@ -502,7 +560,19 @@ fn ts_elapsed_ms(a: libc::timespec, b: libc::timespec) -> u32 {
     if ms < 0 { 0 } else { ms as u32 }
 }
 
-/// Hilo de temporización del VMM (sustituye al setitimer de 1 ms).
+/// Tiempo de CPU real consumido por el hilo actual (`CLOCK_THREAD_CPUTIME_ID`).
+fn thread_cpu_nanos() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    }
+    (ts.tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec.max(0) as u64)
+}
+
+/// Hilo de temporización del VMM (PIT respaldo / RTC / HPET / AC'97 / input host).
+#[allow(clippy::too_many_arguments)]
 fn pit_timer_thread(
     vm: Arc<kvm_ioctls::VmFd>,
     bus: Arc<Mutex<DeviceBus>>,
@@ -512,24 +582,42 @@ fn pit_timer_thread(
     tablet_queue: Arc<Mutex<VecDeque<(u16, u16, u8, i8)>>>,
     resize_queue: Arc<Mutex<Option<(u32, u32)>>>,
     irq0_raised: Arc<AtomicBool>,
-    bda_tick_count: Arc<AtomicU32>,
+    has_kernel_pit: bool,
     metrics: Arc<metrics::VmmMetrics>,
 ) {
-    let mut ms_since_bda_tick: u32 = 0;
     let mut last = mono_now();
-    loop {
+    let mut next_deadline = ts_add_ms(last, 1);
+    while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         let now = mono_now();
         let elapsed_ms = ts_elapsed_ms(now, last).max(1);
         last = now;
 
-        // Avanzar el PIT (1.193182 MHz), el RTC CMOS (IRQ8), inyectar eventos de
-        // entrada del host y avanzar dispositivos PCI bajo UNA SOLA adquisición
-        // de `bus.lock()` por tick de 1 ms para minimizar la contención con los vCPUs.
+        if metrics.is_paused.load(Ordering::Relaxed) || RESET_REQUESTED.load(Ordering::SeqCst) {
+            next_deadline = ts_add_ms(mono_now(), 5);
+            let _ = unsafe {
+                libc::clock_nanosleep(
+                    libc::CLOCK_MONOTONIC,
+                    libc::TIMER_ABSTIME,
+                    &next_deadline,
+                    std::ptr::null_mut(),
+                )
+            };
+            last = mono_now();
+            next_deadline = ts_add_ms(last, 1);
+            continue;
+        }
+
         let resize_req = resize_queue.try_lock().ok().and_then(|mut rq| rq.take());
-        let (underflow, rtc_irq8, ps2_irq, mouse_irq, uart_irq, (ide14, ide15)) = {
+        let (underflow, rtc_irq8, hpet_irqs, ps2_irq, mouse_irq, uart_irq, (ide14, ide15)) = {
             let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
-            let u = b.legacy_irq.pit_advance_ticks(elapsed_ms * 1193);
-            let r = b.cmos.rtc_advance_ns((elapsed_ms as u64) * 1_000_000);
+            let elapsed_ns = (elapsed_ms as u64) * 1_000_000;
+            let u = if has_kernel_pit {
+                false
+            } else {
+                b.legacy_irq.pit_advance_ticks(elapsed_ms * 1193)
+            };
+            let r = b.cmos.rtc_advance_ns(elapsed_ns);
+            let h_irqs = b.step_hpet(elapsed_ns);
 
             if let Ok(mut q) = kbd_queue.try_lock() {
                 while let Some(sc) = q.pop_front() {
@@ -558,16 +646,14 @@ fn pit_timer_thread(
             b.step_virtio_serial(&guest_mem);
             b.step_virtio_net(&guest_mem);
             b.step_e1000(&guest_mem);
-            sync_pci_irqs(&mut b, &vm, None);
+            b.step_ac97(&guest_mem);
+            sync_pci_irqs(&mut b, &vm, Some(&metrics));
 
             let uart = b.take_uart_irq();
             let ide = b.take_ide_irq();
-            (u, r, ps2, mouse, uart, ide)
+            (u, r, h_irqs, ps2, mouse, uart, ide)
         };
         if underflow {
-            // Flanco fresco bajo→alto en IRQ0 (PIC edge-triggered). No se
-            // baja después: un tick pendiente sin entregar no debe perderse.
-            // El irqchip del kernel despierta al vCPU aunque esté en HLT.
             vm.set_irq_line(0, false).ok();
             vm.set_irq_line(0, true).ok();
             irq0_raised.store(true, Ordering::Relaxed);
@@ -578,27 +664,11 @@ fn pit_timer_thread(
             vm.set_irq_line(8, true).ok();
             metrics.record_irq(8);
         }
-
-        // Tick del BDA (0x46C) a 18.2 Hz (~55 ms): SeaBIOS lo sondea en
-        // wait_ms(). Se escribe aquí (hilo de tiempo real), no en el BSP.
-        ms_since_bda_tick += elapsed_ms;
-        while ms_since_bda_tick >= 55 {
-            ms_since_bda_tick -= 55;
-            let ticks = bda_tick_count.fetch_add(1, Ordering::Relaxed) + 1;
-            // Escritura acotada y volatile (GuestMemory): el BSP/guest lo lee
-            // sin sincronización (tick del BDA 0x46C).
-            guest_mem.write_u32_volatile(BDA_TICK_ADDR, ticks);
+        for irq in hpet_irqs {
+            vm.set_irq_line(irq as u32, false).ok();
+            vm.set_irq_line(irq as u32, true).ok();
+            metrics.record_irq(irq);
         }
-
-        // Mantener geometría de pantalla BDA (evita que syslinux/menu.c32 lea cols=0
-        // si SeaBIOS limpió la BDA o no inicializó la consola VGA antes del bootloader).
-        if guest_mem.read_u16(0x44A) == 0 {
-            guest_mem.write_u8(0x449, 0x03);
-            guest_mem.write_u16(0x44A, 80);
-            guest_mem.write_u8(0x484, 24);
-            guest_mem.write_u16(0x463, 0x03D4);
-        }
-
         if ps2_irq {
             vm.set_irq_line(1, false).ok();
             vm.set_irq_line(1, true).ok();
@@ -620,15 +690,18 @@ fn pit_timer_thread(
             vm.set_irq_line(15, true).ok();
         }
 
-        // Dormir hasta ahora + 1 ms. clock_nanosleep absoluto: si una señal
-        // lo interrumpe (EINTR) se reintenta con el mismo deadline (ya
-        // pasado → retorna al momento) y el bucle no acumula deriva.
-        let deadline = ts_add_ms(mono_now(), 1);
+        // Deadline absoluto sin deriva; re-sincronizar si hay atraso > 50 ms
+        let after = mono_now();
+        if ts_elapsed_ms(after, next_deadline) > 50 {
+            next_deadline = ts_add_ms(after, 1);
+        } else {
+            next_deadline = ts_add_ms(next_deadline, 1);
+        }
         let rc = unsafe {
             libc::clock_nanosleep(
                 libc::CLOCK_MONOTONIC,
                 libc::TIMER_ABSTIME,
-                &deadline,
+                &next_deadline,
                 std::ptr::null_mut(),
             )
         };
@@ -640,21 +713,21 @@ fn pit_timer_thread(
 }
 
 /// Reset the vCPU to the power-on state (like a hardware reset via port 0xCF9).
-///
-/// Además de restaurar el estado del procesador, resetea los dispositivos
-/// emulados (`bus.reset()`), reinicializa BDA/EBDA/banner VGA en la RAM del
-/// guest y baja las líneas de IRQ del kernel: tras un reboot el guest debe
-/// ver el mismo hardware limpio que al encender (tarea 5 del TODO).
+/// Libre de interbloqueos: señaliza y estaciona los APs antes de tomar `bus.lock()`.
+#[allow(clippy::too_many_arguments)]
 fn reset_vcpu_to_post(
     vcpu: &kvm_ioctls::VcpuFd,
     vm: &kvm_ioctls::VmFd,
-    bus: &mut DeviceBus,
+    bus: &Arc<Mutex<DeviceBus>>,
     guest_mem: &mut [u8],
-    high_mem: Option<&mut [u8]>,
+    vram_mem: &mut [u8],
+    ram_below_4g: u64,
+    kernel_pit_init: Option<&kvm_bindings::kvm_pit_state2>,
+    metrics: &metrics::VmmMetrics,
     bios: Option<&[u8]>,
     vga_rom: Option<&[u8]>,
 ) {
-    // 1. Interrumpir todos los hilos AP para que salgan de vcpu.run() y se aparquen
+    // 1. Interrumpir todos los hilos AP para que salgan de vcpu.run() y se aparquen (SIN retener bus)
     RESET_REQUESTED.store(true, Ordering::SeqCst);
     if let Ok(tids) = AP_TIDS.lock() {
         for &tid in tids.iter() {
@@ -663,12 +736,14 @@ fn reset_vcpu_to_post(
             }
         }
     }
-    // Dar una pequeña ventana para que los hilos AP reciban la señal y se aparquen
     std::thread::sleep(std::time::Duration::from_millis(20));
 
-    // 2. Limpiar eventos pendientes en vCPU (excepciones, interrupciones residuales o NMIs)
+    // 2. Limpiar eventos pendientes y restaurar PIT del kernel si está activo
     let events = kvm_vcpu_events::default();
     vcpu.set_vcpu_events(&events).ok();
+    if let Some(pit_st) = kernel_pit_init {
+        vm.set_pit2(pit_st).ok();
+    }
 
     // 3. Restaurar estado de registros de modo real completamente limpios
     let mut sregs = kvm_sregs::default();
@@ -739,58 +814,44 @@ fn reset_vcpu_to_post(
         eprintln!("[VMM] ERROR al restaurar regs en reset: {}", e);
     }
 
-    // Asegurar que vCPU 0 esté en estado RUNNABLE
     vcpu.set_mp_state(kvm_mp_state {
         mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
     }).ok();
-
-    // Reset de FPU a valores por defecto
     vcpu.set_fpu(&kvm_fpu::default()).ok();
 
-    // Reset de dispositivos (CD-ROM/ATAPI, PIT/PIC/PS2, PCI, VGA, CMOS...)
-    // y de las áreas de memoria que el BIOS espera limpias.
-    bus.reset();
-    bus.legacy_irq.enable_default_pit();
-    init_bios_data_area(guest_mem);
-
-    // Restaurar copias intactas de BIOS ROM y VGA ROM
-    if let Some(b) = bios {
-        let load_addr = bios_load_addr(b.len());
-        let load_off = load_addr as usize;
-        if load_off + b.len() <= guest_mem.len() {
-            guest_mem[load_off..load_off + b.len()].copy_from_slice(b);
+    // 4. Reiniciar dispositivos y memoria bajo bus.lock()
+    {
+        let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
+        b.reset();
+        if kernel_pit_init.is_none() {
+            b.legacy_irq.enable_default_pit();
         }
-        if let Some(hm) = high_mem {
-            const HIGH_MEM_ADDR: u64 = 0xE000_0000u64;
-            let flash_offset_in_high = (0xFFFC_0000u64.saturating_sub(HIGH_MEM_ADDR)) as usize;
-            if flash_offset_in_high + b.len() <= hm.len() {
-                hm[flash_offset_in_high..flash_offset_in_high + b.len()].copy_from_slice(b);
+        vram_mem.fill(0);
+        sync_vga_bar0_slot(vm, &mut b, vram_mem.as_mut_ptr() as u64, vram_mem.len(), ram_below_4g, metrics);
+        init_bios_data_area(guest_mem);
+
+        if let Some(rom) = bios {
+            if !IS_UEFI.load(Ordering::Relaxed) {
+                let load_addr = bios_load_addr(rom.len());
+                let load_off = load_addr as usize;
+                if load_off + rom.len() <= guest_mem.len() {
+                    guest_mem[load_off..load_off + rom.len()].copy_from_slice(rom);
+                }
             }
         }
-    }
-    if let Some(rom) = vga_rom {
-        let vga_load_off = 0xC0000usize;
-        if vga_load_off + rom.len() <= guest_mem.len() {
-            guest_mem[vga_load_off..vga_load_off + rom.len()].copy_from_slice(rom);
+        if let Some(rom) = vga_rom {
+            let vga_load_off = 0xC0000usize;
+            if vga_load_off + rom.len() <= guest_mem.len() {
+                guest_mem[vga_load_off..vga_load_off + rom.len()].copy_from_slice(rom);
+            }
         }
+
+        for irq in 0..16u32 {
+            vm.set_irq_line(irq, false).ok();
+        }
+        b.clear_pci_irq_levels();
     }
 
-    // Bajar las líneas de IRQ del kernel para no arrastrar flancos del ciclo
-    // anterior (SeaBIOS reprograma el PIC en el POST de todas formas).
-    vm.set_irq_line(0, false).ok();
-    vm.set_irq_line(1, false).ok();
-    vm.set_irq_line(8, false).ok();
-    vm.set_irq_line(4, false).ok();
-    vm.set_irq_line(14, false).ok();
-    vm.set_irq_line(15, false).ok();
-    vm.set_irq_line(11, false).ok();
-    vm.set_irq_line(10, false).ok();
-    vm.set_irq_line(9, false).ok();
-    vm.set_irq_line(5, false).ok();
-    // Las líneas PCI del irqchip acaban de quedar bajas: el cache de
-    // `DeviceBus` debe reflejarlo (si quedara "alta", sync_pci_irqs no
-    // volvería a subir esa línea jamás).
-    bus.clear_pci_irq_levels();
     RESET_REQUESTED.store(false, Ordering::SeqCst);
     eprintln!("[VMM] Reset completado exitosamente: vCPU 0 en POST (CS:IP = {:#x}:{:#x})", sregs.cs.selector, regs.rip);
 }
@@ -834,18 +895,48 @@ fn mmap_zeroed_region(size: usize) -> &'static mut [u8] {
 /// del núcleo físico del host donde se ejecutó `get_supported_cpuid`.
 fn apply_vcpu_cpuid(vcpu: &kvm_ioctls::VcpuFd, base_cpuid: &kvm_bindings::CpuId, cpu_id: u32, num_cpus: u32) {
     let mut cpuid = base_cpuid.clone();
+    let logical = num_cpus.max(1);
+    let core_shift = logical.next_power_of_two().trailing_zeros();
     for entry in cpuid.as_mut_slice().iter_mut() {
         match entry.function {
             0x01 => {
                 entry.ebx = (entry.ebx & 0x0000_FFFF)
-                    | ((num_cpus.max(1) & 0xFF) << 16)
+                    | ((logical & 0xFF) << 16)
                     | ((cpu_id & 0xFF) << 24);
-                if num_cpus > 1 {
+                if logical > 1 {
                     entry.edx |= 1 << 28; // HTT
+                } else {
+                    entry.edx &= !(1 << 28);
+                }
+            }
+            0x04 => {
+                if (entry.eax & 0x1F) != 0 {
+                    entry.eax = (entry.eax & 0x03FF_FFFF)
+                        | ((logical.saturating_sub(1) & 0x3F) << 26);
                 }
             }
             0x0B | 0x1F => {
+                let level = entry.ecx & 0xFF;
+                match level {
+                    0 => {
+                        entry.eax = 0;
+                        entry.ebx = 1;
+                        entry.ecx = 0x100;
+                    }
+                    1 => {
+                        entry.eax = core_shift;
+                        entry.ebx = logical;
+                        entry.ecx = 0x201;
+                    }
+                    _ => {
+                        entry.eax = 0;
+                        entry.ebx = 0;
+                    }
+                }
                 entry.edx = cpu_id; // x2APIC ID = cpu_id
+            }
+            0x8000_0008 => {
+                entry.ecx = (entry.ecx & !0xFF) | (logical.saturating_sub(1) & 0xFF);
             }
             0x8000_001E => {
                 entry.eax = cpu_id; // Extended APIC ID (AMD) = cpu_id
@@ -881,20 +972,66 @@ fn resolve_guest_gpa(vcpu: &kvm_ioctls::VcpuFd, cr0: u64, linear: u64) -> u64 {
     linear
 }
 
-/// Instala un handler para las señales indicadas (wrapper de libc::signal).
+/// Instala un handler POSIX sin SA_RESTART para interrumpir `vcpu.run()`.
 fn install_signal_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     unsafe {
-        libc::signal(sig, handler as *const () as libc::sighandler_t);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
     }
 }
 
-/// Sincroniza las líneas de interrupción de todos los dispositivos PCI hacia la VM de KVM
-/// implementando la semántica estándar de nivel compartida (wired-OR activo en bajo/alto).
-///
-/// Si múltiples dispositivos comparten la misma línea IRQ (ej. AHCI y VirtIO-Serial en IRQ 10,
-/// o USB UHCI y VMMDev en IRQ 11), la línea permanece en alto mientras CUALQUIERA de ellos
-/// la mantenga asserted. Esto previene que un dispositivo inactivo limpie la interrupción
-/// recién levantada por otro dispositivo en el mismo bus.
+/// Sincroniza el slot 3 dinámico de 64 MiB VRAM en KVM cuando el guest asigna VGA BAR0.
+fn sync_vga_bar0_slot(
+    vm: &kvm_ioctls::VmFd,
+    bus: &mut devices::DeviceBus,
+    vram_addr: u64,
+    vram_size: usize,
+    ram_below_4g: u64,
+    metrics: &metrics::VmmMetrics,
+) {
+    let Some(bar_raw) = bus.take_vga_bar0_remap() else {
+        return;
+    };
+    let new_gpa = (bar_raw & 0xFFFF_FFF0) as u64;
+    // Validar que no invada RAM (<ram_below_4g) ni PCIE/IOAPIC/HPET/LAPIC/ROM (>= 0xFC00_0000)
+    if new_gpa < ram_below_4g || new_gpa.saturating_add(vram_size as u64) > 0xFC00_0000 {
+        return;
+    }
+    if bus.mapped_vram_gpa == Some(new_gpa) {
+        return;
+    }
+    if let Some(old_gpa) = bus.mapped_vram_gpa.take() {
+        let _ = unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 3,
+                guest_phys_addr: old_gpa,
+                memory_size: 0,
+                userspace_addr: 0,
+                flags: 0,
+            })
+        };
+    }
+    if unsafe {
+        vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+            slot: 3,
+            guest_phys_addr: new_gpa,
+            memory_size: vram_size as u64,
+            userspace_addr: vram_addr,
+            flags: 0,
+        })
+    }
+    .is_ok()
+    {
+        bus.mapped_vram_gpa = Some(new_gpa);
+        metrics.lfb_gpa.store(new_gpa, Ordering::Relaxed);
+        eprintln!("[KVM] Slot 3 (VRAM 64 MiB) mapeado en GPA {:#x}", new_gpa);
+    }
+}
+
+/// Sincroniza las líneas de interrupción de todos los dispositivos PCI + SCI ACPI (IRQ 9).
 fn sync_pci_irqs(
     b: &mut devices::DeviceBus,
     vm: &kvm_ioctls::VmFd,
@@ -921,7 +1058,10 @@ fn sync_pci_irqs(
     let irq_e1000 = b.e1000_irq_line() as u32;
     let assert_e1000 = b.is_e1000_irq_asserted();
 
-    let mut lines = [irq_usb, irq_vs, irq_vn, irq_ahci, irq_vmm, irq_ac97, irq_e1000];
+    let pulse_hotplug_sci = b.take_cpu_hotplug_sci();
+    let assert_sci = b.is_acpi_sci_asserted() || pulse_hotplug_sci;
+
+    let mut lines = [irq_usb, irq_vs, irq_vn, irq_ahci, irq_vmm, irq_ac97, irq_e1000, 9];
     lines.sort_unstable();
 
     let mut last = 0xFF;
@@ -933,7 +1073,8 @@ fn sync_pci_irqs(
 
         let pulse = (line == irq_usb && pulse_usb)
             || (line == irq_vs && pulse_vs)
-            || (line == irq_vn && pulse_vn);
+            || (line == irq_vn && pulse_vn)
+            || (line == 9 && pulse_hotplug_sci);
 
         let asserted = (line == irq_usb && assert_usb)
             || (line == irq_vs && assert_vs)
@@ -941,7 +1082,8 @@ fn sync_pci_irqs(
             || (line == irq_ahci && assert_ahci)
             || (line == irq_vmm && assert_vmm)
             || (line == irq_ac97 && assert_ac97)
-            || (line == irq_e1000 && assert_e1000);
+            || (line == irq_e1000 && assert_e1000)
+            || (line == 9 && assert_sci);
 
         // El ioctl KVM_IRQ_LINE cuesta ~480 ns y esto corre tras CADA
         // VM-exit: solo lo emitimos cuando el nivel cambia de verdad.
@@ -1008,9 +1150,22 @@ fn main() {
     }
 
     let mut force_gui = false;
-    let mut no_gui = std::env::var("MI_VMM_NO_GUI").is_ok();
+    let mut no_gui = get_vmm_env("NO_GUI").is_ok();
+    let mut use_efi = false;
+    let mut no_disk = false;
     let mut cli_cpus: Option<u32> = None;
     let mut cli_ram_mb: Option<usize> = None;
+    let mut cli_net_name: Option<String> = None;
+    let mut cli_net_mode: Option<String> = None;
+    let mut cli_net_subnet: Option<String> = None;
+    let mut cli_tap: Option<String> = None;
+    let mut cli_mac: Option<String> = None;
+    let mut cli_hostfwds: Vec<network::PortForward> = Vec::new();
+    let mut agent_status = false;
+    let mut bogo_only = false;
+    let mut agent_prompt: Option<String> = None;
+    let mut ollama_model: Option<String> = None;
+    let mut ollama_url: Option<String> = None;
 
     let mut positional_args: Vec<String> = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
@@ -1021,6 +1176,10 @@ fn main() {
             force_gui = true;
         } else if arg == "--no-gui" {
             no_gui = true;
+        } else if arg == "--efi" || arg == "--uefi" {
+            use_efi = true;
+        } else if arg == "--no-disk" {
+            no_disk = true;
         } else if arg == "--cpus" {
             if let Some(val) = iter.next() {
                 cli_cpus = val.parse::<u32>().ok();
@@ -1168,12 +1327,147 @@ fn main() {
         } else if let Some(val) = arg.strip_prefix("--startvm=") {
             cli_vm_name = Some(val.to_string());
             no_gui = true;
+        } else if arg == "--net" {
+            if let Some(val) = iter.next() {
+                cli_net_name = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--net=") {
+            cli_net_name = Some(val.to_string());
+        } else if arg == "--net-mode" {
+            if let Some(val) = iter.next() {
+                cli_net_mode = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--net-mode=") {
+            cli_net_mode = Some(val.to_string());
+        } else if arg == "--net-subnet" {
+            if let Some(val) = iter.next() {
+                cli_net_subnet = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--net-subnet=") {
+            cli_net_subnet = Some(val.to_string());
+        } else if arg == "--tap" {
+            if let Some(val) = iter.next() {
+                cli_tap = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--tap=") {
+            cli_tap = Some(val.to_string());
+        } else if arg == "--mac" {
+            if let Some(val) = iter.next() {
+                cli_mac = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--mac=") {
+            cli_mac = Some(val.to_string());
+        } else if arg == "--hostfwd" {
+            if let Some(val) = iter.next() {
+                if let Ok(pf) = network::PortForward::parse(val) {
+                    cli_hostfwds.push(pf);
+                } else {
+                    eprintln!("[NET] Advertencia: --hostfwd inválido '{}'", val);
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--hostfwd=") {
+            if let Ok(pf) = network::PortForward::parse(val) {
+                cli_hostfwds.push(pf);
+            } else {
+                eprintln!("[NET] Advertencia: --hostfwd inválido '{}'", val);
+            }
+        } else if arg == "--agent-status" {
+            agent_status = true;
+        } else if arg == "--bogo-only" {
+            bogo_only = true;
+        } else if arg == "--agent-prompt" {
+            if let Some(val) = iter.next() {
+                agent_prompt = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--agent-prompt=") {
+            agent_prompt = Some(val.to_string());
+        } else if arg == "--ollama-model" {
+            if let Some(val) = iter.next() {
+                ollama_model = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--ollama-model=") {
+            ollama_model = Some(val.to_string());
+        } else if arg == "--ollama-url" {
+            if let Some(val) = iter.next() {
+                ollama_url = Some(val.clone());
+            }
+        } else if let Some(val) = arg.strip_prefix("--ollama-url=") {
+            ollama_url = Some(val.to_string());
         } else if arg == "-h" || arg == "--help" {
             usage();
         } else if arg.starts_with("--") {
             // Otras banderas de configuración (ej. --no-iso, --no-cdrom, --tui, etc.)
         } else {
             positional_args.push(arg.clone());
+        }
+    }
+
+    if agent_status {
+        println!("Candidatos Ollama (por prioridad):");
+        for (i, ep) in ollama::OllamaClient::candidate_endpoints().iter().enumerate() {
+            println!("  {}. [{}] {}", i + 1, ep.label, ep.url);
+        }
+        if let Some(ref u) = ollama_url {
+            let c = ollama::OllamaClient::new(u);
+            match c.list_models() {
+                Ok(models) => {
+                    println!("Ollama activo en: {}", c.base_url);
+                    let rem = !ollama::is_loopback_url(&c.base_url);
+                    let best = ollama::OllamaClient::pick_best_model_for(&models, rem).unwrap_or_default();
+                    println!("Modelo recomendado: {}", best);
+                    for m in &models {
+                        println!("  - {} ({}, tools={})", m.name, m.parameter_size, m.supports_tools);
+                    }
+                    exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[AGENT] Ollama no disponible en {}: {}", u, e);
+                    exit(1);
+                }
+            }
+        } else {
+            match ollama::OllamaClient::discover_endpoint_detailed(bogo_only) {
+                Ok(d) => {
+                    println!(
+                        "Servidor activo: [{}] {} ({})",
+                        d.endpoint.label,
+                        d.client.base_url,
+                        if d.endpoint.is_remote { "GPU Tailscale" } else { "CPU local" }
+                    );
+                    if let Some(note) = d.fallback_note {
+                        println!("Aviso fallback: {}", note);
+                    }
+                    let best = ollama::OllamaClient::pick_best_model_for(&d.models, d.endpoint.is_remote)
+                        .unwrap_or_default();
+                    println!("Modelo recomendado: {}", best);
+                    for m in &d.models {
+                        println!("  - {} ({}, tools={})", m.name, m.parameter_size, m.supports_tools);
+                    }
+                    exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[AGENT] Ollama no disponible: {}", e);
+                    exit(1);
+                }
+            }
+        }
+    }
+
+    if let Some(ref prompt) = agent_prompt {
+        match agent::run_headless_prompt(
+            prompt,
+            ollama_model.as_deref(),
+            ollama_url.as_deref(),
+            bogo_only,
+        ) {
+            Ok(reply) => {
+                println!("{}", reply);
+                exit(0);
+            }
+            Err(e) => {
+                eprintln!("[AGENT] Error: {}", e);
+                exit(1);
+            }
         }
     }
 
@@ -1195,17 +1489,39 @@ fn main() {
             if cli_disk.is_none() && p.disk_path.is_some() {
                 cli_disk = p.disk_path.map(PathBuf::from);
             }
+            if cli_net_name.is_none() && !p.network_name.is_empty() {
+                cli_net_name = Some(p.network_name);
+            }
+            if cli_mac.is_none() && !p.mac_address.is_empty() {
+                cli_mac = Some(p.mac_address);
+            }
+            if p.ssh_host_port > 0
+                && !cli_hostfwds.iter().any(|pf| pf.host_port == p.ssh_host_port)
+            {
+                cli_hostfwds.push(network::PortForward {
+                    host_port: p.ssh_host_port,
+                    guest_port: 22,
+                });
+            }
             unattended = unattended || p.unattended;
+            use_efi = use_efi || p.use_efi;
         }
     }
 
     let (bios_path_buf, mut iso_path_buf, mut disk_path_buf) = if positional_args.is_empty() {
-        let bios = find_default_bios().unwrap_or_else(|| {
-            eprintln!("[VMM] ERROR: No se especificó BIOS ni se encontró SeaBIOS en rutas estándar.");
-            usage();
-        });
+        let bios = if use_efi {
+            find_ovmf_bios().unwrap_or_else(|| {
+                eprintln!("[VMM] ERROR: --efi solicitado pero no se encontró OVMF_CODE.fd.");
+                usage();
+            })
+        } else {
+            find_default_bios().unwrap_or_else(|| {
+                eprintln!("[VMM] ERROR: No se especificó BIOS ni se encontró SeaBIOS en rutas estándar.");
+                usage();
+            })
+        };
         let iso = cli_cdrom.or_else(auto_detect_iso);
-        let disk = cli_disk.or_else(auto_detect_disk);
+        let disk = if no_disk { None } else { cli_disk.or_else(auto_detect_disk) };
         (bios, iso, disk)
     } else {
         let mut bios = None;
@@ -1225,14 +1541,20 @@ fn main() {
         }
 
         let bios = bios.unwrap_or_else(|| {
-            find_default_bios().unwrap_or_else(|| {
-                eprintln!("[VMM] ERROR: No se encontró SeaBIOS para arrancar la VM.");
-                usage();
-            })
+            if use_efi {
+                find_ovmf_bios().unwrap_or_else(|| {
+                    eprintln!("[VMM] ERROR: --efi solicitado pero no se encontró OVMF_CODE.fd.");
+                    usage();
+                })
+            } else {
+                find_default_bios().unwrap_or_else(|| {
+                    eprintln!("[VMM] ERROR: No se encontró SeaBIOS para arrancar la VM.");
+                    usage();
+                })
+            }
         });
 
-        // Si se especificó una ISO pero ningún disco, conectar el disco por defecto si existe
-        let disk = disk.or_else(auto_detect_disk);
+        let disk = if no_disk { None } else { disk.or_else(auto_detect_disk) };
 
         (bios, iso, disk)
     };
@@ -1240,15 +1562,18 @@ fn main() {
     if args.iter().any(|a| a == "--no-iso" || a == "--no-cdrom") {
         iso_path_buf = None;
     }
+    if no_disk {
+        disk_path_buf = None;
+    }
 
-    let verbose = std::env::var("MI_VMM_VERBOSE").is_ok();
+    let verbose = get_vmm_env("VERBOSE").is_ok();
     let mut num_cpus: u32 = cli_cpus
-        .or_else(|| std::env::var("MI_VMM_CPUS").ok().and_then(|v| v.parse::<u32>().ok()))
+        .or_else(|| get_vmm_env("CPUS").ok().and_then(|v| v.parse::<u32>().ok()))
         .unwrap_or(4)
         .clamp(1, 16);
 
     let mut ram_mb: usize = cli_ram_mb
-        .or_else(|| std::env::var("MI_VMM_RAM").ok().and_then(|v| v.parse::<usize>().ok()))
+        .or_else(|| get_vmm_env("RAM").ok().and_then(|v| v.parse::<usize>().ok()))
         .unwrap_or(4096)
         .max(256);
 
@@ -1256,7 +1581,7 @@ fn main() {
     let should_open_gui = force_gui
         || (!no_gui
             && positional_args.is_empty()
-            && std::env::var("MI_VMM_SERIAL_IN").is_err());
+            && get_vmm_env("SERIAL_IN").is_err());
 
     if should_open_gui {
         match gui_launcher::run_gui_launcher(
@@ -1273,8 +1598,7 @@ fn main() {
                 iso_path_buf = sel.iso_path;
                 disk_path_buf = sel.disk_path;
                 unattended = sel.unattended;
-                // Breve pausa para que el servidor X11/Wayland cierre limpiamente la ventana
-                // del lanzador y suelte la tecla Enter antes de abrir DisplayManager.
+                use_efi = sel.use_efi;
                 std::thread::sleep(std::time::Duration::from_millis(120));
             }
             gui_launcher::GuiOutcome::Cancelled => {
@@ -1284,6 +1608,18 @@ fn main() {
             gui_launcher::GuiOutcome::Headless => {}
         }
     }
+
+    let bios_path_buf = if use_efi
+        && !bios_path_buf.to_string_lossy().to_lowercase().contains("ovmf")
+        && !bios_path_buf.to_string_lossy().to_lowercase().ends_with(".fd")
+    {
+        find_ovmf_bios().unwrap_or_else(|| {
+            eprintln!("[VMM] ERROR: EFI solicitado pero no se encontró OVMF_CODE.fd.");
+            usage();
+        })
+    } else {
+        bios_path_buf
+    };
 
     let bios_path_str = bios_path_buf.to_string_lossy().to_string();
     let bios_path = &bios_path_str;
@@ -1302,34 +1638,73 @@ fn main() {
         eprintln!("[VMM] DISK: {}", disk);
     }
 
+    // Cargar firmware primero para conocer tamaño exacto del slot ROM read-only
+    let mut bios = Vec::new();
+    let bios_io = File::open(bios_path).and_then(|mut f| f.read_to_end(&mut bios));
+    if let Err(e) = bios_io {
+        eprintln!("[VMM] No se pudo leer '{}': {}", bios_path, e);
+        exit(1);
+    }
+    const BIOS_MAX: usize = 16 * 1024 * 1024;
+    if bios.is_empty() || bios.len() > BIOS_MAX {
+        eprintln!(
+            "[VMM] ERROR: '{}' tiene {} bytes (válido: 1..={} KB).",
+            bios_path, bios.len(), BIOS_MAX / 1024
+        );
+        exit(1);
+    }
+    let is_uefi = bios.len() > 512 * 1024
+        || bios_path.to_lowercase().contains("ovmf")
+        || bios_path.to_lowercase().contains(".fd");
+    IS_UEFI.store(is_uefi, Ordering::Relaxed);
+
     let kvm = Kvm::new().expect("No se pudo abrir /dev/kvm");
-    // vm se comparte con el hilo pit-timer (tarea 16): kvm-ioctls 0.14 no
-    // implementa Clone para VmFd, así que se envuelve en Arc (VmFd es
-    // Send+Sync: contiene un File y un usize). Todos los métodos usan
-    // &self, así que las llamadas funcionan por auto-deref.
     let vm = Arc::new(kvm.create_vm().expect("create_vm falló"));
     vm.create_irq_chip().expect("create_irq_chip falló");
+    let kernel_pit_init = vm
+        .create_pit2(kvm_bindings::kvm_pit_config {
+            flags: kvm_bindings::KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        })
+        .ok()
+        .and_then(|_| vm.get_pit2().ok());
+    let has_kernel_pit = kernel_pit_init.is_some();
+    if has_kernel_pit {
+        eprintln!("[VMM] PIT del kernel habilitado (KVM_CREATE_PIT2 / SPEAKER_DUMMY)");
+    }
 
-    // ─── RAM principal (con split para hueco PCI a 3.5GB) ────────
+    // ─── RAM principal con hueco VGA planar 0xA0000..0xB8000 ────
     let guest_mem_size = ram_mb * 1024 * 1024;
-
     let guest_mem = mmap_zeroed_region(guest_mem_size);
-    // Manija compartida con bounds-check (tarea 18): display, DebugCon y el
-    // hilo de temporización la reciben en vez de punteros `*const u8` crudos.
     let guest_mem_handle: Arc<GuestMemory> =
         GuestMemory::arc(guest_mem.as_mut_ptr(), guest_mem.len());
 
     const RAM_BELOW_4G_LIMIT: u64 = 0xE000_0000;
+    const LOW_RAM_END: u64 = 0x000A_0000;
+    const UPPER_LOW_RAM_START: u64 = 0x000B_8000;
     let ram_below_4g = (guest_mem_size as u64).min(RAM_BELOW_4G_LIMIT);
+
+    // Slot 0: 0..0xA0000 (RAM convencional; 0xA0000..0xB8000 queda sin memslot -> MMIO VGA planar)
     unsafe {
         vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
             slot: 0,
             guest_phys_addr: 0,
-            memory_size: ram_below_4g,
+            memory_size: LOW_RAM_END,
             userspace_addr: guest_mem_handle.as_mut_ptr() as u64,
             flags: 0,
         })
-        .expect("set_user_memory_region (RAM baja) falló");
+        .expect("set_user_memory_region (slot 0 RAM convencional) falló");
+    }
+    // Slot 4: 0xB8000..ram_below_4g (buffer texto 0xB8000 + Option ROM + RAM baja restante)
+    unsafe {
+        vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+            slot: 4,
+            guest_phys_addr: UPPER_LOW_RAM_START,
+            memory_size: ram_below_4g.saturating_sub(UPPER_LOW_RAM_START),
+            userspace_addr: guest_mem_handle.as_mut_ptr() as u64 + UPPER_LOW_RAM_START,
+            flags: 0,
+        })
+        .expect("set_user_memory_region (slot 4 RAM baja) falló");
     }
 
     if (guest_mem_size as u64) > ram_below_4g {
@@ -1342,7 +1717,7 @@ fn main() {
                 userspace_addr: guest_mem_handle.as_mut_ptr() as u64 + ram_below_4g,
                 flags: 0,
             })
-            .expect("set_user_memory_region (RAM alta >4GB) falló");
+            .expect("set_user_memory_region (slot 1 RAM >4GB) falló");
         }
         eprintln!(
             "[VMM] RAM dividida: {} MiB baja (<3.5GB) + {} MiB alta (>4GB)",
@@ -1351,39 +1726,42 @@ fn main() {
         );
     }
 
-    // ─── High memory: 512 MiB desde 0xE0000000 ─────────────────
-    // (tarea 7) La ventana se registra TROCEADA: las páginas de MMIO del
-    // LAPIC (0xFEE00000) y del IOAPIC (0xFEC00000) quedan SIN memslot para
-    // que las atienda el irqchip del kernel (create_irq_chip). Con un
-    // memslot de RAM encima, la EPT resolvía el acceso como memoria y los
-    // accesos del guest (ICR, IOREDTBL…) caían en RAM tonta.
-    const HIGH_MEM_SIZE: usize = 512 * 1024 * 1024;
-    const HIGH_MEM_ADDR: u64 = 0xE000_0000u64;
-    let high_mem = mmap_zeroed_region(HIGH_MEM_SIZE);
-    for (i, (start, end)) in
-        carve_reserved_holes(HIGH_MEM_ADDR, HIGH_MEM_SIZE as u64, &HIGH_MEM_HOLES)
-            .into_iter()
-            .enumerate()
-    {
-        let off = (start - HIGH_MEM_ADDR) as usize;
-        unsafe {
-            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
-                slot: 2 + i as u32,
-                guest_phys_addr: start,
-                memory_size: end - start,
-                userspace_addr: high_mem.as_ptr() as u64 + off as u64,
-                flags: 0,
-            })
-            .expect("set_user_memory_region (high mem) falló");
-        }
+    // Slot 2: ROM read-only justo debajo de 4 GiB (HPET 0xFED00000, IOAPIC/LAPIC, PCI MMIO y pflash sin memslot)
+    let rom_size = (bios.len() + 0xFFF) & !0xFFF;
+    let rom_gpa = 0x1_0000_0000u64 - rom_size as u64;
+    let bios_rom_mem = mmap_zeroed_region(rom_size);
+    bios_rom_mem[rom_size - bios.len()..rom_size].copy_from_slice(&bios);
+    unsafe {
+        vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+            slot: 2,
+            guest_phys_addr: rom_gpa,
+            memory_size: rom_size as u64,
+            userspace_addr: bios_rom_mem.as_ptr() as u64,
+            flags: kvm_bindings::KVM_MEM_READONLY,
+        })
+        .expect("set_user_memory_region (slot 2 BIOS/OVMF ROM RO) falló");
     }
     eprintln!(
-        "[VMM] Huecos reservados en high_mem: PCI MMIO@0xFE000000 (12MB), LAPIC@0xFEE00000 e IOAPIC@0xFEC00000 (sin memslot de RAM)"
+        "[VMM] ROM de firmware ({} KiB, RO) en GPA {:#x}..{:#x}",
+        rom_size / 1024,
+        rom_gpa,
+        rom_gpa + rom_size as u64
     );
 
-    // ─── VRAM: 16 MiB en GPA 0xE8000000 (offset 128MB de high_mem) ───
-    const VRAM_SIZE: usize = 16 * 1024 * 1024;
-    let vram_ptr = unsafe { high_mem.as_mut_ptr().add(128 * 1024 * 1024) };
+    // Slot 3: VRAM lineal de 64 MiB (arranca en 0xE8000000 y se remapea dinámicamente con VGA BAR0)
+    let vram_size = devices::vga::VRAM_SIZE;
+    let vram_mem = mmap_zeroed_region(vram_size);
+    let vram_ptr = vram_mem.as_mut_ptr();
+    unsafe {
+        vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+            slot: 3,
+            guest_phys_addr: devices::vga::VRAM_DEFAULT_BASE_GPA,
+            memory_size: vram_size as u64,
+            userspace_addr: vram_ptr as u64,
+            flags: 0,
+        })
+        .expect("set_user_memory_region (slot 3 VRAM 64 MiB) falló");
+    }
 
     // ─── Buscar VGA Option ROM para fw_cfg y C0000 ─────────────
     let vga_candidates = [
@@ -1418,17 +1796,48 @@ fn main() {
         }
     }
 
-    let (mut bus, vga_state) = match DeviceBus::new(
+    let net_cfg = {
+        let nets = network::load_networks();
+        let net_name = cli_net_name.as_deref().unwrap_or(network::DEFAULT_NETWORK_NAME);
+        let mut net = nets
+            .into_iter()
+            .find(|n| n.name.eq_ignore_ascii_case(net_name))
+            .unwrap_or_else(network::VirtualNetwork::default_nat);
+        if let Some(ref mode_s) = cli_net_mode {
+            if let Ok(m) = network::NetworkMode::parse(mode_s) {
+                net.mode = m;
+            }
+        }
+        if let Some(ref sub) = cli_net_subnet {
+            if let Ok((gw, dns, guest, mask)) = network::parse_cidr(sub) {
+                net.subnet = sub.clone();
+                net.gateway_ip = gw;
+                net.dns_ip = dns;
+                net.guest_ip = guest;
+                net.subnet_mask = mask;
+            }
+        }
+        if let Some(ref tap) = cli_tap {
+            net.tap_if = Some(tap.clone());
+            net.mode = network::NetworkMode::Tap;
+        }
+        let mac = cli_mac
+            .as_deref()
+            .and_then(network::parse_mac)
+            .unwrap_or(devices::virtio_net::DEFAULT_GUEST_MAC);
+        net.to_net_config(&cli_hostfwds, mac)
+    };
+
+    let vram_addr = vram_ptr as u64;
+    let (mut bus, vga_state) = match DeviceBus::new_with_net(
         iso_path,
         disk_path,
         vram_ptr,
-        VRAM_SIZE,
+        vram_size,
         guest_mem_size as u64,
         num_cpus,
-        high_mem.as_mut_ptr(),
-        HIGH_MEM_ADDR,
-        HIGH_MEM_SIZE,
         vga_rom_data.clone(),
+        Some(net_cfg),
     ) {
         Ok(res) => res,
         Err(e) => {
@@ -1440,30 +1849,39 @@ fn main() {
     bus.debugcon.set_guest_mem(guest_mem_handle.clone());
     // Connect DeviceBus to guest memory for Bus Master DMA (BMDMA)
     bus.set_guest_mem(guest_mem_handle.clone());
-    // Habilitar PIT canal 0 por defecto (Modo 3, 18.2 Hz) como en hardware PC real
-    bus.legacy_irq.enable_default_pit();
+    if !has_kernel_pit {
+        bus.legacy_irq.enable_default_pit();
+    }
     if !bus.debugcon.mirror_enabled() {
         eprintln!("[VMM] Espejo BIOS→0xB8000 desactivado (MI_VMM_MIRROR_BIOS=1 para activarlo)");
     }
 
-    // ─── Instalación Desatendida (OEMDRV / CIDATA) ──────────────
+    // ─── Instalación Desatendida (OEMDRV / CIDATA / OS-aware) ──
     if unattended {
         bus.ahci.unattended = true;
         if let Some(ref mut cdrom) = bus.cdrom {
             cdrom.unattended = true;
         }
         if let Some(iso) = iso_path {
+            let detected_os = unattended::detect_os_from_iso(Path::new(iso))
+                .unwrap_or(unattended::GuestOsType::Unknown);
             let config = unattended::UnattendedConfig {
                 username: unattended_user,
                 password: unattended_pass,
                 hostname: unattended_host,
                 timezone: "UTC".to_string(),
             };
+            bus.ahci.unattended_os = detected_os;
+            bus.ahci.unattended_config = config.clone();
+            if let Some(ref mut cdrom) = bus.cdrom {
+                cdrom.unattended_os = detected_os;
+                cdrom.unattended_config = config.clone();
+            }
             match unattended::prepare_unattended_media(Path::new(iso), &config) {
                 Ok(aux_path) => {
                     let path_str = aux_path.to_string_lossy().to_string();
                     bus.ahci.attach_aux_disk(&path_str);
-                    eprintln!("[two-five-five] Instalación desatendida activada (OEMDRV montado)");
+                    eprintln!("[two-five-five] Instalación desatendida ({}) activada (OEMDRV montado)", detected_os);
                 }
                 Err(e) => {
                     eprintln!("[two-five-five] Error preparando medio desatendido: {}", e);
@@ -1474,17 +1892,11 @@ fn main() {
         }
     }
 
-    // ─── (tarea 6) Compartir el bus entre todos los vCPUs ──────
-    // Los APs manejan sus propios exits de E/S contra los mismos
-    // dispositivos; el Mutex serializa el acceso. (La condición Send de
-    // DeviceBus se justifica en devices/mod.rs.)
+    // ─── Compartir el bus entre todos los vCPUs ──────────────────
     let bus = Arc::new(Mutex::new(bus));
 
     // ─── Serial-in: stdin del host → COM1 (RX) ──────────────────
-    // Opcional (MI_VMM_SERIAL_IN=1): un hilo reenvía lo que se teclea en la
-    // terminal a la cola RX del UART, de modo que console=ttyS0 sirva también
-    // para escribir en el guest (GRUB menu, shell de Linux, etc.).
-    if std::env::var("MI_VMM_SERIAL_IN").is_ok() {
+    if get_vmm_env("SERIAL_IN").is_ok() {
         let bus_serial = Arc::clone(&bus);
         std::thread::Builder::new()
             .name("serial-in".to_string())
@@ -1509,43 +1921,9 @@ fn main() {
         eprintln!("[VMM] Serial-in activo: stdin del host → COM1 (RX del guest)");
     }
 
-    // ─── Cargar firmware ────────────────────────────────────────
-    let mut bios = Vec::new();
-    let bios_io = File::open(bios_path)
-        .and_then(|mut f| f.read_to_end(&mut bios));
-    if let Err(e) = bios_io {
-        eprintln!("[VMM] No se pudo leer '{}': {}", bios_path, e);
-        exit(1);
-    }
-    // Soporte para Legacy BIOS (<= 512 KB) y UEFI / OVMF (hasta 16 MB)
-    const BIOS_MAX: usize = 16 * 1024 * 1024;
-    if bios.len() > BIOS_MAX {
-        eprintln!(
-            "[VMM] ERROR: '{}' tiene {} bytes (>{} KB). Excede el tamaño máximo de firmware.",
-            bios_path, bios.len(), BIOS_MAX / 1024
-        );
-        exit(1);
-    }
-    let is_uefi = bios.len() > 512 * 1024
-        || bios_path.to_lowercase().contains("ovmf")
-        || bios_path.to_lowercase().contains(".fd");
-    IS_UEFI.store(is_uefi, Ordering::Relaxed);
-
+    // ─── Configurar firmware (UEFI VarStore o SeaBIOS baja) ────
     if is_uefi {
-        // Rediseño de mapeo de flash para UEFI / OVMF (Item 22):
-        // OVMF se mapea justo debajo de 4 GiB (0x1_0000_0000 - len)
-        let flash_addr = (0x1_0000_0000u64).saturating_sub(bios.len() as u64);
-        if flash_addr >= HIGH_MEM_ADDR {
-            let offset_in_high = (flash_addr - HIGH_MEM_ADDR) as usize;
-            if offset_in_high + bios.len() <= high_mem.len() {
-                high_mem[offset_in_high..offset_in_high + bios.len()].copy_from_slice(&bios);
-                eprintln!("[VMM] Firmware UEFI/OVMF mapeado en {:#x}..{:#x} ({} MB)",
-                    flash_addr, flash_addr + bios.len() as u64, bios.len() / (1024 * 1024));
-            }
-        }
-
-        // Cargar o inicializar VarStore para UEFI (Item 22)
-        let vars_path = std::env::var("MI_VMM_VARS").ok();
+        let vars_path = get_vmm_env("VARS").ok();
         let pflash = match vars_path {
             Some(ref p) if std::path::Path::new(p).exists() => {
                 devices::pflash::ParallelFlash::load_file("OVMF_VARS", p, 64 * 1024, false)
@@ -1553,8 +1931,9 @@ fn main() {
             }
             _ => devices::pflash::ParallelFlash::new("OVMF_VARS", 512 * 1024, 64 * 1024, false),
         };
-        bus.lock().unwrap_or_else(|p| p.into_inner()).set_pflash(pflash);
-        eprintln!("[VMM] VarStore UEFI (pflash) inicializado.");
+        let pflash_base = rom_gpa.saturating_sub(pflash.data.len() as u64);
+        bus.lock().unwrap_or_else(|p| p.into_inner()).set_pflash(pflash, pflash_base);
+        eprintln!("[VMM] VarStore UEFI (pflash) inicializado en GPA {:#x}.", pflash_base);
     } else {
         let load_addr = bios_load_addr(bios.len());
         let load_off = load_addr as usize;
@@ -1567,10 +1946,6 @@ fn main() {
         if ep_phys + 16 <= guest_mem.len() {
             eprintln!("[VMM] BIOS entry @phys {:#x}: {:02x?}", ep_phys, &guest_mem[ep_phys..ep_phys + 16]);
         }
-
-        let flash_offset_in_high = (0xFFFC_0000u64 - HIGH_MEM_ADDR) as usize;
-        high_mem[flash_offset_in_high..flash_offset_in_high + bios.len()].copy_from_slice(&bios);
-        eprintln!("[VMM] Flash BIOS en {:#x}", 0xFFFC_0000u64);
     }
 
     // ─── Copiar VGA Option ROM en memoria física (0xC0000) ─────────
@@ -1614,26 +1989,16 @@ fn main() {
     regs.rflags = 0x2;
     vcpu.set_regs(&regs).expect("set_regs falló");
 
-    // ─── APs (tarea 6: SMP) ──────────────────────────────────
-    // Cada AP nace aparcado en KVM_MP_STATE_INIT_RECEIVED (esperando
-    // SIPI) en su propio hilo. Solo ejecutará cuando el guest le entregue
-    // INIT-SIPI por el LAPIC — manejado íntegramente por el irqchip del
-    // kernel (create_irq_chip): SeaBIOS y Linux hacen su sondeo SIPI
-    // estándar y detectan los APs sin tablas adicionales (el fw_cfg
-    // NB_CPUS de FwCfg ya anuncia num_cpus).
-    // El set_mp_state va ANTES del spawn: si el hilo llegara a correr sin
-    // aparcar, el AP ejecutaría el vector de reset y duplicaría el BIOS.
-    // ─── Métricas y profiling de VM-Exits (Item 24) ────────────
     let metrics = Arc::new(metrics::VmmMetrics::new());
     metrics.ram_bytes.store(guest_mem_size as u64, Ordering::Relaxed);
-    metrics.high_mem_bytes.store(HIGH_MEM_SIZE as u64, Ordering::Relaxed);
+    metrics.high_mem_bytes.store(vram_size as u64, Ordering::Relaxed);
+    metrics.lfb_gpa.store(devices::vga::VRAM_DEFAULT_BASE_GPA, Ordering::Relaxed);
     metrics.num_cpus.store(num_cpus, Ordering::Relaxed);
     metrics.max_cpus.store(16, Ordering::Relaxed);
 
-    // Cargar snapshot previo si se solicitó (Item 24)
-    if let Ok(snap_path) = std::env::var("MI_VMM_SNAPSHOT_LOAD") {
+    if let Ok(snap_path) = get_vmm_env("SNAPSHOT_LOAD") {
         eprintln!("[VMM] Cargando snapshot desde: {}", snap_path);
-        snapshot::load_vm_snapshot(&snap_path, guest_mem, high_mem, &[&vcpu]).ok();
+        snapshot::load_vm_snapshot(&snap_path, guest_mem, vram_mem, &[&vcpu]).ok();
     }
 
     // ─── Configurar CPUID (FPU, SSE, MMX, etc. para Linux/Windows) ─────
@@ -1656,40 +2021,36 @@ fn main() {
         ap_handles.push(
             std::thread::Builder::new()
                 .name(format!("vcpu-{cpu_id}"))
-                .spawn(move || ap_vcpu_worker(cpu_id, ap, vm_ap, bus_ap, metrics_ap, verbose))
+                .spawn(move || ap_vcpu_worker(cpu_id, ap, vm_ap, bus_ap, metrics_ap, vram_addr, vram_size, ram_below_4g, verbose))
                 .expect("spawn de hilo AP falló"),
         );
     }
-    // Los hilos AP no se joinean: el proceso vive mientras viva el BSP.
     if num_cpus > 1 {
         eprintln!(
-            "[VMM] SMP: {} vCPUs (BSP + {} APs en wait-for-SIPI; MI_VMM_CPUS=n para cambiar)",
+            "[VMM] SMP: {} vCPUs (BSP + {} APs en wait-for-SIPI; TWO_FIVE_FIVE_CPUS=n para cambiar)",
             num_cpus,
             num_cpus - 1
         );
     }
 
-    // Handle Ctrl+C / SIGTERM: dump VGA screen and diagnostics on exit
     install_signal_handler(libc::SIGTERM, shutdown_handler);
     install_signal_handler(libc::SIGINT, shutdown_handler);
     install_signal_handler(libc::SIGUSR1, sigusr1_handler);
 
     // ─── Display GUI Manager ───────────────────────────────────
     let kbd_queue: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-    // Cola del ratón host: (dx, dy, botones PS/2) desde la ventana minifb.
     let mouse_queue: Arc<Mutex<VecDeque<(i16, i16, u8)>>> = Arc::new(Mutex::new(VecDeque::new()));
-    // Cola de la tableta gráfica USB: (x, y, botones, rueda) coordenadas absolutas (0..32767).
     let tablet_queue: Arc<Mutex<VecDeque<(u16, u16, u8, i8)>>> = Arc::new(Mutex::new(VecDeque::new()));
-    // Solicitud de cambio de resolución dinámica desde la ventana minifb
     let resize_queue: Arc<Mutex<Option<(u32, u32)>>> = Arc::new(Mutex::new(None));
-    
-    // Inyección de ENTER (tarea 3): acelera el arranque de ISOLINUX/menu.c32 a los 3s, 5s, 7s, 9s y 11s
-    // para tests y modo headless; activo en instalación desatendida o con MI_VMM_AUTO_ENTER=1.
-    if unattended || std::env::var("MI_VMM_AUTO_ENTER").map(|v| v == "1").unwrap_or(false) {
+
+    if unattended || get_vmm_env("AUTO_ENTER").map(|v| v == "1").unwrap_or(false) {
         let auto_enter_kbd = Arc::clone(&kbd_queue);
         std::thread::spawn(move || {
             for wait_secs in [3, 2, 2, 2, 2] {
                 std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Ok(mut q) = auto_enter_kbd.lock() {
                     q.push_back(0x1C);
                     q.push_back(0x9C);
@@ -1698,7 +2059,7 @@ fn main() {
         });
     }
 
-    let vm_title = cli_vm_name.map(|name| format!("{} [Corriendo] — Oracle VM VirtualBox", name));
+    let vm_title = cli_vm_name.map(|name| format!("{} [Corriendo] — Two Five Five (255)", name));
     let _display = display::DisplayManager::start(
         vga_state.clone(),
         guest_mem_handle.clone(),
@@ -1711,33 +2072,33 @@ fn main() {
     );
 
     // ─── Dashboard TUI interactivo ─────────────────────────────
-    let force_tui = args.iter().any(|a| a == "--tui") || std::env::var("MI_VMM_TUI").is_ok();
-    let no_tui = args.iter().any(|a| a == "--no-tui") || std::env::var("MI_VMM_NO_TUI").is_ok();
+    let force_tui = args.iter().any(|a| a == "--tui") || get_vmm_env("TUI").is_ok();
+    let no_tui = args.iter().any(|a| a == "--no-tui") || get_vmm_env("NO_TUI").is_ok();
     let is_interactive = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0 };
-    let use_tui = (force_tui || (!no_tui && is_interactive)) && std::env::var("MI_VMM_SERIAL_IN").is_err();
+    let use_tui = (force_tui || (!no_tui && is_interactive)) && get_vmm_env("SERIAL_IN").is_err();
 
     let tui_running = Arc::new(AtomicBool::new(true));
     let tui_handle = if use_tui {
         let iso_name = iso_path.and_then(|p| Path::new(p).file_name()).map(|n| n.to_string_lossy().to_string());
         let disk_name = disk_path.and_then(|p| Path::new(p).file_name()).map(|n| n.to_string_lossy().to_string());
-        tui::start_tui(
+        let h = tui::start_tui(
             Arc::clone(&metrics),
             vga_state.clone(),
             Arc::clone(&bus),
             iso_name,
             disk_name,
             Arc::clone(&tui_running),
-        )
+        );
+        if h.is_some() {
+            bus.lock().unwrap_or_else(|p| p.into_inner()).set_uart_suppress_stdout(true);
+        }
+        h
     } else {
         None
     };
 
-    // ─── Hilo de temporización (tarea 16) ──────────────────────
-    // Sustituye al setitimer(1ms)+SIGALRM: avanza el PIT, pulsa IRQ0,
-    // mantiene el tick del BDA e inyecta el input host cada 1 ms con
-    // clock_nanosleep absoluto (sin deriva), incluso con el guest en HLT.
+    // ─── Hilo de temporización ─────────────────────────────────
     let irq0_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    let bda_tick_count: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     std::thread::Builder::new()
         .name("pit-timer".to_string())
         .spawn({
@@ -1747,9 +2108,7 @@ fn main() {
             let tablet_t = Arc::clone(&tablet_queue);
             let resize_t = Arc::clone(&resize_queue);
             let irq0_t = Arc::clone(&irq0_flag);
-            let bda_t = Arc::clone(&bda_tick_count);
             let metrics_t = Arc::clone(&metrics);
-            // vm (Arc<VmFd>) se clona ANTES del move (el BSP sigue usando vm).
             let vm_t = Arc::clone(&vm);
             let gm_t = Arc::clone(&guest_mem_handle);
             move || {
@@ -1762,7 +2121,7 @@ fn main() {
                     tablet_t,
                     resize_t,
                     irq0_t,
-                    bda_t,
+                    has_kernel_pit,
                     metrics_t,
                 )
             }
@@ -1800,9 +2159,10 @@ fn main() {
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             tui_running.store(false, Ordering::Relaxed);
             std::thread::sleep(std::time::Duration::from_millis(150));
+            tui::shutdown();
             eprintln!("[VMM] Shutdown solicitado — volcando estado final (exits={}, reboots={})...",
                 total_exits, total_reboots);
-            if let Ok(shot_path) = std::env::var("MI_VMM_SCREENSHOT") {
+            if let Ok(shot_path) = get_vmm_env("SCREENSHOT") {
                 if let Err(e) = display::save_ppm_screenshot(&vga_state, &guest_mem_handle, &shot_path) {
                     eprintln!("[VMM] Error al guardar captura en {}: {}", shot_path, e);
                 } else {
@@ -1852,6 +2212,7 @@ fn main() {
         if acpi_sleep {
             tui_running.store(false, Ordering::Relaxed);
             std::thread::sleep(std::time::Duration::from_millis(150));
+            tui::shutdown();
             eprintln!("[VMM] ACPI S5 solicitado por el guest — apagado limpio (exits={}, reboots={})...",
                 total_exits, total_reboots);
             dump_vga_text_screen(guest_mem);
@@ -1885,9 +2246,13 @@ fn main() {
             }
         }
 
-        // Comandos de control de la VM provenientes de la GUI (barra superior de VirtualBox)
+        // Comandos de control de la VM provenientes de la GUI (barra superior)
         if ACPI_SHUTDOWN_REQUESTED.swap(false, Ordering::Relaxed) {
-            bus_lock().trigger_power_button();
+            {
+                let mut b = bus_lock();
+                b.trigger_power_button();
+                sync_pci_irqs(&mut b, &vm, Some(&metrics));
+            }
             tui::log("[GUI] Solicitud de apagado ACPI enviada al SO huésped.");
         }
         if RESET_REQUESTED.swap(false, Ordering::SeqCst) || reset_from_device {
@@ -1901,9 +2266,12 @@ fn main() {
             reset_vcpu_to_post(
                 &vcpu,
                 &vm,
-                &mut bus_lock(),
+                &bus,
                 guest_mem,
-                Some(high_mem),
+                vram_mem,
+                ram_below_4g,
+                kernel_pit_init.as_ref(),
+                &metrics,
                 Some(&bios),
                 vga_rom_data.as_deref(),
             );
@@ -1942,7 +2310,7 @@ fn main() {
                                         ap_handles.push(
                                             std::thread::Builder::new()
                                                 .name(format!("vcpu-{new_id}"))
-                                                .spawn(move || ap_vcpu_worker(new_id, new_vcpu, vm_ap, bus_ap, metrics_ap, verbose))
+                                                .spawn(move || ap_vcpu_worker(new_id, new_vcpu, vm_ap, bus_ap, metrics_ap, vram_addr, vram_size, ram_below_4g, verbose))
                                                 .expect("spawn de hilo AP falló"),
                                         );
                                         metrics.num_cpus.fetch_add(1, Ordering::Relaxed);
@@ -2006,7 +2374,11 @@ fn main() {
                         tui::log(format!("[TUI] Escala cambiada a {}x", next));
                     }
                     tui::DashboardCommand::ShutdownAcpi => {
-                        bus_lock().trigger_power_button();
+                        {
+                            let mut b = bus_lock();
+                            b.trigger_power_button();
+                            sync_pci_irqs(&mut b, &vm, Some(&metrics));
+                        }
                         tui::log("[TUI] Solicitud de apagado ACPI enviada al SO.");
                     }
                     tui::DashboardCommand::ResetVm => {
@@ -2014,9 +2386,12 @@ fn main() {
                         reset_vcpu_to_post(
                             &vcpu,
                             &vm,
-                            &mut bus_lock(),
+                            &bus,
                             guest_mem,
-                            Some(high_mem),
+                            vram_mem,
+                            ram_below_4g,
+                            kernel_pit_init.as_ref(),
+                            &metrics,
                             Some(&bios),
                             vga_rom_data.as_deref(),
                         );
@@ -2090,12 +2465,12 @@ fn main() {
                         // Dump segment registers and BDA keyboard buffer
                         eprintln!("  DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS={:04x} CS={:04x}",
                             s.ds.selector, s.es.selector, s.fs.selector, s.gs.selector, s.ss.selector, s.cs.selector);
-                        let bda_tick_val = guest_mem[BDA_TICK_ADDR] as u32
-                            | ((guest_mem[BDA_TICK_ADDR+1] as u32) << 8)
-                            | ((guest_mem[BDA_TICK_ADDR+2] as u32) << 16)
-                            | ((guest_mem[BDA_TICK_ADDR+3] as u32) << 24);
-                        eprintln!("  BDA tick@0x46C={:08x} (written={}) kbd: head@0x41A={:04x} tail@0x41C={:04x}",
-                            bda_tick_val, bda_tick_count.load(Ordering::Relaxed),
+                        let bda_tick_val = guest_mem[0x46C] as u32
+                            | ((guest_mem[0x46D] as u32) << 8)
+                            | ((guest_mem[0x46E] as u32) << 16)
+                            | ((guest_mem[0x46F] as u32) << 24);
+                        eprintln!("  BDA tick@0x46C={:08x} kbd: head@0x41A={:04x} tail@0x41C={:04x}",
+                            bda_tick_val,
                             guest_mem[0x41A] as u16 | ((guest_mem[0x41B] as u16) << 8),
                             guest_mem[0x41C] as u16 | ((guest_mem[0x41D] as u16) << 8));
                         // Dump bytes at ES:0x1A and ES:0x1C (the addresses the loop reads)
@@ -2227,7 +2602,7 @@ fn main() {
         }
 
         // ── Ejecutar guest ──────────────────────────────────────
-        let bsp_run_start = std::time::Instant::now();
+        let bsp_cpu_start = thread_cpu_nanos();
         let exit_reason = match vcpu.run() {
             Ok(r) => r,
             Err(e) if e.errno() == libc::EINTR => {
@@ -2267,38 +2642,20 @@ fn main() {
             }
             Err(e) => { eprintln!("[VMM] vcpu.run() falló: {}", e); exit(1); }
         };
-        let bsp_nanos = bsp_run_start.elapsed().as_nanos() as u64;
+        let bsp_nanos = thread_cpu_nanos().saturating_sub(bsp_cpu_start);
         metrics.record_vcpu_active(0, bsp_nanos);
         metrics.record_vcpu_exit(0);
         total_exits += 1;
 
-       // NOTE: The PIT is only advanced by the dedicated pit-timer thread
-        // (clock_nanosleep, tarea 16). We do NOT call pit_tick() here to
-        // avoid double-counting: no está gobernado por el conteo de exits.
-
         // ── IRQs pendientes de dispositivos: un solo lock del bus ────
-        // Antes eran 8 adquisiciones por exit (ps2/mouse/uart/ide/sync/smi/
-        // hotplug/nivel de IRQ1). Se recogen todos los latches one-shot y la
-        // sincronización PCI bajo el mismo guard.
         let (ps2_irq, mouse_irq, uart_irq, ide_irqs, smi, ps2_has_data) = {
             let mut b = bus_lock();
             let ps2 = b.take_ps2_irq();
             let mouse = b.take_mouse_irq();
             let uart = b.take_uart_irq();
             let ide = b.take_ide_irq();
-            // Dispositivos PCI (UHCI, VirtIO, AHCI, VMMDev, AC'97, e1000):
-            // sincronizar con lógica wired-OR (solo emite ioctl al cambiar).
             sync_pci_irqs(&mut b, &vm, Some(&metrics));
             let smi = b.take_smi();
-            // CPU Hotplug (Item 23): SCI en IRQ9. Esta línea es compartida
-            // con VirtIO-Net (PIRQA), así que el cache de niveles debe
-            // reflejar el flanco para que sync_pci_irqs pueda bajarla luego.
-            let sci = b.take_cpu_hotplug_sci();
-            if sci {
-                vm.set_irq_line(9, false).ok();
-                vm.set_irq_line(9, true).ok();
-                b.set_pci_irq_level(9, true);
-            }
             let ps2_data = b.legacy_irq.ps2_has_data();
             (ps2, mouse, uart, ide, smi, ps2_data)
         };
@@ -2335,12 +2692,10 @@ fn main() {
             vm.set_irq_line(15, true).ok();
             metrics.record_irq(15);
         }
-        // APM / SMI (Item 23): inyectar SMI al vCPU si hubo comando en 0xB2
-        if smi {
-            use std::os::unix::io::AsRawFd;
-            const KVM_SMI: libc::c_ulong = 0xAEB7;
-            unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_SMI); };
-            if verbose { eprintln!("[VMM] SMI inyectado a vCPU 0 tras comando APM en 0xB2"); }
+        // APM / SMI (0xB2): sin SMRAM/SMM configurado en KVM, no inyectamos KVM_SMI
+        // para evitar EIO en vcpu.run(); SeaBIOS detecta ausencia de SMM y continúa el POST.
+        if smi && verbose {
+            eprintln!("[VMM] Comando APM recibido en 0xB2 (SMM no habilitado)");
         }
         // (tarea 4) Disciplina de nivel para IRQ1: si el guest consumió
         // todo el output buffer, la línea puede bajar con seguridad — la
@@ -2357,14 +2712,14 @@ fn main() {
                 let (handled, reset_from_dev) = {
                     let mut b = bus_lock();
                     let h = b.out(port, data);
+                    sync_vga_bar0_slot(&vm, &mut b, vram_addr, vram_size, ram_below_4g, &metrics);
+                    sync_pci_irqs(&mut b, &vm, Some(&metrics));
                     let r = b.take_reset_requested();
                     (h, r)
                 };
                 if !handled {
                     eprintln!("[VMM] OUT no manejado: 0x{:X} <- {:02X?}", port, data);
                 }
-                // Hardware reset register (PCI/PIIX): 0xCF9
-                // 0x02 = soft reset, 0x04 = hard reset, 0x06 = full reset
                 if (port == 0xCF9 && data.iter().any(|&v| v & 0x04 != 0)) || reset_from_dev {
                     eprintln!("[VMM] Reset via puerto 0x{:X} (data={:02X?}) — reiniciando guest...", port, data);
                     if let Ok(mut q) = kbd_queue.lock() {
@@ -2376,28 +2731,23 @@ fn main() {
                     reset_vcpu_to_post(
                         &vcpu,
                         &vm,
-                        &mut bus_lock(),
+                        &bus,
                         guest_mem,
-                        Some(high_mem),
+                        vram_mem,
+                        ram_below_4g,
+                        kernel_pit_init.as_ref(),
+                        &metrics,
                         Some(&bios),
                         vga_rom_data.as_deref(),
                     );
                     total_reboots = 0;
                     continue;
                 }
-                // (tarea 4) EOI del guest al PIC maestro (OCW2): la
-                // interrupción ya se entregó y atendió, así que damos por
-                // entregado el IRQ0 pendiente (el marcador solo alimenta
-                // request_interrupt_window). La línea NO se baja aquí: un
-                // EOI no descarta ticks coalescidos pendientes en el IRR.
                 if port == 0x20
                     && (data[0] == 0x20 || ((data[0] & 0xF8) == 0x60 && (data[0] & 0x07) == 0))
                 {
                     irq0_raised = false;
                 }
-                // Traza de I/O solo en modo verbose: estos dos push se
-                // ejecutaban en CADA acceso a puerto aunque nadie leyera
-                // la traza (solo se imprime en el volcado de diagnóstico).
                 if verbose {
                     recent.push_back(format!("OUT 0x{:X} <- {:02X?}", port, data));
                     if recent.len() > 128 { recent.pop_front(); }
@@ -2407,7 +2757,13 @@ fn main() {
             }
             VcpuExit::IoIn(port, data) => {
                 metrics.record_io_in(port);
-                match bus_lock().input(port, data.len()) {
+                let res = {
+                    let mut b = bus_lock();
+                    let r = b.input(port, data.len());
+                    sync_pci_irqs(&mut b, &vm, Some(&metrics));
+                    r
+                };
+                match res {
                     Some(bytes) => {
                         for (i, b) in bytes.iter().take(data.len()).enumerate() {
                             data[i] = *b;
@@ -2427,14 +2783,14 @@ fn main() {
             }
             VcpuExit::Hlt => {
                 metrics.record_hlt();
-                // HLT es un evento normal (guest ocioso o STI;HLT), no un
-                // error: los dos ioctls de registros + escritura a stderr
-                // se hacían en cada halt y no aportan nada sin verbose.
                 if verbose {
                     let r = vcpu.get_regs().unwrap_or_default();
                     let s = vcpu.get_sregs().unwrap_or_default();
                     eprintln!("[VMM] HLT — phys={:#x} rflags={:#x}", s.cs.base + r.rip, r.rflags);
                 }
+            }
+            VcpuExit::Intr => {
+                metrics.record_intr();
             }
             VcpuExit::Shutdown => {
                 metrics.record_shutdown();
@@ -2443,14 +2799,39 @@ fn main() {
                 crash_reboot(
                     &vcpu,
                     &vm,
-                    &mut bus_lock(),
+                    &bus,
                     guest_mem,
-                    Some(high_mem),
+                    vram_mem,
+                    ram_below_4g,
+                    kernel_pit_init.as_ref(),
+                    &metrics,
                     Some(&bios),
                     vga_rom_data.as_deref(),
                     &mut total_reboots,
                 );
                 if total_reboots >= MAX_CRASH_REBOOTS { break; }
+            }
+            VcpuExit::SystemEvent(ev_type, _) => {
+                metrics.record_other();
+                eprintln!("[VMM] KVM SystemEvent(type={})", ev_type);
+                if ev_type == 1 {
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                } else {
+                    crash_reboot(
+                        &vcpu,
+                        &vm,
+                        &bus,
+                        guest_mem,
+                        vram_mem,
+                        ram_below_4g,
+                        kernel_pit_init.as_ref(),
+                        &metrics,
+                        Some(&bios),
+                        vga_rom_data.as_deref(),
+                        &mut total_reboots,
+                    );
+                    if total_reboots >= MAX_CRASH_REBOOTS { break; }
+                }
             }
             VcpuExit::IrqWindowOpen => {
                 metrics.record_irq_window();
@@ -2521,9 +2902,12 @@ fn main() {
                 crash_reboot(
                     &vcpu,
                     &vm,
-                    &mut bus_lock(),
+                    &bus,
                     guest_mem,
-                    Some(high_mem),
+                    vram_mem,
+                    ram_below_4g,
+                    kernel_pit_init.as_ref(),
+                    &metrics,
                     Some(&bios),
                     vga_rom_data.as_deref(),
                     &mut total_reboots,
@@ -2540,38 +2924,31 @@ fn main() {
         }
     }
 
-    // ─── Cierre de VM: sincronización y guardado de snapshots (Item 22, 24) ───
+    // ─── Cierre de VM: sincronización y guardado de snapshots ──
     tui_running.store(false, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(150));
+    tui::shutdown();
     eprintln!("\n{}", metrics.format_summary(1.0, 0));
     if let Some(pf) = bus.lock().unwrap_or_else(|p| p.into_inner()).pflash.as_mut() {
         pf.flush_to_disk().ok();
     }
-    if let Ok(snap_path) = std::env::var("MI_VMM_SNAPSHOT_SAVE") {
+    if let Ok(snap_path) = get_vmm_env("SNAPSHOT_SAVE") {
         eprintln!("[VMM] Guardando snapshot en: {}", snap_path);
-        snapshot::save_vm_snapshot(&snap_path, guest_mem, high_mem, &[&vcpu]).ok();
+        snapshot::save_vm_snapshot(&snap_path, guest_mem, vram_mem, &[&vcpu]).ok();
     }
 }
 
 /// Bucle de un vCPU AP (tarea 6: SMP).
-///
-/// El AP nace aparcado en KVM_MP_STATE_INIT_RECEIVED: `run()` se bloquea
-/// en el kernel hasta que el guest le entrega INIT-SIPI por el LAPIC (el
-/// irqchip del kernel lo maneja entero, incluido fijar CS:IP = vector<<4
-/// en modo real). Desde ahí ejecuta el guest igual que el BSP pero con
-/// una política de exits más simple:
-///   - El temporizador (PIT/IRQ0/tick del BDA) lo gobierna el hilo dedicado
-///     pit-timer (tarea 16): si una señal interrumpe este hilo (EINTR) se
-///     reintenta sin tocar nada.
-///   - Un triple fault en un AP solo "resetea" ese CPU: se re-aparca en
-///     wait-for-SIPI y el siguiente INIT-SIPI del guest lo trae de vuelta
-///     (en hardware real un triple fault de un AP no apaga la caja).
+#[allow(clippy::too_many_arguments)]
 fn ap_vcpu_worker(
     cpu_id: u32,
     vcpu: kvm_ioctls::VcpuFd,
     vm: Arc<kvm_ioctls::VmFd>,
     bus: Arc<Mutex<DeviceBus>>,
     metrics: Arc<metrics::VmmMetrics>,
+    vram_addr: u64,
+    vram_size: usize,
+    ram_below_4g: u64,
     verbose: bool,
 ) {
     let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
@@ -2588,24 +2965,38 @@ fn ap_vcpu_worker(
         .ok();
     };
     loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            return;
+        }
         if RESET_REQUESTED.load(Ordering::SeqCst) {
             park(&vcpu);
             while RESET_REQUESTED.load(Ordering::SeqCst) {
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    return;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         while metrics.is_paused.load(Ordering::Relaxed) {
+            if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        let run_start = std::time::Instant::now();
+        let run_cpu_start = thread_cpu_nanos();
         let exit_reason = match vcpu.run() {
             Ok(r) => r,
-            // Señal (SIGINT/SIGTERM/SIGUSR1): si es reset global, aparcar en wait-for-SIPI
             Err(e) if e.errno() == libc::EINTR => {
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    return;
+                }
                 if RESET_REQUESTED.load(Ordering::SeqCst) {
                     park(&vcpu);
                     while RESET_REQUESTED.load(Ordering::SeqCst) {
+                        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                            return;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 }
@@ -2616,7 +3007,7 @@ fn ap_vcpu_worker(
                 return;
             }
         };
-        let run_nanos = run_start.elapsed().as_nanos() as u64;
+        let run_nanos = thread_cpu_nanos().saturating_sub(run_cpu_start);
         metrics.record_vcpu_active(cpu_id as usize, run_nanos);
         metrics.record_vcpu_exit(cpu_id as usize);
         total_exits += 1;
@@ -2626,6 +3017,7 @@ fn ap_vcpu_worker(
                 let (handled, kbd_irq, mouse_irq, ide_irqs, reset_req) = {
                     let mut b = bus.lock().unwrap_or_else(|p| p.into_inner());
                     let h = b.out(port, data);
+                    sync_vga_bar0_slot(&vm, &mut b, vram_addr, vram_size, ram_below_4g, &metrics);
                     let k = b.take_ps2_irq();
                     let m = b.take_mouse_irq();
                     let ide = b.take_ide_irq();
@@ -2932,5 +3324,11 @@ mod tests {
         let res_events = vcpu.set_vcpu_events(&events);
         println!("Resultado de set_vcpu_events: {:?}", res_events);
         assert!(res_events.is_ok());
+    }
+
+    #[test]
+    fn test_ovmf_discovery_helper_does_not_panic() {
+        let _ = find_ovmf_bios();
+        let _ = find_default_bios();
     }
 }

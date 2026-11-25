@@ -103,19 +103,19 @@ pub const NABM_REG_GLOB_CNT: u16 = 0x2C; // Global Control (32 bits)
 pub const NABM_REG_GLOB_STA: u16 = 0x30; // Global Status (32 bits)
 pub const NABM_REG_ACC_SEMA: u16 = 0x34; // Codec Access Semaphore (8 bits)
 
-// Bits y máscaras de GLOB_STA (Global Status Register)
+// Bits y máscaras de GLOB_STA (Global Status Register) según ICH AC'97 (Intel 82801AA)
 pub const GLOB_STA_GSCI: u32 = 1 << 0;
-pub const GLOB_STA_MIINT: u32 = 1 << 1;
-pub const GLOB_STA_POINT: u32 = 1 << 2;
-pub const GLOB_STA_PIINT: u32 = 1 << 3;
-pub const GLOB_STA_PCR: u32 = 1 << 8; // Primary Codec Ready (1 = listo)
+pub const GLOB_STA_PIINT: u32 = 1 << 5; // PCM In Interrupt
+pub const GLOB_STA_POINT: u32 = 1 << 6; // PCM Out Interrupt
+pub const GLOB_STA_MIINT: u32 = 1 << 7; // Mic In Interrupt
+pub const GLOB_STA_PCR: u32 = 1 << 8;   // Primary Codec Ready (1 = listo)
 
 pub const AC97_GS_GSCI: u32 = 1 << 0;
 pub const AC97_GS_MIINT: u32 = 1 << 1;
 pub const AC97_GS_MOINT: u32 = 1 << 2;
-pub const AC97_GS_PIINT: u32 = 1 << 5;
-pub const AC97_GS_POINT: u32 = 1 << 6;
-pub const AC97_GS_MINT: u32 = 1 << 7;
+pub const AC97_GS_PIINT: u32 = GLOB_STA_PIINT;
+pub const AC97_GS_POINT: u32 = GLOB_STA_POINT;
+pub const AC97_GS_MINT: u32 = GLOB_STA_MIINT;
 pub const AC97_GS_S0CR: u32 = 1 << 8;
 pub const AC97_GS_S1CR: u32 = 1 << 9;
 pub const AC97_GS_S0R1: u32 = 1 << 10;
@@ -199,7 +199,7 @@ impl Ac97State {
             nabmbar: 0,
             mixer: [0u16; 128],
             streams: [Ac97Stream::new(), Ac97Stream::new(), Ac97Stream::new()],
-            glob_cnt: 0,
+            glob_cnt: 0x02, // Bit 1 = nReset (active-LOW, 1 = fuera de cold reset)
             glob_sta: GLOB_STA_PCR, // Códec primario listo
             cas: 0,
             irq_asserted: false,
@@ -213,7 +213,7 @@ impl Ac97State {
         for st in &mut self.streams {
             st.reset();
         }
-        self.glob_cnt = 0;
+        self.glob_cnt = 0x02;
         self.glob_sta = GLOB_STA_PCR;
         self.cas = 0;
         self.irq_asserted = false;
@@ -564,6 +564,22 @@ impl Ac97Device {
         state.update_irq();
     }
 
+    /// Avanza periódicamente todos los streams DMA activos (invocado desde el hilo de timer).
+    pub fn step_streams(&mut self, mem: &GuestMemory) {
+        let mut state = self.state.lock().unwrap();
+        let mut any = false;
+        for idx in 0..3 {
+            let st = &state.streams[idx];
+            if st.bdbar != 0 && (st.cr & AC97_CR_RPBM) != 0 && (st.sr & AC97_SR_DCH) == 0 {
+                Self::process_dma_stream(idx, &mut state, mem, &self.audio_sink);
+                any = true;
+            }
+        }
+        if any {
+            state.update_irq();
+        }
+    }
+
     pub fn set_nambar(&mut self, base: u16) {
         self.cached_nambar = base;
         self.state.lock().unwrap().nambar = base;
@@ -633,10 +649,13 @@ impl Ac97Device {
                             return vec![bytes[0]];
                         } else if count == 2 {
                             return bytes.to_vec();
-                        } else if count == 4 && off + 2 < 128 && Self::is_nambar_reg_mapped((off + 2) as u16) {
-                            let val2 = state.mixer[reg_idx + 1];
-                            let bytes2 = val2.to_le_bytes();
-                            return vec![bytes[0], bytes[1], bytes2[0], bytes2[1]];
+                        } else if count == 4 && off + 2 < 128 {
+                            if Self::is_nambar_reg_mapped((off + 2) as u16) {
+                                let val2 = state.mixer[reg_idx + 1];
+                                let bytes2 = val2.to_le_bytes();
+                                return vec![bytes[0], bytes[1], bytes2[0], bytes2[1]];
+                            }
+                            return vec![bytes[0], bytes[1], 0x00, 0x00];
                         }
                     } else if count == 1 {
                         return vec![bytes[1]];
@@ -697,12 +716,16 @@ impl Ac97Device {
         if nam != 0 && port >= nam && port < nam + 256 {
             state.cas = 0;
             let off = (port - nam) as usize;
-            if off < 128 && data.len() >= 2 && Self::is_nambar_reg_mapped(off as u16) {
+            if off < 128 && data.len() >= 2 && (off & 1) == 0 && Self::is_nambar_reg_mapped(off as u16) {
                 let reg_idx = off / 2;
                 let val = u16::from_le_bytes([data[0], data[1]]);
                 match off as u16 {
                     AC97_RESET => {
                         state.reset_mixer();
+                    }
+                    AC97_POWERDOWN_CTRL_STAT => {
+                        // Bits 0..3 son estados de listo de solo lectura
+                        state.mixer[reg_idx] = (val & !0x000F) | 0x000F;
                     }
                     AC97_EXTENDED_AUDIO_CTRL_STAT => {
                         state.mixer[reg_idx] = val & (AC97_EACS_VRA | AC97_EACS_VRM);
@@ -737,17 +760,22 @@ impl Ac97Device {
         if nabm != 0 && port >= nabm && port < nabm + 64 {
             let off = port - nabm;
             let val = match data.len() {
+                0 => return,
                 1 => data[0] as u32,
-                2 => u16::from_le_bytes([data[0], data[1]]) as u32,
+                2 | 3 => u16::from_le_bytes([data[0], data[1]]) as u32,
                 _ => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
             };
 
             match off {
                 NABM_REG_GLOB_CNT => {
+                    let prev_cnt = state.glob_cnt;
                     state.glob_cnt = val;
-                    if (val & 0x02) != 0 {
-                        // Cold reset
+                    // Bit 1 de GLOB_CNT es active-LOW Cold Reset (0 = reset, 1 = normal)
+                    if (prev_cnt & 0x02) != 0 && (val & 0x02) == 0 {
                         state.reset();
+                        state.glob_cnt = val;
+                    } else if (prev_cnt & 0x02) == 0 && (val & 0x02) != 0 {
+                        state.glob_sta |= GLOB_STA_PCR;
                     }
                 }
                 NABM_REG_GLOB_STA => {
@@ -860,12 +888,15 @@ impl Ac97Device {
             let ioc = (flags & 0x8000) != 0;
 
             if buf_addr != 0 && samples > 0 {
-                // Buffer válido: si es Stream 1 (PO - PCM Output), enviar audio al sink
+                // Buffer válido: si es Stream 1 (PO - PCM Output), enviar audio al sink.
+                // En ICH AC'97 cada muestra en BDLE es de 16 bits (2 bytes).
                 if st_idx == 1 {
-                    // Cada muestra estéreo S16_LE son 4 bytes (2 canales * 2 bytes)
-                    let total_bytes = (samples as usize) * 4;
+                    let total_bytes = (samples as usize) * 2;
                     let mut pcm_buf = vec![0u8; total_bytes];
                     if mem.read_bytes(buf_addr as u64, &mut pcm_buf).is_ok() {
+                        let master_vol = state.mixer[(AC97_MASTER_VOLUME_MUTE / 2) as usize];
+                        let pcm_vol = state.mixer[(AC97_PCM_OUT_VOLUME_MUTE / 2) as usize];
+                        apply_ac97_volume(&mut pcm_buf, master_vol, pcm_vol);
                         let sample_rate = {
                             let rate = state.mixer[(AC97_PCM_FRONT_DAC_RATE / 2) as usize] as u32;
                             if rate == 0 {
@@ -886,12 +917,13 @@ impl Ac97Device {
                     st.sr |= AC97_SR_BCIS;
                 }
 
-                // Avanzar índice circular CIV
+                // Avanzar índice circular CIV y prefetched PIV
                 if civ == lvi {
                     // Alcanzó el último buffer válido: detener DMA
                     st.sr |= AC97_SR_CELV | AC97_SR_LVBCI | AC97_SR_DCH;
                 } else {
                     st.civ = (civ + 1) % 32;
+                    st.piv = (st.civ + 1) % 32;
                 }
             }
         }
@@ -1105,12 +1137,16 @@ mod tests {
 
         let bd_table_gpa = 0x2000u32;
         let pcm_buf_gpa = 0x3000u32;
-        let samples = 256u16; // 256 samples * 4 bytes = 1024 bytes
+        let samples = 512u16; // 512 muestras de 16 bits = 1024 bytes
         let flags = 0x8000u16; // IOC = 1
 
-        // Generar un patrón PCM reconocible (256 muestras estéreo S16_LE)
+        // Quitar mute de Master y PCM Out para verificar entrega sin atenuación
+        dev.write(0xE000 + AC97_MASTER_VOLUME_MUTE, &0x0000u16.to_le_bytes(), None);
+        dev.write(0xE000 + AC97_PCM_OUT_VOLUME_MUTE, &0x0000u16.to_le_bytes(), None);
+
+        // Generar un patrón PCM reconocible (256 muestras estéreo S16_LE = 1024 bytes)
         let mut test_pcm = Vec::with_capacity(1024);
-        for i in 0..samples {
+        for i in 0..256u16 {
             let left = (i as i16) * 100;
             let right = -(i as i16) * 100;
             test_pcm.extend_from_slice(&left.to_le_bytes());
@@ -1155,11 +1191,14 @@ mod tests {
         let bd_table_gpa = 0x1000u32;
         let buf0_gpa = 0x2000u32;
         let buf1_gpa = 0x3000u32;
-        let samples0 = 64u16;  // 256 bytes
-        let samples1 = 128u16; // 512 bytes
+        let samples0 = 128u16; // 256 bytes (128 * 2 bytes)
+        let samples1 = 256u16; // 512 bytes (256 * 2 bytes)
 
-        let pcm0 = vec![0x11u8; (samples0 as usize) * 4];
-        let pcm1 = vec![0x22u8; (samples1 as usize) * 4];
+        dev.write(0xE000 + AC97_MASTER_VOLUME_MUTE, &0x0000u16.to_le_bytes(), None);
+        dev.write(0xE000 + AC97_PCM_OUT_VOLUME_MUTE, &0x0000u16.to_le_bytes(), None);
+
+        let pcm0 = vec![0x11u8; (samples0 as usize) * 2];
+        let pcm1 = vec![0x22u8; (samples1 as usize) * 2];
         let _ = guest_mem.write_bytes(buf0_gpa as u64, &pcm0);
         let _ = guest_mem.write_bytes(buf1_gpa as u64, &pcm1);
 

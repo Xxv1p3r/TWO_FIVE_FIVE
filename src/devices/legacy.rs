@@ -227,6 +227,8 @@ pub struct CmosRtc {
     rtc_base_unix_secs: u64,
     /// Status C: IRQF (bit 7), PF (bit 6), AF (bit 5), UF (bit 4)
     status_c: u8,
+    /// Latched one-shot IRQ8 trigger for VMM PIC/IOAPIC injection
+    pending_irq8: bool,
     /// Track the last second we saw (to detect second transitions)
     last_second: u64,
     /// Acumulador de nanosegundos para el temporizador periódico (PF, bit 6)
@@ -257,17 +259,19 @@ impl CmosRtc {
         ram[0x0D] = 0x80; // Status D: CMOS battery power good
         ram[0x0F] = 0x00; // Shutdown status: normal boot
         ram[0x10] = 0x00; // Equipment byte: 0 floppies
-        ram[0x14] = 0x23; // Equipment: 80x25 color, keyboard installed
+        ram[0x14] = 0x06; // Equipment: VGA/EGA, math coprocessor + PS/2 mouse installed
 
         // Base memory: 640 KB (0x0280)
         ram[0x15] = 0x80;
         ram[0x16] = 0x02;
 
+        let ram_below_4g = ram_size.min(0xE000_0000);
+
         // Extended memory 1MB-16MB in KB (max 15MB = 15360 KB = 0x3C00)
-        let ext_16m = if ram_size > 16 * 1024 * 1024 {
+        let ext_16m = if ram_below_4g > 16 * 1024 * 1024 {
             15 * 1024 // 15360 KB = 0x3C00
-        } else if ram_size > 1024 * 1024 {
-            ((ram_size - 1024 * 1024) / 1024) as u16
+        } else if ram_below_4g > 1024 * 1024 {
+            ((ram_below_4g - 1024 * 1024) / 1024) as u16
         } else {
             0
         };
@@ -276,9 +280,9 @@ impl CmosRtc {
         ram[0x30] = ext_16m as u8;
         ram[0x31] = (ext_16m >> 8) as u8;
 
-        // Extended memory >16MB in 64KB chunks
-        let ext_above_16m = if ram_size > 16 * 1024 * 1024 {
-            (((ram_size - 16 * 1024 * 1024) / 65536) as u64).min(0xFFFF) as u16
+        // Extended memory >16MB (acotado al agujero PCI bajo 4GB = ram_below_4g) en chunks de 64KB
+        let ext_above_16m = if ram_below_4g > 16 * 1024 * 1024 {
+            (((ram_below_4g - 16 * 1024 * 1024) / 65536) as u64).min(0xFFFF) as u16
         } else {
             0
         };
@@ -319,10 +323,17 @@ impl CmosRtc {
             rtc_start: Instant::now(),
             rtc_base_unix_secs: unix_secs,
             status_c: 0,
+            pending_irq8: false,
             last_second: 0,
             periodic_ns_acc: 0,
             ram,
         }
+    }
+
+    pub fn take_irq8_pending(&mut self) -> bool {
+        let p = self.pending_irq8;
+        self.pending_irq8 = false;
+        p
     }
 
     /// Reset del RTC/CMOS: limpia el estado volátil (registro índice,
@@ -331,6 +342,7 @@ impl CmosRtc {
     pub fn reset(&mut self) {
         self.index = [0, 0];
         self.status_c = 0;
+        self.pending_irq8 = false;
         self.last_second = self.rtc_start.elapsed().as_secs();
         self.periodic_ns_acc = 0;
         self.ram[0x0A] = 0x26;
@@ -350,6 +362,20 @@ impl CmosRtc {
             self.last_second = current_second;
             if (self.ram[0x0B] & 0x10) != 0 {
                 new_event = true;
+            }
+            // Evaluar coincidencia de alarma RTC (0x01=seg, 0x03=min, 0x05=hora; >=0xC0 es comodín)
+            let (_, _, _, hour, min, sec, _) = self.current_utc();
+            let is_binary = (self.ram[0x0B] & 0x04) != 0;
+            let fmt = |v: u8| if is_binary { v } else { Self::to_bcd(v) };
+            let alarm_match = |reg: u8, cur: u8| -> bool { reg >= 0xC0 || reg == cur };
+            if alarm_match(self.ram[0x01], fmt(sec))
+                && alarm_match(self.ram[0x03], fmt(min))
+                && alarm_match(self.ram[0x05], fmt(hour))
+            {
+                self.status_c |= 0x20; // AF
+                if (self.ram[0x0B] & 0x20) != 0 {
+                    new_event = true;
+                }
             }
         }
 
@@ -377,9 +403,10 @@ impl CmosRtc {
         }
 
         let enabled = self.ram[0x0B] & 0x70;
-        if (self.status_c & enabled) != 0 {
+        if new_event && (self.status_c & enabled) != 0 {
             self.status_c |= 0x80; // IRQF
-            new_event
+            self.pending_irq8 = true;
+            true
         } else {
             false
         }
@@ -488,7 +515,11 @@ impl IoDevice for CmosRtc {
             0x71 => {
                 let idx = self.index[0] as usize;
                 if idx < 128 {
-                    self.ram[idx] = val;
+                    match idx {
+                        0x0A => self.ram[0x0A] = val & 0x7F,
+                        0x0C | 0x0D => {} // read-only
+                        _ => self.ram[idx] = val,
+                    }
                     if (0x10..=0x2D).contains(&idx) {
                         self.recalc_crc();
                     }
@@ -542,10 +573,10 @@ impl A20Gate {
         Self { state: 0x02, reset_requested: false }
     }
 
-    /// ¿El A20 está habilitado?
+    /// ¿El A20 está habilitado? (En el puerto 0x92, bit 1 = A20 gate, bit 0 = fast CPU reset)
     #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
-        self.state & 0x01 != 0
+        self.state & 0x02 != 0
     }
 
     pub fn take_reset_requested(&mut self) -> bool {
@@ -631,16 +662,14 @@ pub struct AcpiPm {
     pm_base: u16,
     /// PM I/O space enabled (PCI config reg 0x80 bit 0)
     pm_enabled: bool,
-    /// GPE0 Status (4 bytes at 0xAFE0)
-    gpe0_sts: u8,
-    /// GPE0 Enable (4 bytes at 0xAFE0)
-    gpe0_en: u8,
+    /// GPE0 Status (2 bytes en 0xAFE0..0xAFE1)
+    gpe0_sts: u16,
+    /// GPE0 Enable (2 bytes en 0xAFE2..0xAFE3)
+    gpe0_en: u16,
     /// SMBus I/O base (from PCI config reg 0x90)
     smb_base: u16,
     /// SMBus enabled (PCI config reg 0xD2)
     smb_enabled: bool,
-    /// Legacy compat registers (0xB0-0xB7)
-    legacy_regs: [u8; 8],
     /// Contador de reads para debug
     read_count: u32,
     /// SLP_EN visto en PM1a_CNT (bit 13): el guest evaluó _S5 y pidió
@@ -656,16 +685,21 @@ impl AcpiPm {
             pm1a_cnt: 0x0001, // SCI_EN = 1 (ACPI habilitado por defecto)
             pm_timer_start: Instant::now(),
             pm_timer_last: 0,
-            pm_base: 0xB0,  // default QEMU base
+            pm_base: 0,
             pm_enabled: false,
             gpe0_sts: 0,
             gpe0_en: 0,
             smb_base: 0,
             smb_enabled: false,
-            legacy_regs: [0u8; 8],
             read_count: 0,
             sleep_requested: false,
         }
+    }
+
+    /// True si la interrupción SCI debe mantenerse afirmada (nivel alto).
+    pub fn sci_asserted(&self) -> bool {
+        (self.pm1a_cnt & 0x0001) != 0
+            && (((self.pm1a_sts & self.pm1a_en) != 0) || ((self.gpe0_sts & self.gpe0_en) != 0))
     }
 
     /// True si el guest escribió SLP_EN en PM1a_CNT (apagado limpio vía _S5).
@@ -732,8 +766,8 @@ impl AcpiPm {
     /// Uses 64-bit unwrapped counter that always advances monotonically
     /// without getting stuck when the 24-bit low part wraps every 4.68 seconds.
     fn pm_timer_value(&mut self) -> u32 {
-        let elapsed_ns = self.pm_timer_start.elapsed().as_nanos() as u64;
-        let ticks = (elapsed_ns * PM_TIMER_HZ) / 1_000_000_000;
+        let elapsed_ns = self.pm_timer_start.elapsed().as_nanos();
+        let ticks = ((elapsed_ns * PM_TIMER_HZ as u128) / 1_000_000_000) as u64;
         let next = self.pm_timer_last.wrapping_add(1);
         self.pm_timer_last = std::cmp::max(ticks, next);
         (self.pm_timer_last & 0x00FF_FFFF) as u32
@@ -746,10 +780,6 @@ impl Default for AcpiPm {
 
 impl IoDevice for AcpiPm {
     fn matches_port(&self, port: u16) -> bool {
-        // Rango legacy hardcoded (0xB0-0xB7) — fallback
-        if matches!(port, 0xB0..=0xB7) {
-            return true;
-        }
         // Rango dinámico PM I/O (64 bytes desde pm_base)
         if self.pm_enabled && port >= self.pm_base && port < self.pm_base.wrapping_add(64) {
             return true;
@@ -767,33 +797,24 @@ impl IoDevice for AcpiPm {
 
     fn write(&mut self, port: u16, data: &[u8]) {
         if data.is_empty() { return; }
-        let val = data[0];
 
-        // GPE0 registers (0xAFE0-0xAFE3)
+        // GPE0 registers (0xAFE0..=0xAFE1 STS W1C, 0xAFE2..=0xAFE3 EN R/W)
         if matches!(port, 0xAFE0..=0xAFE3) {
-            let off = (port - 0xAFE0) as usize;
-            if off == 0 { self.gpe0_sts &= !val; } // Write-1-to-clear
-            if off == 1 { self.gpe0_en = val; }
-            if off == 2 { self.gpe0_sts &= !val; }
-            if off == 3 { self.gpe0_en = val; }
+            let base_off = (port - 0xAFE0) as usize;
+            for (i, &b) in data.iter().enumerate() {
+                match base_off + i {
+                    0 => self.gpe0_sts &= !(b as u16),
+                    1 => self.gpe0_sts &= !((b as u16) << 8),
+                    2 => self.gpe0_en = (self.gpe0_en & 0xFF00) | (b as u16),
+                    3 => self.gpe0_en = (self.gpe0_en & 0x00FF) | ((b as u16) << 8),
+                    _ => {}
+                }
+            }
             return;
         }
 
         // SMBus registers — silently ignore writes
         if self.smb_enabled && port >= self.smb_base && port < self.smb_base.wrapping_add(16) {
-            return;
-        }
-
-        // Legacy range 0xB0-0xB7
-        if matches!(port, 0xB0..=0xB7) {
-            let off = (port - 0xB0) as usize;
-            if off <= 3 {
-                // PM1a Event Status (0xB0-0xB3): write-1-to-clear
-                self.legacy_regs[off] &= !val;
-            } else {
-                // PM1a Control and other regs: direct write
-                self.legacy_regs[off] = val;
-            }
             return;
         }
 
@@ -853,16 +874,16 @@ impl IoDevice for AcpiPm {
         self.read_count += 1;
         let n = count.max(1);
 
-        // GPE0 registers (0xAFE0-0xAFE3)
+        // GPE0 registers (0xAFE0..=0xAFE1 STS, 0xAFE2..=0xAFE3 EN)
         if matches!(port, 0xAFE0..=0xAFE3) {
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 let off = (port - 0xAFE0) as usize + i;
                 out.push(match off {
-                    0 => self.gpe0_sts,
-                    1 => self.gpe0_en,
-                    2 => self.gpe0_sts,
-                    3 => self.gpe0_en,
+                    0 => (self.gpe0_sts & 0xFF) as u8,
+                    1 => ((self.gpe0_sts >> 8) & 0xFF) as u8,
+                    2 => (self.gpe0_en & 0xFF) as u8,
+                    3 => ((self.gpe0_en >> 8) & 0xFF) as u8,
                     _ => 0,
                 });
             }
@@ -872,16 +893,6 @@ impl IoDevice for AcpiPm {
         // SMBus registers — return 0
         if self.smb_enabled && port >= self.smb_base && port < self.smb_base.wrapping_add(16) {
             return vec![0; n];
-        }
-
-        // Legacy range 0xB0-0xB7
-        if matches!(port, 0xB0..=0xB7) {
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let idx = (port - 0xB0) as usize + i;
-                out.push(if idx < 8 { self.legacy_regs[idx] } else { 0 });
-            }
-            return out;
         }
 
         // Dynamic PM I/O range
@@ -1033,8 +1044,13 @@ mod tests {
     #[test]
     fn test_cmos_ram_size_above_4gb_saturates() {
         let cmos = CmosRtc::with_ram_size(8 * 1024 * 1024 * 1024);
-        assert_eq!(cmos.ram[0x34], 0xFF);
-        assert_eq!(cmos.ram[0x35], 0xFF);
+        // 0x34/0x35 acotados a ram_below_4g (0xE000_0000 = 3.5 GiB): (0xE000_0000 - 16 MiB) / 64 KiB = 0xDF00
+        assert_eq!(cmos.ram[0x34], 0x00);
+        assert_eq!(cmos.ram[0x35], 0xDF);
+        // 0x5B..=0x5D contiene memoria sobre 4G en bloques de 64 KiB: (8 GiB - 3.5 GiB) / 64 KiB = 0x12000
+        assert_eq!(cmos.ram[0x5B], 0x00);
+        assert_eq!(cmos.ram[0x5C], 0x20);
+        assert_eq!(cmos.ram[0x5D], 0x01);
     }
 
     #[test]
@@ -1163,14 +1179,8 @@ impl IoDevice for PlatformStubs {
             0x379 | 0x279 => vec![0xDF; count], // all lines high
             // LPT control: bits 0-2 active, bit 3 = IRQ enable (low)
             0x37A | 0x27A => vec![0x04; count],
-            // COM IER (offset1): no interrupts
-            0x2F9 | 0x3E9 | 0x2E9 => vec![0x00; count],
-            // COM IIR/FCR (offset2): no interrupt pending, 16550 FIFO
-            0x2FA | 0x3EA | 0x2EA => vec![0xC1; count],
-            // COM LSR: THRE(bit5) + TEMT(bit6) = transmitter empty
-            0x2FD | 0x3FD | 0x2ED => vec![0x60; count],
-            // COM MSR (offset6): DSR+CTS+DCD ready
-            0x2FE | 0x3EE | 0x2EE => vec![0xB0; count],
+            // COM2/3/4 ausentes: devolver 0xFF para evitar falsos positivos en probe de 8250
+            0x2F8..=0x2FF | 0x3E8..=0x3EF | 0x2E8..=0x2EF => vec![0xFF; count],
             _ => vec![0x00; count],
         }
     }
@@ -1228,6 +1238,10 @@ impl IoDevice for ApmSmiDevice {
         }
         if port == Self::PORT_CMD {
             self.cmd = data[0];
+            if data[0] == 0x00 {
+                // SeaBIOS smm_relocate: escribe 0x01 en 0xB3, 0x00 en 0xB2 y espera 0xB3 == 0
+                self.data = 0;
+            }
             self.smi_requested = true;
         } else if port == Self::PORT_DATA {
             self.data = data[0];
@@ -1321,6 +1335,10 @@ impl I8237Dma {
     }
 
     pub fn reset(&mut self) {
+        self.channels = [
+            DmaChannel::new(), DmaChannel::new(), DmaChannel::new(), DmaChannel::new(),
+            DmaChannel::new(), DmaChannel::new(), DmaChannel::new(), DmaChannel::new(),
+        ];
         self.flip_flop = [false, false];
         self.command = [0, 0];
         self.status = [0, 0];

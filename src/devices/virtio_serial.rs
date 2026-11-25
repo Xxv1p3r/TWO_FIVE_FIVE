@@ -56,6 +56,7 @@ pub struct VirtQueue {
     pub size: u16,
     pub pfn: u32,
     pub last_avail_idx: u16,
+    pub last_used_idx: u16,
 }
 
 impl Default for VirtQueue {
@@ -64,6 +65,7 @@ impl Default for VirtQueue {
             size: QUEUE_SIZE,
             pfn: 0,
             last_avail_idx: 0,
+            last_used_idx: 0,
         }
     }
 }
@@ -99,6 +101,7 @@ impl VirtQueue {
 
         let avail_addr = self.avail_addr();
         let avail_idx = mem.read_u16(avail_addr + 2);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         if avail_idx == self.last_avail_idx {
             return false; // No hay buffers disponibles puestos por el guest
         }
@@ -142,15 +145,17 @@ impl VirtQueue {
             }
         }
 
-        // Registrar elemento en el Used Ring
+        // Registrar elemento en el Used Ring con índice local rastreado y barrera Release
         let used_addr = self.used_addr();
-        let used_idx = mem.read_u16(used_addr + 2);
+        let used_idx = self.last_used_idx;
         let used_slot = (used_idx % self.size) as usize;
         let elem_addr = used_addr + 4 + 8 * used_slot;
 
         mem.write_u32(elem_addr, head_idx as u32);
         mem.write_u32(elem_addr + 4, bytes_written as u32);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         mem.write_u16(used_addr + 2, used_idx.wrapping_add(1));
+        self.last_used_idx = used_idx.wrapping_add(1);
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
 
         true
@@ -165,6 +170,7 @@ impl VirtQueue {
 
         let avail_addr = self.avail_addr();
         let avail_idx = mem.read_u16(avail_addr + 2);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         if avail_idx == self.last_avail_idx {
             return None;
         }
@@ -190,8 +196,9 @@ impl VirtQueue {
             let flags = mem.read_u16(desc_entry + 12);
             let next = mem.read_u16(desc_entry + 14);
 
-            if (flags & VRING_DESC_F_WRITE) == 0 && buf_len > 0 {
-                let mut chunk = vec![0u8; buf_len];
+            if (flags & VRING_DESC_F_WRITE) == 0 && buf_len > 0 && data.len() < 65536 {
+                let capped = buf_len.min(65536 - data.len());
+                let mut chunk = vec![0u8; capped];
                 let copied = mem.copy_from(buf_gpa, &mut chunk);
                 chunk.truncate(copied);
                 data.extend_from_slice(&chunk);
@@ -207,15 +214,17 @@ impl VirtQueue {
             }
         }
 
-        // Registrar elemento en el Used Ring
+        // Registrar elemento en el Used Ring con len = 0 (TX Guest->Host en especificación VirtIO)
         let used_addr = self.used_addr();
-        let used_idx = mem.read_u16(used_addr + 2);
+        let used_idx = self.last_used_idx;
         let used_slot = (used_idx % self.size) as usize;
         let elem_addr = used_addr + 4 + 8 * used_slot;
 
         mem.write_u32(elem_addr, head_idx as u32);
-        mem.write_u32(elem_addr + 4, data.len() as u32);
+        mem.write_u32(elem_addr + 4, 0);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         mem.write_u16(used_addr + 2, used_idx.wrapping_add(1));
+        self.last_used_idx = used_idx.wrapping_add(1);
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
 
         Some(data)
@@ -479,6 +488,11 @@ impl VirtioSerialDevice {
     pub fn new(state: Arc<Mutex<VirtioSerialState>>) -> Self {
         Self { state }
     }
+
+    #[allow(dead_code)]
+    pub fn set_iobase(&self, base: u16) {
+        self.state.lock().unwrap().iobase = base;
+    }
 }
 
 impl IoDevice for VirtioSerialDevice {
@@ -557,6 +571,7 @@ impl IoDevice for VirtioSerialDevice {
                 // Al leer el registro ISR, se limpia a 0 según especificación VirtIO
                 res[0] = st.isr_status;
                 st.isr_status = 0;
+                st.irq_pulse = false;
             }
             // Device-specific config (offset 0x14):
             // cols: 80, rows: 25, max_nr_ports: 1
@@ -627,6 +642,7 @@ impl IoDevice for VirtioSerialDevice {
                     if st.queues[q_idx].pfn != new_pfn {
                         st.queues[q_idx].pfn = new_pfn;
                         st.queues[q_idx].last_avail_idx = 0;
+                        st.queues[q_idx].last_used_idx = 0;
                     }
                 }
             }
@@ -706,6 +722,7 @@ mod tests {
             size: 16,
             pfn: 1, // desc_addr = 0x1000
             last_avail_idx: 0,
+            last_used_idx: 0,
         };
         // avail_addr = 0x1000 + 16 * 16 = 0x1100
         // Caso 1: head_idx >= vq.size (20 >= 16)
@@ -719,6 +736,7 @@ mod tests {
             size: 16,
             pfn: 1,
             last_avail_idx: 0,
+            last_used_idx: 0,
         };
         assert!(vq_tx.write_buffer(&mem, &[1, 2, 3, 4]));
 
@@ -727,6 +745,7 @@ mod tests {
             size: 16,
             pfn: 1,
             last_avail_idx: 0,
+            last_used_idx: 0,
         };
         mem.write_u16(0x1100 + 2, 1);
         mem.write_u16(0x1100 + 4, 0); // head_idx = 0

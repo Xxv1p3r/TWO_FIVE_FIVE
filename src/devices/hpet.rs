@@ -11,8 +11,8 @@ use std::time::Instant;
 pub const HPET_MMIO_BASE: u64 = 0xFED0_0000;
 pub const HPET_MMIO_SIZE: u64 = 0x400; // 1 KiB
 
-/// Periodo del reloj en femtosegundos (10 ns = 100_000_000 fs = 100 MHz de frecuencia).
-pub const HPET_CLK_PERIOD_FS: u64 = 100_000_000;
+/// Periodo del reloj en femtosegundos (10 ns = 10_000_000 fs = 100 MHz de frecuencia).
+pub const HPET_CLK_PERIOD_FS: u64 = 10_000_000;
 
 // Registros de control general
 pub const HPET_REG_GCAP_ID: usize = 0x000;
@@ -37,7 +37,9 @@ pub const HPET_TN_PER_CAP: u64 = 1 << 4;       // Periodic capable (RO)
 pub const HPET_TN_64BIT_CAP: u64 = 1 << 5;     // 64-bit capable (RO)
 pub const HPET_TN_SETVAL: u64 = 1 << 6;        // Value set
 pub const HPET_TN_32MODE: u64 = 1 << 8;        // 32-bit mode
+#[allow(dead_code)]
 pub const HPET_TN_ROUTE_MASK: u64 = 0x1F << 9; // Interrupt Route Mask (bits 9..13)
+#[allow(dead_code)]
 pub const HPET_TN_FSB_EN: u64 = 1 << 14;       // FSB interrupt enable
 pub const HPET_TN_FSB_CAP: u64 = 1 << 15;      // FSB delivery capable
 
@@ -58,17 +60,16 @@ impl HpetTimer {
         let route_cap: u64 = match index {
             0 => (1 << 2) | (1 << 0), // Puede enrutar a IRQ0 o IRQ2
             1 => 1 << 8,            // Enruta a IRQ8
-            _ => (1 << 11) | (1 << 12),
+            _ => (1 << 11) | (1 << 10), // Evitar colisión con IRQ12 (ratón PS/2)
         };
         let default_irq: u64 = match index {
             0 => 2,
             1 => 8,
             _ => 11,
         };
-        // Periodic capable (bit 4), 64-bit capable (bit 5) y FSB capaz (bit 15)
+        // Periodic capable (bit 4), 64-bit capable (bit 5); FSB deshabilitado para garantizar PIC/IOAPIC
         let config = HPET_TN_PER_CAP
             | HPET_TN_64BIT_CAP
-            | HPET_TN_FSB_CAP
             | ((default_irq & 0x1F) << 9)
             | (route_cap << 32);
 
@@ -95,6 +96,16 @@ impl HpetTimer {
     #[inline]
     pub fn route_irq(&self) -> u8 {
         ((self.config >> 9) & 0x1F) as u8
+    }
+
+    #[inline]
+    pub fn is_32bit(&self) -> bool {
+        (self.config & HPET_TN_32MODE) != 0
+    }
+
+    #[inline]
+    pub fn is_level_triggered(&self) -> bool {
+        (self.config & HPET_TN_INT_TYPE) != 0
     }
 }
 
@@ -258,12 +269,17 @@ impl HpetDevice {
         match off {
             HPET_REG_GEN_CONF => {
                 let was_enabled = self.enabled;
-                self.enabled = (val & HPET_GEN_CONF_ENABLE) != 0;
+                let next_enabled = (val & HPET_GEN_CONF_ENABLE) != 0;
                 self.legacy_route = (val & HPET_GEN_CONF_LEG_RT) != 0;
-                if !was_enabled && self.enabled {
-                    self.start_time = Instant::now();
-                } else if was_enabled && !self.enabled {
+                if was_enabled && !next_enabled {
+                    // Capturar el contador ANTES de deshabilitar
                     self.base_counter = self.read_counter();
+                    self.enabled = false;
+                } else {
+                    self.enabled = next_enabled;
+                    if !was_enabled && self.enabled {
+                        self.start_time = Instant::now();
+                    }
                 }
             }
 
@@ -283,28 +299,41 @@ impl HpetDevice {
                     match reg_off {
                         HPET_TN_CONF => {
                             let tmr = &mut self.timers[t_idx];
-                            // Preservar bits read-only
+                            // Preservar bits read-only y autoclear de HPET_TN_SETVAL
                             let ro_mask = HPET_TN_PER_CAP | HPET_TN_64BIT_CAP | HPET_TN_FSB_CAP | (0xFFFF_FFFFu64 << 32);
                             let ro_bits = tmr.config & ro_mask;
-                            let rw_bits = val & !ro_mask;
+                            let rw_bits = val & !ro_mask & !HPET_TN_SETVAL;
                             tmr.config = ro_bits | rw_bits;
                             if (val & HPET_TN_SETVAL) != 0 {
                                 tmr.val_set = true;
+                            }
+                            if (tmr.config & HPET_TN_32MODE) != 0 {
+                                tmr.comparator &= 0xFFFF_FFFF;
+                                tmr.period &= 0xFFFF_FFFF;
                             }
                         }
 
                         HPET_TN_COMP => {
                             let now_cnt = self.read_counter();
                             let tmr = &mut self.timers[t_idx];
-                            if tmr.is_periodic() && tmr.val_set {
-                                tmr.period = val;
-                                tmr.comparator = now_cnt.wrapping_add(val);
-                                tmr.val_set = false;
-                            } else {
-                                tmr.comparator = val;
-                                if tmr.is_periodic() {
-                                    tmr.period = val;
+                            let v = if tmr.is_32bit() { val & 0xFFFF_FFFF } else { val };
+                            if tmr.is_periodic() {
+                                if tmr.val_set {
+                                    // Según Intel HPET 1.0a: con SETVAL activo, la primera escritura fija el comparador
+                                    tmr.comparator = v;
+                                    tmr.val_set = false;
+                                } else {
+                                    // La escritura subsecuente fija el periodo de recarga
+                                    tmr.period = v;
+                                    if tmr.comparator == 0xFFFF_FFFF_FFFF_FFFF || (tmr.is_32bit() && tmr.comparator == 0xFFFF_FFFF) {
+                                        tmr.comparator = now_cnt.wrapping_add(v);
+                                        if tmr.is_32bit() {
+                                            tmr.comparator &= 0xFFFF_FFFF;
+                                        }
+                                    }
                                 }
+                            } else {
+                                tmr.comparator = v;
                             }
                             tmr.fired = false;
                         }
@@ -345,30 +374,57 @@ impl HpetDevice {
         let cnt = self.read_counter();
 
         for i in 0..NUM_TIMERS {
-            let (is_enabled, is_periodic, period, comparator, fired) = {
+            let (is_enabled, is_periodic, is_32bit, is_level, period, comparator, fired) = {
                 let tmr = &self.timers[i];
-                (tmr.is_enabled(), tmr.is_periodic(), tmr.period, tmr.comparator, tmr.fired)
+                (
+                    tmr.is_enabled(),
+                    tmr.is_periodic(),
+                    tmr.is_32bit(),
+                    tmr.is_level_triggered(),
+                    tmr.period,
+                    tmr.comparator,
+                    tmr.fired,
+                )
             };
 
             if !is_enabled {
                 continue;
             }
 
+            let triggered = if is_32bit {
+                ((cnt as u32).wrapping_sub(comparator as u32) as i32) >= 0
+            } else {
+                (cnt.wrapping_sub(comparator) as i64) >= 0
+            };
+
             if is_periodic && period > 0 {
-                if cnt >= comparator {
+                if triggered {
                     let irq = self.get_timer_irq(i);
-                    self.interrupt_status |= 1 << i;
+                    if is_level {
+                        self.interrupt_status |= 1 << i;
+                    }
                     irqs.push(irq);
 
                     let tmr = &mut self.timers[i];
-                    while cnt >= tmr.comparator && tmr.period > 0 {
-                        tmr.comparator = tmr.comparator.wrapping_add(tmr.period);
+                    if is_32bit {
+                        let c32 = cnt as u32;
+                        let comp32 = tmr.comparator as u32;
+                        let p32 = tmr.period as u32;
+                        if p32 > 0 {
+                            let steps = c32.wrapping_sub(comp32) / p32 + 1;
+                            tmr.comparator = comp32.wrapping_add(steps.wrapping_mul(p32)) as u64;
+                        }
+                    } else {
+                        let steps = cnt.wrapping_sub(tmr.comparator) / tmr.period + 1;
+                        tmr.comparator = tmr.comparator.wrapping_add(steps.wrapping_mul(tmr.period));
                     }
                 }
-            } else if cnt >= comparator && !fired {
+            } else if triggered && !fired {
                 self.timers[i].fired = true;
                 let irq = self.get_timer_irq(i);
-                self.interrupt_status |= 1 << i;
+                if is_level {
+                    self.interrupt_status |= 1 << i;
+                }
                 irqs.push(irq);
             }
         }
@@ -390,13 +446,35 @@ impl HpetDevice {
                 continue;
             }
 
-            if cnt >= tmr.comparator {
-                irq_mask |= 1 << i;
-                self.interrupt_status |= 1 << i;
+            let is_32bit = tmr.is_32bit();
+            let is_level = tmr.is_level_triggered();
+            let triggered = if is_32bit {
+                ((cnt as u32).wrapping_sub(tmr.comparator as u32) as i32) >= 0
+            } else {
+                (cnt.wrapping_sub(tmr.comparator) as i64) >= 0
+            };
 
+            if triggered {
                 if tmr.is_periodic() && tmr.period > 0 {
-                    while cnt >= tmr.comparator {
-                        tmr.comparator = tmr.comparator.wrapping_add(tmr.period);
+                    irq_mask |= 1 << i;
+                    if is_level {
+                        self.interrupt_status |= 1 << i;
+                    }
+                    if is_32bit {
+                        let p32 = tmr.period as u32;
+                        if p32 > 0 {
+                            let steps = (cnt as u32).wrapping_sub(tmr.comparator as u32) / p32 + 1;
+                            tmr.comparator = (tmr.comparator as u32).wrapping_add(steps.wrapping_mul(p32)) as u64;
+                        }
+                    } else {
+                        let steps = cnt.wrapping_sub(tmr.comparator) / tmr.period + 1;
+                        tmr.comparator = tmr.comparator.wrapping_add(steps.wrapping_mul(tmr.period));
+                    }
+                } else if !tmr.fired {
+                    tmr.fired = true;
+                    irq_mask |= 1 << i;
+                    if is_level {
+                        self.interrupt_status |= 1 << i;
                     }
                 }
             }
@@ -457,6 +535,10 @@ mod tests {
         let t0_conf = HPET_TN_ENABLE | HPET_TN_PERIODIC | HPET_TN_SETVAL | (2 << 9);
         hpet.write_reg(0x100, t0_conf);
         hpet.write_reg(0x108, 1_000_000); // Periodo de 1_000_000 ticks (10 ms)
+        // Nota: al escribir SETVAL con comparador antes o usando comparator directo:
+        // con val_set=true se actualiza period=1_000_000 y comparator actual.
+        // Ajustar comparator a 1_000_000 explícitamente para probar disparo determinista:
+        hpet.write_reg(0x108, 1_000_000);
 
         // Simular avance del contador
         hpet.write_counter(500_000);

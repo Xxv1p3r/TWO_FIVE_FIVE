@@ -7,7 +7,7 @@
 //! 4. Bloques de memoria física del guest (RAM principal y High Memory / VRAM).
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use kvm_bindings::kvm_mp_state;
 
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"VIPERVM\0";
@@ -189,9 +189,16 @@ pub fn load_vm_snapshot(
             "Versión incompatible de snapshot",
         ));
     }
+    if header.num_cpus == 0 || header.num_cpus > 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Número de vCPUs inválido en snapshot",
+        ));
+    }
 
-    // 2. Leer estado de vCPUs
-    for (_i, vcpu) in vcpus.iter().take(header.num_cpus as usize).enumerate() {
+    // 2. Leer estado de vCPUs (saltando registros sobrantes si difieren de vcpus.len())
+    let read_cpus = (header.num_cpus as usize).min(vcpus.len());
+    for vcpu in vcpus.iter().take(read_cpus) {
         let mut vstate = VcpuSnapshotState {
             cpu_id: 0,
             rip: 0,
@@ -265,18 +272,34 @@ pub fn load_vm_snapshot(
 
         vcpu.set_mp_state(kvm_mp_state { mp_state: vstate.mp_state }).ok();
     }
+    let extra_cpus = (header.num_cpus as usize).saturating_sub(read_cpus);
+    if extra_cpus > 0 {
+        let skip = (extra_cpus * std::mem::size_of::<VcpuSnapshotState>()) as i64;
+        file.seek(SeekFrom::Current(skip))?;
+    }
 
     // 3. Restaurar memoria RAM
     let ram_len = guest_mem.len().min(header.ram_size as usize);
     file.read_exact(&mut guest_mem[..ram_len])?;
+    let ram_skip = header.ram_size.saturating_sub(ram_len as u64);
+    if ram_skip > 0 {
+        file.seek(SeekFrom::Current(ram_skip as i64))?;
+    }
 
     let high_len = high_mem.len().min(header.high_mem_size as usize);
-    file.read_exact(&mut high_mem[..high_len])?;
+    if high_len > 0 {
+        file.read_exact(&mut high_mem[..high_len])?;
+    }
 
+    let rip_msg = vcpus
+        .first()
+        .and_then(|v| v.get_regs().ok())
+        .map(|r| r.rip)
+        .unwrap_or(0);
     eprintln!(
         "[SNAPSHOT] VM restaurada exitosamente desde '{}' (RIP={:#x})",
         path,
-        vcpus[0].get_regs().map(|r| r.rip).unwrap_or(0)
+        rip_msg
     );
 
     Ok(())

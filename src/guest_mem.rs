@@ -107,7 +107,8 @@ impl GuestMemory {
     /// Lee un u16 little-endian con bounds-check (0 si fuera de límites).
     #[inline]
     pub fn read_u16(&self, offset: usize) -> u16 {
-        if let (Some(h1), Some(h2)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 1)) {
+        let Some(off1) = offset.checked_add(1) else { return 0; };
+        if let (Some(h1), Some(h2)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off1)) {
             if h2 == h1 + 1 {
                 unsafe {
                     let low = *self.ptr.add(h1) as u16;
@@ -131,7 +132,8 @@ impl GuestMemory {
     /// Lee un u32 little-endian con bounds-check (0 si fuera de límites).
     #[inline]
     pub fn read_u32(&self, offset: usize) -> u32 {
-        if let (Some(h0), Some(h3)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 3)) {
+        let Some(off3) = offset.checked_add(3) else { return 0; };
+        if let (Some(h0), Some(h3)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off3)) {
             if h3 == h0 + 3 {
                 unsafe {
                     std::ptr::read_unaligned(self.ptr.add(h0) as *const u32).to_le()
@@ -147,7 +149,8 @@ impl GuestMemory {
     /// Escribe un u16 little-endian con bounds-check. Devuelve false si fuera de límites.
     #[inline]
     pub fn write_u16(&self, offset: usize, val: u16) -> bool {
-        if let (Some(h0), Some(h1)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 1)) {
+        let Some(off1) = offset.checked_add(1) else { return false; };
+        if let (Some(h0), Some(h1)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off1)) {
             if h1 == h0 + 1 {
                 unsafe {
                     *self.ptr.add(h0) = val as u8;
@@ -162,7 +165,8 @@ impl GuestMemory {
     /// Escribe un u32 little-endian con bounds-check. Devuelve false si fuera de límites.
     #[inline]
     pub fn write_u32(&self, offset: usize, val: u32) -> bool {
-        if let (Some(h0), Some(h3)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 3)) {
+        let Some(off3) = offset.checked_add(3) else { return false; };
+        if let (Some(h0), Some(h3)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off3)) {
             if h3 == h0 + 3 {
                 unsafe {
                     std::ptr::write_unaligned(self.ptr.add(h0) as *mut u32, val.to_le());
@@ -173,14 +177,21 @@ impl GuestMemory {
         false
     }
 
-    /// Escribe u32 little-endian con `write_volatile` y bounds-check: el
-    /// guest u otro hilo pueden leerlo sin sincronización (p. ej. el tick
-    /// del BDA en 0x46C).
+    /// Escribe u32 little-endian con `write_volatile` y bounds-check (sin UB de desalineación).
+    #[allow(dead_code)]
     pub fn write_u32_volatile(&self, offset: usize, val: u32) -> bool {
-        if let (Some(h0), Some(h3)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 3)) {
+        let Some(off3) = offset.checked_add(3) else { return false; };
+        if let (Some(h0), Some(h3)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off3)) {
             if h3 == h0 + 3 {
                 unsafe {
-                    std::ptr::write_volatile(self.ptr.add(h0) as *mut u32, val);
+                    let dst = self.ptr.add(h0);
+                    if (dst as usize) % 4 == 0 {
+                        std::ptr::write_volatile(dst as *mut u32, val.to_le());
+                    } else {
+                        for (i, b) in val.to_le_bytes().into_iter().enumerate() {
+                            std::ptr::write_volatile(dst.add(i), b);
+                        }
+                    }
                 }
                 return true;
             }
@@ -197,7 +208,7 @@ impl GuestMemory {
             (offset, ram_below_4g - offset)
         } else if offset >= 0x1_0000_0000 {
             let high_off = offset - 0x1_0000_0000;
-            let host_off = ram_below_4g + high_off;
+            let Some(host_off) = ram_below_4g.checked_add(high_off) else { return 0; };
             if host_off < self.size {
                 (host_off, self.size - host_off)
             } else {
@@ -225,7 +236,7 @@ impl GuestMemory {
             (offset, ram_below_4g - offset)
         } else if offset >= 0x1_0000_0000 {
             let high_off = offset - 0x1_0000_0000;
-            let host_off = ram_below_4g + high_off;
+            let Some(host_off) = ram_below_4g.checked_add(high_off) else { return false; };
             if host_off < self.size {
                 (host_off, self.size - host_off)
             } else {
@@ -238,16 +249,56 @@ impl GuestMemory {
         if src.len() > max_contiguous {
             return false;
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(host_start), src.len());
+        if !src.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(host_start), src.len());
+            }
         }
         true
+    }
+
+    /// Rellena `len` bytes desde `offset` con `val`, acotado por región.
+    pub fn fill_region(&self, offset: usize, len: usize, val: u8) -> bool {
+        const RAM_BELOW_4G_LIMIT: usize = 0xE000_0000;
+        let ram_below_4g = self.size.min(RAM_BELOW_4G_LIMIT);
+        let (host_start, max_contiguous) = if offset < ram_below_4g {
+            (offset, ram_below_4g - offset)
+        } else if offset >= 0x1_0000_0000 {
+            let high_off = offset - 0x1_0000_0000;
+            let Some(host_off) = ram_below_4g.checked_add(high_off) else { return false; };
+            if host_off < self.size {
+                (host_off, self.size - host_off)
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        };
+        if len > max_contiguous {
+            return false;
+        }
+        if len > 0 {
+            unsafe {
+                std::ptr::write_bytes(self.ptr.add(host_start), val, len);
+            }
+        }
+        true
+    }
+
+    /// Pone a cero toda la región backing mmap del guest (usado en reset completo).
+    pub fn zero_all(&self) {
+        if self.size > 0 {
+            unsafe {
+                std::ptr::write_bytes(self.ptr, 0, self.size);
+            }
+        }
     }
 
     /// Lee un u64 little-endian con bounds-check (0 si fuera de límites).
     #[inline]
     pub fn read_u64(&self, offset: usize) -> u64 {
-        if let (Some(h0), Some(h7)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 7)) {
+        let Some(off7) = offset.checked_add(7) else { return 0; };
+        if let (Some(h0), Some(h7)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off7)) {
             if h7 == h0 + 7 {
                 unsafe {
                     std::ptr::read_unaligned(self.ptr.add(h0) as *const u64).to_le()
@@ -263,7 +314,8 @@ impl GuestMemory {
     /// Escribe un u64 little-endian con bounds-check. Devuelve false si fuera de límites.
     #[inline]
     pub fn write_u64(&self, offset: usize, val: u64) -> bool {
-        if let (Some(h0), Some(h7)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(offset + 7)) {
+        let Some(off7) = offset.checked_add(7) else { return false; };
+        if let (Some(h0), Some(h7)) = (self.gpa_to_host_offset(offset), self.gpa_to_host_offset(off7)) {
             if h7 == h0 + 7 {
                 unsafe {
                     std::ptr::write_unaligned(self.ptr.add(h0) as *mut u64, val.to_le());

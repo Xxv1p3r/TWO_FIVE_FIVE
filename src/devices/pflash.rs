@@ -39,7 +39,7 @@ impl ParallelFlash {
         Self {
             name: name.to_string(),
             data: vec![0xFF; size], // Flash virgen borrada = todos los bits a 1 (0xFF)
-            block_size,
+            block_size: block_size.max(1),
             readonly,
             mode: PFlashMode::ReadArray,
             status: Self::STATUS_READY,
@@ -57,7 +57,7 @@ impl ParallelFlash {
         Ok(Self {
             name: name.to_string(),
             data,
-            block_size,
+            block_size: block_size.max(1),
             readonly,
             mode: PFlashMode::ReadArray,
             status: Self::STATUS_READY,
@@ -75,24 +75,44 @@ impl ParallelFlash {
 
         match self.mode {
             PFlashMode::ReadArray => {
-                let end = (offset + count).min(self.data.len());
+                let end = offset.saturating_add(count).min(self.data.len());
                 let slice = &self.data[offset..end];
                 res[..slice.len()].copy_from_slice(slice);
             }
             PFlashMode::StatusRegister => {
-                // Devolver el registro de estado replicado en cada byte leído
                 res.fill(self.status);
             }
             PFlashMode::CfiQuery => {
-                // Firma básica CFI 'Q', 'R', 'Y' en offsets normalizados
+                // Tabla CFI estándar de 8 bits (Intel Command Set 0x0001) para OVMF QemuFlash
+                let dev_size_log2 = (self.data.len().max(1).ilog2() as u8).max(16);
+                let num_blocks = ((self.data.len() / self.block_size.max(1)).saturating_sub(1)) as u16;
+                let blk_sz_256 = (self.block_size / 256) as u16;
                 for (i, b) in res.iter_mut().enumerate() {
                     let addr = offset + i;
                     *b = match addr & 0xFF {
-                        0x20 => b'Q',
+                        0x00 => 0x89, // Intel Manufacturer ID
+                        0x01 => 0x18, // Device ID
+                        0x10 => b'Q',
+                        0x11 => b'R',
+                        0x12 => b'Y',
+                        0x13 => 0x01, // Primary Vendor Command Set: Intel 0x0001
+                        0x14 => 0x00,
+                        0x15 => 0x31, // Extended table addr
+                        0x16 => 0x00,
+                        0x20 => b'Q', // Alias de ancho 16-bit por compatibilidad
                         0x22 => b'R',
                         0x24 => b'Y',
-                        0x26 => 0x01, // Intel Command Set ID LSB
-                        0x28 => 0x00, // MSB
+                        0x26 => 0x01,
+                        0x27 => dev_size_log2,
+                        0x28 => 0x00, // x8/x16 interface
+                        0x29 => 0x00,
+                        0x2A => 0x05, // Max write buffer size = 32 bytes (2^5)
+                        0x2B => 0x00,
+                        0x2C => 0x01, // 1 erase block region
+                        0x2D => (num_blocks & 0xFF) as u8,
+                        0x2E => (num_blocks >> 8) as u8,
+                        0x2F => (blk_sz_256 & 0xFF) as u8,
+                        0x30 => (blk_sz_256 >> 8) as u8,
                         _ => 0x00,
                     };
                 }
@@ -107,43 +127,42 @@ impl ParallelFlash {
     /// Escribe o envía un comando CFI a la flash.
     /// Devuelve true si los datos persistentes cambiaron.
     pub fn write(&mut self, offset: usize, data: &[u8]) -> bool {
-        if self.readonly {
-            // Flash de solo lectura: ignora comandos de borrado/programación
-            return false;
-        }
-
-        if data.is_empty() {
+        if data.is_empty() || offset >= self.data.len() {
             return false;
         }
 
         let cmd = data[0];
+        if self.readonly {
+            match cmd {
+                0xFF | 0x00 => self.mode = PFlashMode::ReadArray,
+                0x70 => self.mode = PFlashMode::StatusRegister,
+                0x98 | 0x90 => self.mode = PFlashMode::CfiQuery,
+                _ => {}
+            }
+            return false;
+        }
+
         let mut changed = false;
 
         match self.mode {
             PFlashMode::ReadArray | PFlashMode::StatusRegister | PFlashMode::CfiQuery => {
                 match cmd {
                     0xFF | 0x00 => {
-                        // Reset / Read Array
                         self.mode = PFlashMode::ReadArray;
                     }
                     0x70 => {
-                        // Read Status Register
                         self.mode = PFlashMode::StatusRegister;
                     }
                     0x50 => {
-                        // Clear Status Register
                         self.status = Self::STATUS_READY;
                     }
                     0x98 | 0x90 => {
-                        // Read Query (CFI) / Read ID
                         self.mode = PFlashMode::CfiQuery;
                     }
                     0x20 => {
-                        // Block Erase Setup -> espera confirmación 0xD0
                         self.mode = PFlashMode::BlockEraseWaitingConfirm;
                     }
                     0x40 | 0x10 => {
-                        // Program Word / Byte
                         self.mode = PFlashMode::ProgramWord;
                     }
                     _ => {}
@@ -151,9 +170,9 @@ impl ParallelFlash {
             }
             PFlashMode::BlockEraseWaitingConfirm => {
                 if cmd == 0xD0 {
-                    // Confirmación de borrado de bloque: llenar el bloque con 0xFF
-                    let block_start = (offset / self.block_size) * self.block_size;
-                    let block_end = (block_start + self.block_size).min(self.data.len());
+                    let bsz = self.block_size.max(1);
+                    let block_start = (offset / bsz) * bsz;
+                    let block_end = block_start.saturating_add(bsz).min(self.data.len());
                     if block_start < self.data.len() {
                         self.data[block_start..block_end].fill(0xFF);
                         self.dirty = true;
@@ -166,9 +185,8 @@ impl ParallelFlash {
                 self.mode = PFlashMode::StatusRegister;
             }
             PFlashMode::ProgramWord => {
-                // Escribir bytes respetando la regla física de la flash (AND de bits)
-                let end = (offset + data.len()).min(self.data.len());
-                for (i, &b) in data.iter().take(end - offset).enumerate() {
+                let end = offset.saturating_add(data.len()).min(self.data.len());
+                for (i, &b) in data.iter().take(end.saturating_sub(offset)).enumerate() {
                     let target = &mut self.data[offset + i];
                     let new_val = *target & b;
                     if *target != new_val {
@@ -185,16 +203,20 @@ impl ParallelFlash {
         changed
     }
 
-    /// Sincroniza las modificaciones al archivo en el disco host (fsync).
+    /// Sincroniza las modificaciones al archivo en el disco host de forma atómica (fsync + rename).
     pub fn flush_to_disk(&mut self) -> std::io::Result<()> {
         if !self.dirty || self.readonly {
             return Ok(());
         }
 
         if let Some(ref path) = self.file_path {
-            let mut file = File::create(path)?;
-            file.write_all(&self.data)?;
-            file.sync_all()?;
+            let tmp_path = format!("{}.tmp", path);
+            {
+                let mut file = File::create(&tmp_path)?;
+                file.write_all(&self.data)?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, path)?;
             self.dirty = false;
             eprintln!("[PFLASH] VarStore guardado en disco: {} ({} bytes)", path, self.data.len());
         }

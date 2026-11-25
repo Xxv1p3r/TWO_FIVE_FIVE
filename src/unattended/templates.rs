@@ -46,6 +46,54 @@ impl Default for UnattendedConfig {
     }
 }
 
+fn strip_newlines(s: &str) -> String {
+    s.chars().filter(|&c| c != '\n' && c != '\r').collect()
+}
+
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\n' | '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_yaml_inline(s: &str) -> String {
+    strip_newlines(s).replace('\'', "''")
+}
+
+fn iana_to_windows_tz(tz: &str) -> &str {
+    match tz.trim() {
+        "UTC" | "Etc/UTC" | "GMT" => "UTC",
+        "America/Mexico_City" => "Central Standard Time (Mexico)",
+        "America/Monterrey" => "Central Standard Time (Mexico)",
+        "America/Tijuana" => "Pacific Standard Time (Mexico)",
+        "America/Cancun" => "Eastern Standard Time (Mexico)",
+        "America/New_York" => "Eastern Standard Time",
+        "America/Chicago" => "Central Standard Time",
+        "America/Denver" => "Mountain Standard Time",
+        "America/Los_Angeles" => "Pacific Standard Time",
+        "America/Bogota" => "SA Pacific Standard Time",
+        "America/Lima" => "SA Pacific Standard Time",
+        "America/Santiago" => "Pacific SA Standard Time",
+        "America/Buenos_Aires" | "America/Argentina/Buenos_Aires" => "Argentina Standard Time",
+        "America/Caracas" => "Venezuela Standard Time",
+        "America/Havana" => "Cuba Standard Time",
+        "Europe/Madrid" | "Europe/Paris" | "Europe/Berlin" => "Romance Standard Time",
+        "Europe/London" => "GMT Standard Time",
+        "Asia/Tokyo" => "Tokyo Standard Time",
+        other => other,
+    }
+}
+
 /// Genera el contenido de un archivo `preseed.cfg` completo y compatible con `debian-installer`
 /// para instalaciones 100% desatendidas de Debian y Kali Linux.
 pub fn generate_debian_preseed(config: &UnattendedConfig) -> String {
@@ -70,10 +118,10 @@ pub fn generate_debian_preseed(config: &UnattendedConfig) -> String {
         ("en_US.UTF-8", "us", "US", "en")
     };
 
-    let username = &config.username;
-    let password = &config.password;
-    let hostname = &config.hostname;
-    let timezone = &config.timezone;
+    let username = strip_newlines(&config.username);
+    let password = strip_newlines(&config.password);
+    let hostname = strip_newlines(&config.hostname);
+    let timezone = strip_newlines(&config.timezone);
 
     format!(
         r#"#_preseed_V1
@@ -184,7 +232,9 @@ d-i grub-installer/only_debian boolean true
 d-i grub-installer/with_other_os boolean true
 d-i grub-installer/bootdev string /dev/sda
 
-#### 9. Finalizacion de la instalacion y reinicio automatico
+#### 9. Habilitar SSH con autenticacion por contrasena y reinicio automatico
+d-i preseed/late_command string \
+    in-target sh -c "mkdir -p /etc/ssh/sshd_config.d && printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-two55.conf; systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true"
 d-i finish-install/reboot_in_progress note
 "#
     )
@@ -196,10 +246,10 @@ d-i finish-install/reboot_in_progress note
 ///   claves en `chpasswd`, zona horaria y paquetes base.
 /// - `meta-data`: Metadatos de la instancia conteniendo `instance-id` y `local-hostname`.
 pub fn generate_cloud_init(config: &UnattendedConfig) -> (String, String) {
-    let username = &config.username;
-    let password = &config.password;
-    let hostname = &config.hostname;
-    let timezone = &config.timezone;
+    let username = escape_yaml_inline(&config.username);
+    let password = strip_newlines(&config.password);
+    let hostname = escape_yaml_inline(&config.hostname);
+    let timezone = escape_yaml_inline(&config.timezone);
 
     let user_data = format!(
         r#"#cloud-config
@@ -253,10 +303,10 @@ local-hostname: {hostname}
 
 /// Genera un archivo XML `autounattend.xml` para instalación automatizada de Microsoft Windows.
 pub fn generate_windows_unattend(config: &UnattendedConfig) -> String {
-    let username = &config.username;
-    let password = &config.password;
-    let hostname = &config.hostname;
-    let timezone = &config.timezone;
+    let username = escape_xml(&config.username);
+    let password = escape_xml(&config.password);
+    let hostname = escape_xml(&config.hostname);
+    let timezone = escape_xml(iana_to_windows_tz(&config.timezone));
 
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -362,10 +412,10 @@ pub fn generate_windows_unattend(config: &UnattendedConfig) -> String {
 /// Genera un archivo Kickstart (`ks.cfg`) para instalación desatendida en distribuciones
 /// Red Hat, CentOS, Fedora, AlmaLinux y Rocky Linux (Anaconda).
 pub fn generate_kickstart(config: &UnattendedConfig) -> String {
-    let username = &config.username;
-    let password = &config.password;
-    let hostname = &config.hostname;
-    let timezone = &config.timezone;
+    let username = strip_newlines(&config.username);
+    let password = strip_newlines(&config.password);
+    let hostname = strip_newlines(&config.hostname);
+    let timezone = strip_newlines(&config.timezone);
 
     format!(
         r#"# Kickstart auto-install for Red Hat / CentOS / Fedora / Rocky / Alma

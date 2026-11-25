@@ -33,8 +33,8 @@ check_kvm() {
         error "KVM no disponible. Instala KVM:\n  Debian/Ubuntu: sudo apt install qemu-kvm\n  Fedora:        sudo dnf install qemu-kvm\n  Arch:          sudo pacman -S qemu-full"
     fi
 
-    if ! groups "$USER" 2>/dev/null | grep -qw "kvm"; then
-        warn "Tu usuario no está en el grupo 'kvm'. Puede que necesites sudo."
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+        warn "Sin permisos R/W en /dev/kvm para el usuario actual."
         warn "Para evitarlo: sudo usermod -aG kvm \$USER (y vuelve a login)"
     fi
 
@@ -146,6 +146,29 @@ find_iso() {
 }
 
 # ─── Main ─────────────────────────────────────────────────────────
+for arg in "$@"; do
+    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+        cat <<'EOF'
+Uso: ./run.sh [opciones] [bios.bin] [imagen.iso] [disco.vdi|disco.img]
+
+Opciones:
+  -g, --gui, --launcher         Abrir el Administrador Grafico de VMs
+  --startvm, --vm-name <nombre> Iniciar una VM configurada en vms.conf
+  --no-gui                      Omitir lanzador grafico inicial
+  --tui / --no-tui              Forzar / desactivar dashboard TUI
+  --efi, --uefi                 Arrancar con firmware UEFI (OVMF)
+  --no-disk                     No adjuntar ni autodetectar disco duro
+  --no-iso, --no-cdrom          Arrancar sin imagen ISO
+  --cpus <N> / --ram <MiB>      Recursos de la VM
+  -u, --unattended              Activar instalacion desatendida
+  --net <nombre> / --hostfwd <h:g>    Red virtual y redireccion de puertos
+  --agent-status / --bogo-only / --agent-prompt <texto>  Agente IA Ollama (bogo Tailscale)
+  --create-vdi / --compact-vdi / --disk-info   Utilidades de disco VDI
+EOF
+        exit 0
+    fi
+done
+
 echo ""
 info "═══════════════════════════════════════════════"
 info "  Two Five Five (255) — Hipervisor Tipo-2"
@@ -159,27 +182,56 @@ FLAGS=()
 BIOS=""
 ISO=""
 DISK=""
+NO_DISK=0
+NO_ISO=0
+NO_GUI_ENV="${TWO_FIVE_FIVE_NO_GUI:-${TFF_NO_GUI:-${MI_VMM_NO_GUI:-}}}"
 
 # Si se ejecuta sin argumentos y hay servidor gráfico disponible, abrir el Mini GUI
-if [ $# -eq 0 ] && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } && [ -z "${MI_VMM_NO_GUI:-}" ]; then
+if [ $# -eq 0 ] && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } && [ -z "$NO_GUI_ENV" ]; then
     exec "$BINARY" --gui
 fi
 
-# Si se solicita modo GUI o utilidades VDI directamente, delegar al binario
+# Si se solicita modo GUI, startvm o utilidades VDI directamente, delegar al binario
 for arg in "$@"; do
     if [ "$arg" = "-g" ] || [ "$arg" = "--gui" ] || [ "$arg" = "--launcher" ] || \
-       [ "$arg" = "--create-vdi" ] || [ "$arg" = "--compact-vdi" ] || [ "$arg" = "--disk-info" ]; then
+       [ "$arg" = "--create-vdi" ] || [ "$arg" = "--compact-vdi" ] || [ "$arg" = "--disk-info" ] || \
+       [ "$arg" = "--agent-status" ] || [ "$arg" = "--bogo-only" ] || [[ "$arg" == --agent-prompt* ]] || \
+       [[ "$arg" == --startvm* ]] || [[ "$arg" == --vm-name* ]]; then
         exec "$BINARY" "$@"
     fi
 done
 
 # Categorizar los argumentos pasados (Flags, BIOS, ISO o DISK)
+expect_val=0
 for arg in "$@"; do
     [ -z "$arg" ] && continue
-    if [ "$arg" = "-u" ] || [ "$arg" = "--unattended" ] || [[ "$arg" == --unattended-* ]] || \
-       [[ "$arg" == --cpus=* ]] || [[ "$arg" == --ram=* ]] || [ "$arg" = "--no-gui" ]; then
+    if [ "$expect_val" -eq 1 ]; then
         FLAGS+=("$arg")
-    elif [ -z "$BIOS" ] && ([[ "$arg" == *.bin ]] || [[ "$arg" == *.fd ]] || [[ "$arg" == *seabios* ]] || [[ "$arg" == *ovmf* ]]); then
+        expect_val=0
+        continue
+    fi
+    case "$arg" in
+        --cpus|--ram|--iso|--cdrom|--disk|--drive|--hda|--unattended-user|--unattended-pass|--unattended-host|--net|--net-mode|--net-subnet|--tap|--mac|--hostfwd|--ollama-model|--ollama-url)
+            FLAGS+=("$arg")
+            expect_val=1
+            continue
+            ;;
+        --no-disk)
+            NO_DISK=1
+            FLAGS+=("$arg")
+            continue
+            ;;
+        --no-iso|--no-cdrom)
+            NO_ISO=1
+            FLAGS+=("$arg")
+            continue
+            ;;
+        -u|--unattended|--unattended-*|--cpus=*|--ram=*|--iso=*|--cdrom=*|--disk=*|--drive=*|--hda=*|--net=*|--net-mode=*|--net-subnet=*|--tap=*|--mac=*|--hostfwd=*|--ollama-model=*|--ollama-url=*|--no-gui|--tui|--no-tui|--efi|--uefi)
+            FLAGS+=("$arg")
+            continue
+            ;;
+    esac
+    if [ -z "$BIOS" ] && ([[ "$arg" == *.bin ]] || [[ "$arg" == *.fd ]] || [[ "$arg" == *seabios* ]] || [[ "$arg" == *ovmf* ]]); then
         BIOS=$(find_bios "$arg")
     elif [ -z "$DISK" ] && ([[ "$arg" == *.img ]] || [[ "$arg" == *.raw ]] || [[ "$arg" == *.vdi ]] || [[ "$arg" == *.qcow2 ]]); then
         [ -f "$arg" ] || error "Disco no encontrado: $arg"
@@ -198,14 +250,13 @@ if [ -z "$BIOS" ]; then
     BIOS=$(find_bios "")
 fi
 
-# Si no se pasó ni ISO ni DISK, buscar ISO disponible
-if [ -z "$DISK" ] && [ -z "$ISO" ]; then
+# Si no se pasó ni ISO ni DISK, buscar ISO disponible salvo --no-iso
+if [ "$NO_ISO" -eq 0 ] && [ -z "$DISK" ] && [ -z "$ISO" ]; then
     ISO=$(find_iso "")
 fi
 
-# Si hay una ISO pero no hay disco asignado, asegurar que exista un disco virtual (disk.img)
-# para que el instalador de la VM siempre tenga un disco donde instalarse
-if [ -n "$ISO" ] && [ -z "$DISK" ]; then
+# Si hay una ISO pero no hay disco asignado (y no se pidió --no-disk), asegurar disk.img
+if [ "$NO_DISK" -eq 0 ] && [ -n "$ISO" ] && [ -z "$DISK" ]; then
     if [ -f "$SCRIPT_DIR/disk.img" ]; then
         DISK="$SCRIPT_DIR/disk.img"
         info "Disco duro virtual detectado: $DISK"

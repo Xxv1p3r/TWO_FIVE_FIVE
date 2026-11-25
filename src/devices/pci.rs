@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 // ─── Puertos de acceso a config space ──────────────────────────────
 const PORT_ADDR: u16 = 0xCF8;
+const PORT_RESET_CTRL: u16 = 0xCF9;
 const PORT_DATA: u16 = 0xCFC;
 
 // ─── PCI Header Type ──────────────────────────────────────────────
@@ -45,8 +46,10 @@ pub struct PciDevice {
     /// Registro de configuración extendido (para PAM, subsystem IDs, etc.)
     pub config_regs: [u8; 256],
     /// BAR sizing masks: indexed by BAR register offset (0x10, 0x14, 0x18, 0x1C, 0x20, 0x24)
-    /// Value 0 = BAR not implemented. Non-zero = mask returned during sizing (write 0xFFFFFFFF → read mask).
+    /// Value 0 = BAR not implemented. Non-zero = mask returned during sizing.
     bar_masks: [u32; 6],
+    /// Máscara de bytes de solo lectura en capability lists u otros campos fijos.
+    ro_mask: [bool; 256],
 }
 
 impl PciDevice {
@@ -79,6 +82,7 @@ impl PciDevice {
             status: 0x00,
             config_regs,
             bar_masks: [0u32; 6],
+            ro_mask: [false; 256],
         }
     }
 
@@ -87,6 +91,43 @@ impl PciDevice {
         let idx = ((reg_off - 0x10) / 4) as usize;
         if idx < 6 {
             self.bar_masks[idx] = mask;
+            // Inicializar bits fijos de tipo (bit 0 para I/O, bits 3:0 para MMIO)
+            let reg = 0x10 + idx * 4;
+            let flags = if (mask & 1) != 0 {
+                (mask & 0x03) as u8
+            } else {
+                (mask & 0x0F) as u8
+            };
+            self.config_regs[reg] = (self.config_regs[reg] & !0x0F) | flags;
+        }
+    }
+
+    /// Marca un offset de config space como de solo lectura.
+    pub fn set_ro(&mut self, reg_off: u8) {
+        self.ro_mask[reg_off as usize] = true;
+    }
+
+    fn read_bar_raw(&self, bar_idx: usize) -> u32 {
+        let bar_reg = 0x10 + bar_idx * 4;
+        (self.config_regs[bar_reg] as u32)
+            | ((self.config_regs[bar_reg + 1] as u32) << 8)
+            | ((self.config_regs[bar_reg + 2] as u32) << 16)
+            | ((self.config_regs[bar_reg + 3] as u32) << 24)
+    }
+
+    fn is_bar_sizing(&self, bar_idx: usize) -> bool {
+        let mask = self.bar_masks[bar_idx];
+        if mask == 0 {
+            return false;
+        }
+        let stored = self.read_bar_raw(bar_idx);
+        if (mask & 1) != 0 {
+            // I/O BAR: bits de dirección son mask & !0x3
+            let addr_mask = mask & !0x0000_0003;
+            (stored & addr_mask) == addr_mask
+        } else {
+            let addr_mask = mask & !0x0000_000F;
+            (stored & addr_mask) == addr_mask
         }
     }
 
@@ -105,69 +146,87 @@ impl PciDevice {
             0x0A => self.subclass,
             0x0B => self.class_code,
             0x0E => self.header_type,
-            // BAR registers: return sizing mask when value is all 1s
             0x10..=0x27 => {
                 let bar_idx = ((offset - 0x10) / 4) as usize;
                 let bar_byte = (offset - 0x10) % 4;
                 if bar_idx < 6 && self.bar_masks[bar_idx] != 0 {
-                    // Check if the stored BAR value is all 1s (sizing mode)
                     let mask = self.bar_masks[bar_idx];
-                    let bar_reg = 0x10 + (bar_idx as u8) * 4;
-                    let stored = (self.config_regs[bar_reg as usize] as u32)
-                        | ((self.config_regs[(bar_reg + 1) as usize] as u32) << 8)
-                        | ((self.config_regs[(bar_reg + 2) as usize] as u32) << 16)
-                        | ((self.config_regs[(bar_reg + 3) as usize] as u32) << 24);
-                    if stored == 0xFFFFFFFF {
-                        // Sizing mode: return mask
+                    if self.is_bar_sizing(bar_idx) {
                         ((mask >> (bar_byte * 8)) & 0xFF) as u8
                     } else if bar_byte == 0 {
-                        (self.config_regs[offset as usize] & (mask as u8)) | ((mask & 0x0F) as u8)
+                        let flag_bits = if (mask & 1) != 0 {
+                            (mask & 0x03) as u8
+                        } else {
+                            (mask & 0x0F) as u8
+                        };
+                        (self.config_regs[offset as usize] & (mask as u8)) | flag_bits
                     } else {
                         self.config_regs[offset as usize]
                     }
                 } else {
-                    // BAR no implementado: debe devolver 0x00 según especificación PCI
                     0x00
                 }
             }
-            // Expansion ROM Base Address (0x30..0x33): devolvemos 0 para indicar
-            // al BIOS que el dispositivo no expone ROM vía PCI BAR (se carga vía fw_cfg o C0000).
             0x30..=0x33 => 0x00,
             _ => self.config_regs[offset as usize],
         }
     }
 
     fn set_byte(&mut self, offset: u8, value: u8) {
+        if self.ro_mask[offset as usize] {
+            return;
+        }
         match offset {
+            0x00..=0x03 | 0x08..=0x0B | 0x0E | 0x2C..=0x2F | 0x30..=0x34 | 0x3D..=0x3F => {
+                // Campos estándar de solo lectura (Vendor/Device/Class/Header/Subsystem/CapPtr/IntPin/Gnt/Lat)
+            }
             0x04 => self.command = (self.command & 0xFF00) | value as u16,
             0x05 => self.command = (self.command & 0x00FF) | ((value as u16) << 8),
-            0x06 => self.status = (self.status & 0xFF00) | value as u16,
-            0x07 => self.status = (self.status & 0x00FF) | ((value as u16) << 8),
-            // BAR registers (0x10..=0x27): solo escribir si el BAR está implementado
+            // PCI_STATUS: bits 7:0 son RO (CAP_LIST etc.); bits 15:11 y 8 son RW1C
+            0x06 => {}
+            0x07 => {
+                let w1c = ((value as u16) << 8) & 0xF900;
+                self.status &= !w1c;
+            }
+            // BAR registers (0x10..=0x27): enmascarar contra bar_masks preservando flags RO
             0x10..=0x27 => {
                 let bar_idx = ((offset - 0x10) / 4) as usize;
+                let bar_byte = (offset - 0x10) % 4;
                 if bar_idx < 6 && self.bar_masks[bar_idx] != 0 {
-                    self.config_regs[offset as usize] = value;
+                    let mask = self.bar_masks[bar_idx];
+                    let byte_mask = ((mask >> (bar_byte * 8)) & 0xFF) as u8;
+                    if bar_byte == 0 {
+                        let flag_bits = if (mask & 1) != 0 {
+                            (mask & 0x03) as u8
+                        } else {
+                            (mask & 0x0F) as u8
+                        };
+                        let addr_byte_mask = if (mask & 1) != 0 {
+                            byte_mask & !0x03
+                        } else {
+                            byte_mask & !0x0F
+                        };
+                        self.config_regs[offset as usize] = (value & addr_byte_mask) | flag_bits;
+                    } else {
+                        self.config_regs[offset as usize] = value & byte_mask;
+                    }
                 }
             }
-            // Expansion ROM BAR (0x30..0x33): inmutable a 0 (sin ROM PCI)
-            0x30..=0x33 => {}
-            // Allow writing to config registers 0x00-0xFF
             _ => {
                 self.config_regs[offset as usize] = value;
-                // Keep vendor/device/ident fields immutable
-                if offset < 0x04 {
-                    // vendor/device: restore original
-                }
             }
         }
     }
 }
 
-/// "Bus PCI" con soporte multifunción (8 devices × 8 functions).
+/// "Bus PCI" con soporte multifunción (32 slots × 8 functions).
 pub struct PciBus {
     addr_reg: u32,
     devices: Vec<Vec<Option<PciDevice>>>,
+    reset_ctrl: u8,
+    reset_requested: bool,
+    ide_pri_enabled: bool,
+    ide_sec_enabled: bool,
     pub last_acpi_config_write: Option<(u8, u32)>,
     /// USB UHCI state compartido (para notificar I/O base asignado)
     usb_uhci: Option<Arc<Mutex<super::usb_uhci::UhciState>>>,
@@ -212,6 +271,10 @@ impl PciBus {
         Self {
             addr_reg: 0,
             devices: vec![vec![None; 8]; 32],
+            reset_ctrl: 0,
+            reset_requested: false,
+            ide_pri_enabled: true,
+            ide_sec_enabled: true,
             last_acpi_config_write: None,
             usb_uhci: None,
             virtio_serial: None,
@@ -256,54 +319,86 @@ impl PciBus {
     #[allow(dead_code)]
     pub fn usb_iobase(&self) -> Option<u16> {
         self.usb_uhci.as_ref().map(|s| {
-            let state = s.lock().unwrap();
+            let state = s.lock().unwrap_or_else(|p| p.into_inner());
             if state.iobase == 0 { None } else { Some(state.iobase) }
         }).and_then(|x| x)
     }
 
-    /// Devuelve la línea IRQ asignada al controlador USB UHCI (dev 1:2).
-    /// SeaBIOS asigna PIRQD -> IRQ 11 y lo escribe en el registro de config 0x3C.
+    /// Resuelve la línea IRQ real siguiendo el enrutamiento PIIX3 PIRQ (0x60..0x63 en dev 1:0)
+    /// que utiliza Linux ACPI (`_PRT` / `LNKA..LNKD`) y el registro `0x3C` como fallback.
+    pub fn routed_irq_line(&self, slot: usize, func: usize) -> Option<u8> {
+        let dev = self.devices.get(slot)?.get(func)?.as_ref()?;
+        let pin = dev.config_regs[0x3D];
+        if pin == 0 || pin > 4 {
+            return None;
+        }
+        if (dev.command & 0x0400) != 0 {
+            // PCI Command bit 10: INTx Disable
+            return None;
+        }
+        // Swizzle PIIX3 idéntico al DSDT (`_PRT`): pirq = (slot + pin_1based + 2) & 3
+        let pirq = (slot + (pin as usize) + 2) & 3;
+        if let Some(isa) = self.devices.get(1).and_then(|f| f.get(0)).and_then(|d| d.as_ref()) {
+            let route = isa.config_regs[0x60 + pirq];
+            if (route & 0x80) != 0 {
+                return None;
+            }
+            let irq = route & 0x0F;
+            if irq != 0 {
+                return Some(irq);
+            }
+        }
+        let line = dev.config_regs[0x3C];
+        if line != 0 && line != 0xFF { Some(line) } else { None }
+    }
+
+    /// Configura si los canales IDE legados PIIX4 (0x1F0/0x170) están habilitados en IDETIM (0x40..0x43).
+    pub fn set_ide_channels_enabled(&mut self, pri: bool, sec: bool) {
+        self.ide_pri_enabled = pri;
+        self.ide_sec_enabled = sec;
+        if let Some(ide) = self.devices.get_mut(1).and_then(|f| f.get_mut(1)).and_then(|d| d.as_mut()) {
+            if pri {
+                ide.config_regs[0x40] = 0x11;
+                ide.config_regs[0x41] = 0x80;
+            } else {
+                ide.config_regs[0x40] = 0x00;
+                ide.config_regs[0x41] = 0x00;
+            }
+            if sec {
+                ide.config_regs[0x42] = 0x11;
+                ide.config_regs[0x43] = 0x80;
+            } else {
+                ide.config_regs[0x42] = 0x00;
+                ide.config_regs[0x43] = 0x00;
+            }
+        }
+    }
+
+    /// Consume la solicitud de reset hardware vía puerto 0xCF9 (flanco 0 -> 1 de bit 2).
+    pub fn take_reset_requested(&mut self) -> bool {
+        let r = self.reset_requested;
+        self.reset_requested = false;
+        r
+    }
+
+    /// Devuelve la línea IRQ asignada al controlador USB UHCI (dev 1:2, INTD# -> LNKD).
     pub fn usb_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[1][2].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        11 // Fallback PIIX3 USB INTD#
+        self.routed_irq_line(1, 2).unwrap_or(0)
     }
 
-    /// Devuelve la línea IRQ asignada al controlador VirtIO Serial (dev 3:0).
+    /// Devuelve la línea IRQ asignada al controlador VirtIO Serial (dev 3:0, INTA# -> LNKC).
     pub fn virtio_serial_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[3][0].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        10 // Default IRQ 10
+        self.routed_irq_line(3, 0).unwrap_or(0)
     }
 
-    /// Devuelve la línea IRQ asignada al controlador VirtIO Net (dev 4:0).
+    /// Devuelve la línea IRQ asignada al controlador VirtIO Net (dev 4:0, INTA# -> LNKD).
     pub fn virtio_net_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[4][0].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        9 // Default IRQ 9 (PIRQA / INTA#)
+        self.routed_irq_line(4, 0).unwrap_or(0)
     }
 
-    /// Devuelve la línea IRQ asignada al controlador SATA AHCI (dev 5:0).
+    /// Devuelve la línea IRQ asignada al controlador SATA AHCI (dev 5:0, INTA# -> LNKA).
     pub fn ahci_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[5][0].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        10 // Default IRQ 10
+        self.routed_irq_line(5, 0).unwrap_or(0)
     }
 
     /// Conecta el estado compartido del dispositivo VirtualBox VMMDev
@@ -311,15 +406,9 @@ impl PciBus {
         self.vmmdev = Some(state);
     }
 
-    /// Devuelve la línea IRQ asignada al dispositivo VirtualBox VMMDev (dev 6:0).
+    /// Devuelve la línea IRQ asignada al dispositivo VirtualBox VMMDev (dev 6:0, INTA# -> LNKB).
     pub fn vmmdev_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[6][0].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        11 // Default IRQ 11 (shared with USB UHCI)
+        self.routed_irq_line(6, 0).unwrap_or(0)
     }
 
     /// Conecta el estado compartido del controlador de audio AC'97
@@ -327,15 +416,9 @@ impl PciBus {
         self.ac97 = Some(state);
     }
 
-    /// Devuelve la línea IRQ asignada al controlador de audio AC'97 (dev 7:0).
+    /// Devuelve la línea IRQ asignada al controlador de audio AC'97 (dev 7:0, INTA# -> LNKC).
     pub fn ac97_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[7][0].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        5 // Default IRQ 5 (Standard PC Audio IRQ)
+        self.routed_irq_line(7, 0).unwrap_or(0)
     }
 
     /// Conecta el estado compartido del controlador Intel PRO/1000 (e1000)
@@ -343,15 +426,9 @@ impl PciBus {
         self.e1000 = Some(state);
     }
 
-    /// Devuelve la línea IRQ asignada a Intel e1000 (dev 8:0).
+    /// Devuelve la línea IRQ asignada a Intel e1000 (dev 8:0, INTA# -> LNKD).
     pub fn e1000_irq_line(&self) -> u8 {
-        if let Some(dev) = self.devices[8][0].as_ref() {
-            let irq = dev.config_regs[0x3C];
-            if irq != 0 && irq != 0xFF {
-                return irq;
-            }
-        }
-        11 // Default IRQ 11
+        self.routed_irq_line(8, 0).unwrap_or(0)
     }
 
     /// Registra un dispositivo en un slot/función específicos.
@@ -427,20 +504,19 @@ impl PciBus {
             for (i, &b) in data.iter().enumerate() {
                 dev.set_byte(byte_off.wrapping_add(i as u8), b);
             }
+            let write_end = (byte_off as usize) + data.len();
+            // Helper inline para verificar si un rango de registro BAR fue completado (incluye byte más alto o escritura de 4 bytes)
+            let touches_bar_hi = |reg: u8| -> bool {
+                (byte_off as usize) <= (reg as usize + 3) && write_end >= (reg as usize + 4)
+            };
+
             // (tarea 1) Detectar asignaciones de los BARs VGA (dev 2:0):
-            // BAR0 (0x10) = framebuffer lineal 16 MiB, BAR2 (0x18) = MMIO 4 KiB.
-            // Igual que con el USB: ignoramos las escrituras de sizing
-            // (0xFFFFFFFF) y solo registramos direcciones reales de memoria.
             if dev_num == 2 && fn_num == 0 {
-                for reg_off in [0x10u8, 0x18u8] {
-                    if byte_off >= reg_off && byte_off < reg_off + 4 {
-                        let raw = (dev.config_regs[reg_off as usize] as u32)
-                            | ((dev.config_regs[reg_off as usize + 1] as u32) << 8)
-                            | ((dev.config_regs[reg_off as usize + 2] as u32) << 16)
-                            | ((dev.config_regs[reg_off as usize + 3] as u32) << 24);
-                        if raw != 0xFFFFFFFF && raw & 1 == 0 {
-                            let base = raw & 0xFFFF_FFF0;
-                            vga_bar_write = Some((reg_off, base));
+                for (bar_idx, reg_off) in [(0usize, 0x10u8), (2usize, 0x18u8)] {
+                    if touches_bar_hi(reg_off) && !dev.is_bar_sizing(bar_idx) {
+                        let base = dev.read_bar_raw(bar_idx) & 0xFFFF_FFF0;
+                        vga_bar_write = Some((reg_off, base));
+                        if base != 0 {
                             eprintln!(
                                 "[PCI] VGA BAR{} asignado: GPA {:#x}",
                                 if reg_off == 0x10 { 0 } else { 2 },
@@ -452,159 +528,91 @@ impl PciBus {
             }
             // Detect writes to PIIX3 ACPI PM config registers (device 1, function 3)
             if dev_num == 1 && fn_num == 3 {
-                let reg = byte_off;
-                if matches!(reg, 0x40 | 0x80 | 0x90 | 0xD2) {
-                    let mut val_bytes = [0u8; 4];
-                    for (i, item) in val_bytes.iter_mut().enumerate() {
-                        *item = dev.get_byte(reg.wrapping_add(i as u8));
+                let start = byte_off as usize;
+                let end = start + data.len();
+                for target_reg in [0x40u8, 0x80u8, 0x90u8, 0xD2u8] {
+                    let tr = target_reg as usize;
+                    let tr_len = if target_reg == 0xD2 { 1 } else { 4 };
+                    if start < tr + tr_len && end > tr {
+                        let mut val_bytes = [0u8; 4];
+                        for (i, item) in val_bytes.iter_mut().enumerate() {
+                            *item = dev.get_byte(target_reg.wrapping_add(i as u8));
+                        }
+                        acpi_write = Some((target_reg, u32::from_le_bytes(val_bytes)));
                     }
-                    acpi_write = Some((reg, u32::from_le_bytes(val_bytes)));
                 }
             }
             // Detect writes to IDE Controller BAR4 (device 1, function 1, reg 0x20)
-            if dev_num == 1 && fn_num == 1 && byte_off >= 0x20 && byte_off < 0x24 {
-                let raw_bar = (dev.config_regs[0x20] as u32)
-                    | ((dev.config_regs[0x21] as u32) << 8)
-                    | ((dev.config_regs[0x22] as u32) << 16)
-                    | ((dev.config_regs[0x23] as u32) << 24);
-                if raw_bar != 0xFFFFFFFF && raw_bar != 0 {
-                    let iobase = (raw_bar & 0xFFF0) as u16;
-                    if iobase != 0 && iobase >= 0x400 {
-                        ide_bmdma_new_iobase = Some(iobase);
-                    }
+            if dev_num == 1 && fn_num == 1 && touches_bar_hi(0x20) && !dev.is_bar_sizing(4) {
+                let iobase = (dev.read_bar_raw(4) & 0xFFF0) as u16;
+                if iobase == 0 || iobase >= 0x400 {
+                    ide_bmdma_new_iobase = Some(iobase);
                 }
             }
             // Detect writes to USB UHCI BAR4 (device 1, function 2, reg 0x20)
-            if dev_num == 1 && fn_num == 2 && byte_off >= 0x20 && byte_off < 0x24 {
-                let raw_bar = (dev.config_regs[0x20] as u32)
-                    | ((dev.config_regs[0x21] as u32) << 8)
-                    | ((dev.config_regs[0x22] as u32) << 16)
-                    | ((dev.config_regs[0x23] as u32) << 24);
-                // Skip sizing writes (all 1s) and 0 — only set iobase for real addresses
-                if raw_bar != 0xFFFFFFFF && raw_bar != 0 {
-                    let iobase = (raw_bar & 0xFFE0) as u16;
-                    if iobase != 0 && iobase >= 0x400 {
-                        usb_new_iobase = Some(iobase);
-                    }
+            if dev_num == 1 && fn_num == 2 && touches_bar_hi(0x20) && !dev.is_bar_sizing(4) {
+                let iobase = (dev.read_bar_raw(4) & 0xFFE0) as u16;
+                if iobase == 0 || iobase >= 0x400 {
+                    usb_new_iobase = Some(iobase);
                 }
             }
             // Detect writes to VirtIO Serial BAR0 (device 3, function 0, reg 0x10)
-            if dev_num == 3 && fn_num == 0 && byte_off >= 0x10 && byte_off < 0x14 {
-                let raw_bar = (dev.config_regs[0x10] as u32)
-                    | ((dev.config_regs[0x11] as u32) << 8)
-                    | ((dev.config_regs[0x12] as u32) << 16)
-                    | ((dev.config_regs[0x13] as u32) << 24);
-                if raw_bar != 0xFFFFFFFF && raw_bar != 0 {
-                    let iobase = (raw_bar & 0xFFC0) as u16;
-                    if iobase != 0 && iobase >= 0x400 {
-                        virtio_serial_new_iobase = Some(iobase);
-                    }
+            if dev_num == 3 && fn_num == 0 && touches_bar_hi(0x10) && !dev.is_bar_sizing(0) {
+                let iobase = (dev.read_bar_raw(0) & 0xFFC0) as u16;
+                if iobase == 0 || iobase >= 0x400 {
+                    virtio_serial_new_iobase = Some(iobase);
                 }
             }
             // Detect writes to VirtIO Net BAR0 (device 4, function 0, reg 0x10)
-            if dev_num == 4 && fn_num == 0 && byte_off >= 0x10 && byte_off < 0x14 {
-                let raw_bar = (dev.config_regs[0x10] as u32)
-                    | ((dev.config_regs[0x11] as u32) << 8)
-                    | ((dev.config_regs[0x12] as u32) << 16)
-                    | ((dev.config_regs[0x13] as u32) << 24);
-                if raw_bar != 0xFFFFFFFF && raw_bar != 0 {
-                    let iobase = (raw_bar & 0xFFE0) as u16;
-                    if iobase != 0 && iobase >= 0x400 {
-                        virtio_net_new_iobase = Some(iobase);
-                    }
+            if dev_num == 4 && fn_num == 0 && touches_bar_hi(0x10) && !dev.is_bar_sizing(0) {
+                let iobase = (dev.read_bar_raw(0) & 0xFFE0) as u16;
+                if iobase == 0 || iobase >= 0x400 {
+                    virtio_net_new_iobase = Some(iobase);
                 }
             }
             // Detect writes to SATA AHCI BAR5 (device 5, function 0, reg 0x24)
-            if dev_num == 5 && fn_num == 0 && byte_off >= 0x24 && byte_off < 0x28 {
-                let raw_bar = (dev.config_regs[0x24] as u32)
-                    | ((dev.config_regs[0x25] as u32) << 8)
-                    | ((dev.config_regs[0x26] as u32) << 16)
-                    | ((dev.config_regs[0x27] as u32) << 24);
-                if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) == 0 {
-                    let base = raw_bar & 0xFFFF_F000;
-                    ahci_new_mmio_base = Some(base);
-                }
+            if dev_num == 5 && fn_num == 0 && touches_bar_hi(0x24) && !dev.is_bar_sizing(5) {
+                let base = dev.read_bar_raw(5) & 0xFFFF_F000;
+                ahci_new_mmio_base = Some(base);
             }
             // Detect writes to VMMDev (device 6, function 0)
             if dev_num == 6 && fn_num == 0 {
-                // BAR0 (reg 0x10): I/O space 32 bytes
-                if byte_off >= 0x10 && byte_off < 0x14 {
-                    let raw_bar = (dev.config_regs[0x10] as u32)
-                        | ((dev.config_regs[0x11] as u32) << 8)
-                        | ((dev.config_regs[0x12] as u32) << 16)
-                        | ((dev.config_regs[0x13] as u32) << 24);
-                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) != 0 {
-                        let iobase = (raw_bar & 0xFFE0) as u16;
-                        if iobase != 0 && iobase >= 0x400 {
-                            vmmdev_new_iobase = Some(iobase);
-                        }
+                if touches_bar_hi(0x10) && !dev.is_bar_sizing(0) {
+                    let iobase = (dev.read_bar_raw(0) & 0xFFE0) as u16;
+                    if iobase == 0 || iobase >= 0x400 {
+                        vmmdev_new_iobase = Some(iobase);
                     }
                 }
-                // BAR1 (reg 0x14): MMIO space 16 KiB
-                if byte_off >= 0x14 && byte_off < 0x18 {
-                    let raw_bar = (dev.config_regs[0x14] as u32)
-                        | ((dev.config_regs[0x15] as u32) << 8)
-                        | ((dev.config_regs[0x16] as u32) << 16)
-                        | ((dev.config_regs[0x17] as u32) << 24);
-                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) == 0 {
-                        let base = raw_bar & 0xFFFF_C000;
-                        vmmdev_new_mmio_base = Some(base);
-                    }
+                if touches_bar_hi(0x14) && !dev.is_bar_sizing(1) {
+                    let base = dev.read_bar_raw(1) & 0xFFFF_C000;
+                    vmmdev_new_mmio_base = Some(base);
                 }
             }
             // Detect writes to AC'97 Audio (device 7, function 0)
             if dev_num == 7 && fn_num == 0 {
-                // BAR0 (reg 0x10): NAMBAR I/O space 256 bytes
-                if byte_off >= 0x10 && byte_off < 0x14 {
-                    let raw_bar = (dev.config_regs[0x10] as u32)
-                        | ((dev.config_regs[0x11] as u32) << 8)
-                        | ((dev.config_regs[0x12] as u32) << 16)
-                        | ((dev.config_regs[0x13] as u32) << 24);
-                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) != 0 {
-                        let iobase = (raw_bar & 0xFF00) as u16;
-                        if iobase != 0 && iobase >= 0x400 {
-                            ac97_new_nam_iobase = Some(iobase);
-                        }
+                if touches_bar_hi(0x10) && !dev.is_bar_sizing(0) {
+                    let iobase = (dev.read_bar_raw(0) & 0xFF00) as u16;
+                    if iobase == 0 || iobase >= 0x400 {
+                        ac97_new_nam_iobase = Some(iobase);
                     }
                 }
-                // BAR1 (reg 0x14): NABMBAR I/O space 64 bytes
-                if byte_off >= 0x14 && byte_off < 0x18 {
-                    let raw_bar = (dev.config_regs[0x14] as u32)
-                        | ((dev.config_regs[0x15] as u32) << 8)
-                        | ((dev.config_regs[0x16] as u32) << 16)
-                        | ((dev.config_regs[0x17] as u32) << 24);
-                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) != 0 {
-                        let iobase = (raw_bar & 0xFFC0) as u16;
-                        if iobase != 0 && iobase >= 0x400 {
-                            ac97_new_nabm_iobase = Some(iobase);
-                        }
+                if touches_bar_hi(0x14) && !dev.is_bar_sizing(1) {
+                    let iobase = (dev.read_bar_raw(1) & 0xFFC0) as u16;
+                    if iobase == 0 || iobase >= 0x400 {
+                        ac97_new_nabm_iobase = Some(iobase);
                     }
                 }
             }
             // Detect writes to Intel e1000 (device 8, function 0)
             if dev_num == 8 && fn_num == 0 {
-                // BAR0 (reg 0x10): MMIO 128 KiB
-                if byte_off >= 0x10 && byte_off < 0x14 {
-                    let raw_bar = (dev.config_regs[0x10] as u32)
-                        | ((dev.config_regs[0x11] as u32) << 8)
-                        | ((dev.config_regs[0x12] as u32) << 16)
-                        | ((dev.config_regs[0x13] as u32) << 24);
-                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) == 0 {
-                        let base = raw_bar & 0xFFFE_0000;
-                        e1000_new_mmio_base = Some(base);
-                    }
+                if touches_bar_hi(0x10) && !dev.is_bar_sizing(0) {
+                    let base = dev.read_bar_raw(0) & 0xFFFE_0000;
+                    e1000_new_mmio_base = Some(base);
                 }
-                // BAR1 (reg 0x14): I/O space 64 bytes
-                if byte_off >= 0x14 && byte_off < 0x18 {
-                    let raw_bar = (dev.config_regs[0x14] as u32)
-                        | ((dev.config_regs[0x15] as u32) << 8)
-                        | ((dev.config_regs[0x16] as u32) << 16)
-                        | ((dev.config_regs[0x17] as u32) << 24);
-                    if raw_bar != 0xFFFFFFFF && raw_bar != 0 && (raw_bar & 1) != 0 {
-                        let iobase = (raw_bar & 0xFFC0) as u16;
-                        if iobase != 0 && iobase >= 0x400 {
-                            e1000_new_iobase = Some(iobase);
-                        }
+                if touches_bar_hi(0x14) && !dev.is_bar_sizing(1) {
+                    let iobase = (dev.read_bar_raw(1) & 0xFFC0) as u16;
+                    if iobase == 0 || iobase >= 0x400 {
+                        e1000_new_iobase = Some(iobase);
                     }
                 }
             }
@@ -627,7 +635,7 @@ impl PciBus {
         if let Some(new_base) = usb_new_iobase {
             self.last_usb_bar_write = Some(new_base);
             if let Some(ref usb_state) = self.usb_uhci {
-                let mut state = usb_state.lock().unwrap();
+                let mut state = usb_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.iobase != new_base {
                     state.iobase = new_base;
                     eprintln!("[PCI] USB UHCI I/O base: 0x{:04X} (dev 1:2 BAR4)", new_base);
@@ -636,7 +644,7 @@ impl PciBus {
         }
         if let Some(new_base) = virtio_serial_new_iobase {
             if let Some(ref vs_state) = self.virtio_serial {
-                let mut state = vs_state.lock().unwrap();
+                let mut state = vs_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.iobase != new_base {
                     state.iobase = new_base;
                     eprintln!("[PCI] VirtIO Serial I/O base: 0x{:04X} (dev 3:0 BAR0)", new_base);
@@ -645,7 +653,7 @@ impl PciBus {
         }
         if let Some(new_base) = virtio_net_new_iobase {
             if let Some(ref vn_state) = self.virtio_net {
-                let mut state = vn_state.lock().unwrap();
+                let mut state = vn_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.iobase != new_base {
                     state.iobase = new_base;
                     eprintln!("[PCI] VirtIO Net I/O base: 0x{:04X} (dev 4:0 BAR0)", new_base);
@@ -659,7 +667,7 @@ impl PciBus {
         if let Some(new_base) = vmmdev_new_iobase {
             self.last_vmmdev_io_bar_write = Some(new_base);
             if let Some(ref vmm_state) = self.vmmdev {
-                let mut state = vmm_state.lock().unwrap();
+                let mut state = vmm_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.iobase != new_base {
                     state.iobase = new_base;
                     eprintln!("[PCI] VMMDev I/O base: 0x{:04X} (dev 6:0 BAR0)", new_base);
@@ -669,7 +677,7 @@ impl PciBus {
         if let Some(new_base) = vmmdev_new_mmio_base {
             self.last_vmmdev_mmio_bar_write = Some(new_base);
             if let Some(ref vmm_state) = self.vmmdev {
-                let mut state = vmm_state.lock().unwrap();
+                let mut state = vmm_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.mmio_base != new_base {
                     state.mmio_base = new_base;
                     eprintln!("[PCI] VMMDev MMIO base: 0x{:08X} (dev 6:0 BAR1)", new_base);
@@ -679,7 +687,7 @@ impl PciBus {
         if let Some(new_base) = ac97_new_nam_iobase {
             self.last_ac97_nam_bar_write = Some(new_base);
             if let Some(ref ac97_state) = self.ac97 {
-                let mut state = ac97_state.lock().unwrap();
+                let mut state = ac97_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.nambar != new_base {
                     state.nambar = new_base;
                     eprintln!("[PCI] AC'97 NAMBAR I/O base: 0x{:04X} (dev 7:0 BAR0)", new_base);
@@ -689,7 +697,7 @@ impl PciBus {
         if let Some(new_base) = ac97_new_nabm_iobase {
             self.last_ac97_nabm_bar_write = Some(new_base);
             if let Some(ref ac97_state) = self.ac97 {
-                let mut state = ac97_state.lock().unwrap();
+                let mut state = ac97_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.nabmbar != new_base {
                     state.nabmbar = new_base;
                     eprintln!("[PCI] AC'97 NABMBAR I/O base: 0x{:04X} (dev 7:0 BAR1)", new_base);
@@ -699,7 +707,7 @@ impl PciBus {
         if let Some(new_base) = e1000_new_mmio_base {
             self.last_e1000_mmio_bar_write = Some(new_base);
             if let Some(ref e_state) = self.e1000 {
-                let mut state = e_state.lock().unwrap();
+                let mut state = e_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.mmio_base != new_base {
                     state.mmio_base = new_base;
                     eprintln!("[PCI] Intel e1000 MMIO base: 0x{:08X} (dev 8:0 BAR0)", new_base);
@@ -709,7 +717,7 @@ impl PciBus {
         if let Some(new_base) = e1000_new_iobase {
             self.last_e1000_io_bar_write = Some(new_base);
             if let Some(ref e_state) = self.e1000 {
-                let mut state = e_state.lock().unwrap();
+                let mut state = e_state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.iobase != new_base {
                     state.iobase = new_base;
                     eprintln!("[PCI] Intel e1000 I/O base: 0x{:04X} (dev 8:0 BAR1)", new_base);
@@ -731,18 +739,27 @@ impl Default for PciBus {
 
 impl IoDevice for PciBus {
     fn matches_port(&self, port: u16) -> bool {
-        matches!(port, PORT_ADDR | PORT_DATA | 0xCFD | 0xCFE | 0xCFF)
+        matches!(port, PORT_ADDR | PORT_RESET_CTRL | PORT_DATA | 0xCFD | 0xCFE | 0xCFF)
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {
         if data.is_empty() { return; }
         match port {
             PORT_ADDR => {
-                let addr = (data[0] as u32)
-                    | ((data.get(1).copied().unwrap_or(0) as u32) << 8)
-                    | ((data.get(2).copied().unwrap_or(0) as u32) << 16)
-                    | ((data.get(3).copied().unwrap_or(0x80) as u32) << 24);
-                self.addr_reg = addr & 0x80FF_FFFC;
+                // Solo las escrituras de 32 bits actualizan CONFIG_ADDRESS (PCI Local Bus Spec)
+                if data.len() == 4 {
+                    let addr = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    self.addr_reg = addr & 0x80FF_FFFC;
+                }
+            }
+            PORT_RESET_CTRL => {
+                let old = self.reset_ctrl;
+                let val = data[0];
+                self.reset_ctrl = val & 0x0E;
+                // Flanco 0 -> 1 en bit 2 (RST_CPU) dispara reset de sistema
+                if (old & 0x04) == 0 && (val & 0x04) != 0 {
+                    self.reset_requested = true;
+                }
             }
             PORT_DATA | 0xCFD | 0xCFE | 0xCFF => {
                 if self.access_enabled() {
@@ -754,18 +771,21 @@ impl IoDevice for PciBus {
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        if port == PORT_RESET_CTRL {
+            let mut out = vec![0xFF; count];
+            if !out.is_empty() {
+                out[0] = self.reset_ctrl;
+            }
+            return out;
+        }
         if matches!(port, PORT_DATA | 0xCFD | 0xCFE | 0xCFF) {
             if !self.access_enabled() {
                 return vec![0xFF; count];
             }
             self.read_bytes(port, count)
         } else {
-            vec![
-                self.addr_reg as u8,
-                ((self.addr_reg >> 8) & 0xFF) as u8,
-                ((self.addr_reg >> 16) & 0xFF) as u8,
-                ((self.addr_reg >> 24) & 0x8F) as u8,
-            ]
+            let bytes = (self.addr_reg & 0x80FF_FFFC).to_le_bytes();
+            (0..count).map(|i| *bytes.get(i).unwrap_or(&0)).collect()
         }
     }
 }
@@ -798,10 +818,15 @@ impl PciBus {
         self.last_vmmdev_mmio_bar_write = None;
         self.last_ac97_nam_bar_write = None;
         self.last_ac97_nabm_bar_write = None;
+        self.reset_ctrl = 0;
+        self.reset_requested = false;
         self.last_e1000_mmio_bar_write = None;
         self.last_e1000_io_bar_write = None;
         self.devices = vec![vec![None; 8]; 32];
         self.populate_legacy_devices();
+        let pri = self.ide_pri_enabled;
+        let sec = self.ide_sec_enabled;
+        self.set_ide_channels_enabled(pri, sec);
     }
 
     /// Puebla el bus con el layout QEMU-compatible i440FX + PIIX3.
@@ -880,8 +905,8 @@ impl PciBus {
         // ── Device 2: Bochs VBE Display Adapter (1234:1111) ──
         let mut vga = PciDevice::new(0x1234, 0x1111, 0x03, 0x00, 0x00);
         vga.revision = 0x02;
-        // BAR0 (reg 0x10): 16 MiB Framebuffer Memory (prefetchable)
-        vga.set_bar_mask(0x10, 0xFF00_0008);
+        // BAR0 (reg 0x10): 64 MiB Framebuffer Memory (prefetchable, soporta 4K / double-buffer KMS)
+        vga.set_bar_mask(0x10, 0xFC00_0008);
         // BAR2 (reg 0x18): 4 KiB MMIO
         vga.set_bar_mask(0x18, 0xFFFF_F000);
         self.add_device(2, 0, vga);
@@ -896,7 +921,7 @@ impl PciBus {
         vs.config_regs[0x2E] = 0x03; // Subsystem Device ID low
         vs.config_regs[0x2F] = 0x00; // Subsystem Device ID high
         vs.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
-        vs.config_regs[0x3C] = 10;   // Default IRQ line 10
+        vs.config_regs[0x3C] = 11;   // Default IRQ line 11 (LNKC -> 0x62 = 11)
         // BAR0 (reg 0x10): I/O space, 64 bytes -> mask 0xFFFFFFC1
         vs.set_bar_mask(0x10, 0xFFFFFFC1);
         self.add_device(3, 0, vs);
@@ -911,7 +936,7 @@ impl PciBus {
         vn.config_regs[0x2E] = 0x01; // Subsystem Device ID low (0x0001 = Net)
         vn.config_regs[0x2F] = 0x00; // Subsystem Device ID high
         vn.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
-        vn.config_regs[0x3C] = 9;    // Default IRQ line 9
+        vn.config_regs[0x3C] = 11;   // Default IRQ line 11 (LNKD -> 0x63 = 11; evita colisión con SCI IRQ 9)
         // BAR0 (reg 0x10): I/O space, 32 bytes -> mask 0xFFFFFFE1
         vn.set_bar_mask(0x10, 0xFFFFFFE1);
         self.add_device(4, 0, vn);
@@ -927,6 +952,8 @@ impl PciBus {
         ahci.config_regs[0x70] = 0x01; // PCI Power Management
         ahci.config_regs[0x71] = 0xA8; // Next Cap -> 0xA8
         ahci.config_regs[0x72] = 0x03;
+        ahci.set_ro(0x70);
+        ahci.set_ro(0x71);
 
         // Registros Propietarios Intel ICH8M (DevAHCI.cpp:5791-5795)
         ahci.config_regs[0x90] = 0x40; // MAP: Sub-Class Code = AHCI Mode (Requerido por msahci.sys)
@@ -941,6 +968,9 @@ impl PciBus {
         ahci.config_regs[0xAA] = 0x10; // Revision 1.0
         ahci.config_regs[0xAB] = 0x00;
         ahci.config_regs[0xAC] = 0x28; // SATACR1: BAR5 en offset 0x24
+        for r in 0xA8..=0xAF {
+            ahci.set_ro(r);
+        }
 
         ahci.interrupt_pin = 0x01; // INTA#
         ahci.config_regs[0x2C] = 0x86; // Subsystem Vendor ID low (Intel)
@@ -948,7 +978,7 @@ impl PciBus {
         ahci.config_regs[0x2E] = 0x29; // Subsystem Device ID low (ICH8M)
         ahci.config_regs[0x2F] = 0x28; // Subsystem Device ID high
         ahci.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
-        ahci.config_regs[0x3C] = 10;   // Default IRQ line 10
+        ahci.config_regs[0x3C] = 10;   // Default IRQ line 10 (LNKA -> 0x60 = 10)
         // BAR5 (reg 0x24): 4 KiB MMIO non-prefetchable -> mask 0xFFFFF000
         ahci.set_bar_mask(0x24, 0xFFFF_F000);
         self.add_device(5, 0, ahci);
@@ -962,7 +992,7 @@ impl PciBus {
         vmmdev.config_regs[0x2E] = 0xFE; // Subsystem Device ID low (VMMDev)
         vmmdev.config_regs[0x2F] = 0xCA; // Subsystem Device ID high
         vmmdev.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
-        vmmdev.config_regs[0x3C] = 11;   // Default IRQ line 11 (shared with USB UHCI)
+        vmmdev.config_regs[0x3C] = 10;   // Default IRQ line 10 (LNKB -> 0x61 = 10)
         // BAR0 (reg 0x10): 32 bytes I/O space -> mask 0xFFFF_FFE1
         vmmdev.set_bar_mask(0x10, 0xFFFF_FFE1);
         // BAR1 (reg 0x14): 16 KiB MMIO -> mask 0xFFFF_C000
@@ -978,7 +1008,7 @@ impl PciBus {
         ac97.config_regs[0x2E] = 0x00; // Subsystem Device ID low
         ac97.config_regs[0x2F] = 0x00; // Subsystem Device ID high
         ac97.config_regs[0x3D] = 0x01; // Interrupt Pin INTA#
-        ac97.config_regs[0x3C] = 5;    // Default IRQ line 5 (Audio)
+        ac97.config_regs[0x3C] = 11;   // Default IRQ line 11 (LNKC -> 0x62 = 11)
         // BAR0 (reg 0x10): NAMBAR 256 bytes I/O space -> mask 0xFFFF_FF01
         ac97.set_bar_mask(0x10, 0xFFFF_FF01);
         // BAR1 (reg 0x14): NABMBAR 64 bytes I/O space -> mask 0xFFFF_FFC1

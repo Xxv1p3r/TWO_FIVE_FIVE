@@ -102,16 +102,14 @@ pub const PORT_SSTS_PRESENT_GEN3: u32 = 0x0000_0133; // DET=3 (Ready), SPD=3 (Ge
 #[allow(dead_code)]
 pub const PORT_SSTS_PRESENT_GEN2: u32 = 0x0000_0123; // DET=3 (Ready), SPD=2 (Gen2), IPM=1 (Active)
 
-#[allow(dead_code)]
 pub const ATA_STATUS_BUSY: u8 = 0x80;
 pub const ATA_STATUS_DRDY: u8 = 0x40;
-#[allow(dead_code)]
 pub const ATA_STATUS_DRQ: u8 = 0x08;
 pub const ATA_STATUS_ERR: u8 = 0x01;
 
 pub const CD_SECTOR_SIZE: usize = 2048;
 
-/// Representación del estado de un puerto SATA individual (0 a 1).
+/// Representación del estado de un puerto SATA individual (0 a 2).
 #[derive(Debug)]
 pub struct AhciPort {
     #[allow(dead_code)]
@@ -132,6 +130,10 @@ pub struct AhciPort {
     pub serr: u32,
     pub sact: u32,
     pub ci: u32,
+    pub sense_key: u8,
+    pub sense_asc: u8,
+    pub sense_ascq: u8,
+    pub media_changed: bool,
 }
 
 impl AhciPort {
@@ -148,12 +150,22 @@ impl AhciPort {
             ie: 0,
             cmd: PORT_CMD_SUD | PORT_CMD_POD,
             tfd: 0x7F, // Estado inicial reset/busy
-            sig: if is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA },
+            sig: if !present {
+                0xFFFF_FFFF
+            } else if is_atapi {
+                PORT_SIG_ATAPI
+            } else {
+                PORT_SIG_ATA
+            },
             ssts: if present { PORT_SSTS_PRESENT_GEN3 } else { 0 },
             sctl: 0,
             serr: 0,
             sact: 0,
             ci: 0,
+            sense_key: 0,
+            sense_asc: 0,
+            sense_ascq: 0,
+            media_changed: false,
         };
         if is_atapi {
             port.cmd |= PORT_CMD_ATAPI;
@@ -179,12 +191,22 @@ impl AhciPort {
         if self.present {
             self.tfd = 0x150; // Unidad lista: Status = 0x50 (DRDY | DSC), Error = 0x01
         }
-        self.sig = if self.is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA };
+        self.sig = if !self.present {
+            0xFFFF_FFFF
+        } else if self.is_atapi {
+            PORT_SIG_ATAPI
+        } else {
+            PORT_SIG_ATA
+        };
         self.ssts = if self.present { PORT_SSTS_PRESENT_GEN3 } else { 0 };
         self.sctl = 0;
         self.serr = 0;
         self.sact = 0;
         self.ci = 0;
+        self.sense_key = 0;
+        self.sense_asc = 0;
+        self.sense_ascq = 0;
+        self.media_changed = false;
     }
 
     #[inline]
@@ -224,8 +246,11 @@ pub struct AhciController {
     pub ram_disk: Option<Vec<u8>>,
     /// Modo de instalación desatendida activado
     pub unattended: bool,
+    pub unattended_os: crate::unattended::GuestOsType,
+    pub unattended_config: crate::unattended::UnattendedConfig,
     pub sectors_read_total: u64,
     pub sectors_written_total: u64,
+    pub cdrom_sectors_read_total: u64,
     /// Buffers reutilizables para evitar asignaciones de heap por cada comando DMA/NCQ
     io_buf: Vec<u8>,
     prd_buf: Vec<(u64, usize)>,
@@ -265,8 +290,11 @@ impl AhciController {
             aux_disk_size: 0,
             ram_disk: None,
             unattended: false,
+            unattended_os: crate::unattended::GuestOsType::Unknown,
+            unattended_config: crate::unattended::UnattendedConfig::default(),
             sectors_read_total: 0,
             sectors_written_total: 0,
+            cdrom_sectors_read_total: 0,
             io_buf: Vec::with_capacity(64 * 1024),
             prd_buf: Vec::with_capacity(32),
         }
@@ -294,6 +322,7 @@ impl AhciController {
         }
         if !disk_mounted {
             ctrl.ports[0].present = false;
+            ctrl.ports[0].sig = 0xFFFF_FFFF;
             ctrl.ports[0].ssts = 0;
             ctrl.ports[0].tfd = 0x7F;
         }
@@ -317,10 +346,45 @@ impl AhciController {
         }
         if !iso_mounted {
             ctrl.ports[1].present = false;
+            ctrl.ports[1].sig = 0xFFFF_FFFF;
             ctrl.ports[1].ssts = 0;
             ctrl.ports[1].tfd = 0x7F;
         }
         ctrl
+    }
+
+    pub fn is_iso_inserted(&self) -> bool {
+        self.iso_file.is_some() || self.iso_size > 0
+    }
+
+    pub fn eject_iso(&mut self) {
+        self.iso_file = None;
+        self.iso_size = 0;
+        self.ports[1].sense_key = 0x06; // UNIT ATTENTION
+        self.ports[1].sense_asc = 0x28; // NOT READY TO READY CHANGE / MEDIUM MAY HAVE CHANGED
+        self.ports[1].sense_ascq = 0x00;
+        self.ports[1].media_changed = true;
+        eprintln!("[AHCI] Puerto 1: Medio óptico expulsado.");
+    }
+
+    pub fn insert_iso(&mut self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut f = OpenOptions::new().read(true).open(path)?;
+        let size = f.seek(SeekFrom::End(0))?;
+        let _ = f.seek(SeekFrom::Start(0));
+        self.iso_file = Some(f);
+        self.iso_size = size;
+        self.ports[1].present = true;
+        self.ports[1].sig = PORT_SIG_ATAPI;
+        self.ports[1].ssts = PORT_SSTS_PRESENT_GEN3;
+        self.ports[1].tfd = 0x150;
+        self.ports[1].sense_key = 0x06;
+        self.ports[1].sense_asc = 0x28;
+        self.ports[1].sense_ascq = 0x00;
+        self.ports[1].media_changed = true;
+        self.ports[1].is |= PORT_IS_PCS;
+        self.update_irq();
+        eprintln!("[AHCI] Puerto 1: Nueva ISO insertada ('{}', {} MiB)", path, size / (1024 * 1024));
+        Ok(size)
     }
 
     /// Adjunta un disco auxiliar (ej. imagen OEMDRV para instalación desatendida) en el Puerto 2.
@@ -393,14 +457,17 @@ impl AhciController {
 
     /// Despacha una lectura MMIO dentro del rango BAR5 del AHCI (0x0000 .. 0x0FFF).
     pub fn read(&mut self, offset: u64, size: usize) -> Vec<u8> {
-        let reg_offset = (offset & 0x0FFF) as u32;
-        let dword_val = self.read_reg_u32(reg_offset);
-        let shift = ((reg_offset & 3) * 8) as usize;
-        let val = dword_val >> shift;
-
         let mut res = vec![0u8; size];
-        for (i, item) in res.iter_mut().enumerate() {
-            *item = ((val >> (i * 8)) & 0xFF) as u8;
+        let mut pos = 0usize;
+        while pos < size {
+            let cur_off = ((offset + pos as u64) & 0x0FFF) as u32;
+            let dword_val = self.read_reg_u32(cur_off & !3);
+            let byte_in_dw = (cur_off & 3) as usize;
+            let take = (4 - byte_in_dw).min(size - pos);
+            for i in 0..take {
+                res[pos + i] = ((dword_val >> ((byte_in_dw + i) * 8)) & 0xFF) as u8;
+            }
+            pos += take;
         }
         res
     }
@@ -457,23 +524,39 @@ impl AhciController {
         }
     }
 
-    /// Despacha una escritura MMIO dentro del rango BAR5 del AHCI.
+    /// Despacha una escritura MMIO dentro del rango BAR5 del AHCI (soporta 1, 2, 4 y 8 bytes).
     pub fn write(&mut self, offset: u64, data: &[u8], mem: Option<&GuestMemory>) {
         if data.is_empty() {
             return;
         }
-        let reg_offset = (offset & 0x0FFF) as u32;
-        let mut dword = self.read_reg_u32(reg_offset & !3);
-        let shift = (reg_offset & 3) as usize;
-        for (i, &b) in data.iter().enumerate() {
-            let byte_pos = shift + i;
-            if byte_pos < 4 {
-                let mask = !(0xFF << (byte_pos * 8));
-                dword = (dword & mask) | ((b as u32) << (byte_pos * 8));
-            }
-        }
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let cur_off = ((offset + pos as u64) & 0x0FFF) as u32;
+            let reg_aligned = cur_off & !3;
+            let shift = (cur_off & 3) as usize;
+            let take = (4 - shift).min(data.len() - pos);
 
-        self.write_reg_u32(reg_offset & !3, dword, mem);
+            // Registros R/WC o R/W1S no deben hacer RMW de bits no escritos en escrituras parciales
+            let is_rwc_or_rw1s = if reg_aligned < 0x100 {
+                reg_aligned == HOST_IRQ_STAT
+            } else {
+                let pr = (reg_aligned - 0x100) % 0x80;
+                matches!(pr, PORT_IS | PORT_SERR | PORT_SACT | PORT_CI)
+            };
+
+            let mut dword = if take == 4 || is_rwc_or_rw1s {
+                0u32
+            } else {
+                self.read_reg_u32(reg_aligned)
+            };
+            for i in 0..take {
+                let byte_pos = shift + i;
+                let mask = !(0xFF << (byte_pos * 8));
+                dword = (dword & mask) | ((data[pos + i] as u32) << (byte_pos * 8));
+            }
+            self.write_reg_u32(reg_aligned, dword, mem);
+            pos += take;
+        }
     }
 
     fn write_reg_u32(&mut self, reg: u32, val: u32, mem: Option<&GuestMemory>) {
@@ -493,7 +576,12 @@ impl AhciController {
                     self.is &= !val;
                 }
                 HOST_BOHC => {
-                    self.bohc = val;
+                    // OOS (bit 1) toma propiedad del OS y limpia BOS (bit 0)
+                    let mut next = (self.bohc & 0x03) | (val & 0x1E);
+                    if (val & 0x02) != 0 {
+                        next &= !0x01; // Clear BOS
+                    }
+                    self.bohc = next;
                 }
                 _ => {}
             }
@@ -522,17 +610,20 @@ impl AhciController {
                         let old_fre = (port.cmd & PORT_CMD_FRE) != 0;
                         let new_fre = (val & PORT_CMD_FRE) != 0;
 
-                        let mut new_cmd = (port.cmd & (PORT_CMD_CR | PORT_CMD_FR | PORT_CMD_ATAPI))
-                            | (val & !(PORT_CMD_CR | PORT_CMD_FR));
+                        // CLO (bit 3) y ICC (bits 31:28) se auto-limpian tras ejecutarse
+                        if (val & (1 << 3)) != 0 {
+                            port.tfd &= !((ATA_STATUS_BUSY | ATA_STATUS_DRQ) as u32);
+                        }
+                        let mut new_cmd = (port.cmd & PORT_CMD_ATAPI)
+                            | (val & !(PORT_CMD_CR | PORT_CMD_FR | (1 << 3) | (0xF << 28)));
                         if (val & PORT_CMD_ST) != 0 {
                             new_cmd |= PORT_CMD_CR;
                         } else {
-                            new_cmd &= !PORT_CMD_CR;
+                            port.ci = 0;
+                            port.sact = 0;
                         }
                         if new_fre {
                             new_cmd |= PORT_CMD_FR;
-                        } else {
-                            new_cmd &= !PORT_CMD_FR;
                         }
                         port.cmd = new_cmd;
 
@@ -564,10 +655,19 @@ impl AhciController {
                         let new_det = val & 0x0F;
                         port.sctl = val;
 
-                        // Secuencia de reset DET = 1 seguido de DET = 0, o cuando se escriba reset (DET = 1)
-                        if (old_det == 1 && new_det == 0) || (new_det == 1) {
+                        if new_det == 1 {
+                            // COMRESET activo: el enlace cae mientras DET=1
+                            port.ssts = 0;
+                            port.serr = 0;
+                            port.tfd = 0x7F;
+                            port.ci = 0;
+                            port.sact = 0;
+                        } else if new_det == 4 {
+                            port.ssts = 0;
+                        } else if new_det == 0 && (old_det == 1 || old_det == 4) {
+                            // Fin de COMRESET o reactivación PHY: subir enlace
                             if port.present {
-                                port.ssts = 0x123;
+                                port.ssts = PORT_SSTS_PRESENT_GEN2;
                                 port.serr = 0;
                                 port.sig = if port.is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA };
                                 port.tfd = 0x150;
@@ -578,8 +678,8 @@ impl AhciController {
                                         if let Some(guest_memory) = mem {
                                             let mut d2h = [0u8; 20];
                                             d2h[0] = 0x34; // FIS Type: Register D2H
-                                            d2h[1] = 0x00; // Interrupt bit (I)
-                                            d2h[2] = 0x50; // Status (DRDY | DSC, bit 5 ATA_DF apagado)
+                                            d2h[1] = 0x00;
+                                            d2h[2] = 0x50; // Status (DRDY | DSC)
                                             d2h[3] = 0x01; // Error
                                             d2h[4] = 0x01; // LBA low
                                             d2h[5] = if port.is_atapi { 0x14 } else { 0x00 };
@@ -595,10 +695,9 @@ impl AhciController {
                             } else {
                                 port.ssts = 0;
                                 port.serr = 0;
+                                port.sig = 0xFFFF_FFFF;
                                 port.tfd = 0x7F;
                             }
-                        } else if new_det == 4 {
-                            port.ssts = 0;
                         }
                     }
                     PORT_SERR => port.serr &= !val, // R/WC
@@ -623,6 +722,10 @@ impl AhciController {
 
     /// Procesa los comandos pendientes marcados en `PxCI` del puerto especificado.
     pub fn process_commands(&mut self, port_idx: usize, mem: &GuestMemory) {
+        if !self.ports[port_idx].present {
+            self.ports[port_idx].ci = 0;
+            return;
+        }
         let ci_mask = self.ports[port_idx].ci;
         if ci_mask == 0 {
             return;
@@ -634,6 +737,7 @@ impl AhciController {
 
         let mut io_buf = std::mem::take(&mut self.io_buf);
         let mut prd_entries = std::mem::take(&mut self.prd_buf);
+        let mut ncq_sact_done = 0u32;
 
         for slot in 0..32 {
             if (ci_mask & (1 << slot)) == 0 {
@@ -644,13 +748,14 @@ impl AhciController {
             let dw0 = mem.read_u32(cmd_hdr_addr as usize);
             let prdtl = ((dw0 >> 16) & 0xFFFF) as usize;
             let cmd_is_atapi = (dw0 & (1 << 5)) != 0 || is_atapi;
-            let _is_write = (dw0 & (1 << 6)) != 0;
+            let is_write = (dw0 & (1 << 6)) != 0;
+            let is_cmd_reset = (dw0 & (1 << 8)) != 0;
 
             let ctba_low = mem.read_u32((cmd_hdr_addr + 8) as usize) as u64;
             let ctba_high = mem.read_u32((cmd_hdr_addr + 12) as usize) as u64;
             let ctba = ((ctba_high << 32) | ctba_low) & !0x7F;
 
-            // Leer Command FIS (20 bytes estándar)
+            // Leer Command FIS (64 bytes)
             let mut cfis = [0u8; 64];
             let _ = mem.copy_from(ctba as usize, &mut cfis);
 
@@ -678,12 +783,23 @@ impl AhciController {
             // Ejecución del comando
             let fis_type = cfis[0];
             let mut bytes_transferred: usize = 0;
-            let mut status: u8 = ATA_STATUS_DRDY;
+            let mut status: u8 = ATA_STATUS_DRDY | 0x10; // DRDY | DSC
             let mut error: u8 = 0;
             let mut is_ncq = false;
             let mut is_pio = false;
+            let mut is_softreset_assert = false;
+            let mut is_softreset_deassert = false;
+            let mut emit_atapi_sig = false;
 
-            if fis_type == 0x27 { // Register FIS - Host to Device
+            if fis_type == 0x27 && (cfis[1] & 0x80) == 0 {
+                // H2D Control FIS (Soft Reset SRST: libata ahci_do_softreset)
+                if is_cmd_reset || (cfis[15] & 0x04) != 0 {
+                    is_softreset_assert = true;
+                } else {
+                    is_softreset_deassert = true;
+                }
+            } else if fis_type == 0x27 {
+                // Register FIS - Host to Device (C=1)
                 let command = cfis[2];
                 if !is_atapi {
                     // ─── Comandos ATA para Disco Duro (Puerto 0 y Puerto 2) ───
@@ -770,34 +886,46 @@ impl AhciController {
                         }
                         0x90 => {
                             // EXECUTE DEVICE DIAGNOSTIC (0x01 = Passed, no error)
-                            status = ATA_STATUS_DRDY;
+                            status = ATA_STATUS_DRDY | 0x10;
                             error = 0x01;
                         }
-                        0xEF | 0x00 | 0x06 | 0x08 | 0x10..=0x1F | 0x40..=0x42 | 0xB0 | 0x27 | 0xF5 | 0xF8
-                        | 0x91 | 0xC6 | 0xDA | 0xDE | 0xDF | 0xE0..=0xE6 | 0xE8 => {
-                            // 0x06: DATA SET MANAGEMENT (TRIM / Discard en NTFS)
-                            // 0x08: DEVICE RESET
-                            // 0x40..=0x42: READ VERIFY SECTORS (Requerido por particionadores MBR/GPT)
-                            // 0xB0: SMART (Chequeos de salud de disco de Windows)
-                            // 0x27/0xF8: READ NATIVE MAX ADDRESS / EXT
-                            // 0xEF: SET FEATURES, 0x00: NOP, 0x10..=0x1F: RECALIBRATE
-                            // 0x91: INITIALIZE DEVICE PARAMETERS
-                            // 0xC6: SET MULTIPLE MODE
-                            // 0xDA/0xDE/0xDF: Media status y lock/unlock
-                            // 0xE0..=0xE3: Standby/Idle power management
-                            // 0xE4/0xE8: Read/Write Buffer
-                            // 0xE5: CHECK POWER MODE
-                            // 0xE6: SLEEP
-                            // 0xF5: SECURITY FREEZE LOCK
-                            status = ATA_STATUS_DRDY;
+                        0xEF | 0x00 | 0x06 | 0x10..=0x1F | 0x40..=0x42
+                        | 0x91 | 0xC6 | 0xDA | 0xDE | 0xDF | 0xE0..=0xE6 | 0xE8 | 0xF5 => {
+                            status = ATA_STATUS_DRDY | 0x10;
+                            error = 0;
+                        }
+                        0x27 | 0xF8 => {
+                            // READ NATIVE MAX ADDRESS / EXT: devolver max_lba real
+                            let max_lba = if port_idx == 2 {
+                                (self.aux_disk_size / 512).saturating_sub(1)
+                            } else {
+                                (self.disk_size / 512).saturating_sub(1)
+                            };
+                            cfis[4] = (max_lba & 0xFF) as u8;
+                            cfis[5] = ((max_lba >> 8) & 0xFF) as u8;
+                            cfis[6] = ((max_lba >> 16) & 0xFF) as u8;
+                            if command == 0x27 {
+                                cfis[7] = (cfis[7] & 0xF0) | (((max_lba >> 24) & 0x0F) as u8);
+                            } else {
+                                cfis[8] = ((max_lba >> 24) & 0xFF) as u8;
+                                cfis[9] = ((max_lba >> 32) & 0xFF) as u8;
+                                cfis[10] = ((max_lba >> 40) & 0xFF) as u8;
+                            }
+                            status = ATA_STATUS_DRDY | 0x10;
                             error = 0;
                         }
                         0x2F => {
-                            // READ LOG EXT (Página de diagnóstico y directorio de logs ATA/NCQ)
+                            // READ LOG EXT (PIO)
+                            is_pio = true;
                             let log_buf = [0u8; 512];
                             bytes_transferred = copy_to_prd(mem, &prd_entries, &log_buf);
-                            status = ATA_STATUS_DRDY;
+                            status = ATA_STATUS_DRDY | 0x10;
                             error = 0;
+                        }
+                        0xB0 | 0x08 => {
+                            // SMART no anunciado en IDENTIFY Word 82; 0x08 es solo ATAPI
+                            status = ATA_STATUS_DRDY | ATA_STATUS_ERR;
+                            error = 0x04; // ABRT
                         }
                         _ => {
                             eprintln!("[AHCI] Puerto {}: comando ATA no implementado: 0x{:02X}", port_idx, command);
@@ -816,10 +944,56 @@ impl AhciController {
                         }
                         0xA0 => {
                             // PACKET (SCSI Command)
-                            let scsi_res = self.execute_scsi(&acmd);
-                            if let Some(buf) = scsi_res {
-                                bytes_transferred = copy_to_prd(mem, &prd_entries, &buf);
+                            match self.execute_scsi_port(port_idx, &acmd) {
+                                Ok(buf) => {
+                                    if !buf.is_empty() {
+                                        bytes_transferred = copy_to_prd(mem, &prd_entries, &buf);
+                                        if (cfis[3] & 0x01) == 0 {
+                                            is_pio = true;
+                                        }
+                                    }
+                                    status = ATA_STATUS_DRDY | 0x10;
+                                    error = 0;
+                                }
+                                Err((sk, asc, ascq)) => {
+                                    self.ports[port_idx].sense_key = sk;
+                                    self.ports[port_idx].sense_asc = asc;
+                                    self.ports[port_idx].sense_ascq = ascq;
+                                    status = ATA_STATUS_DRDY | 0x10 | ATA_STATUS_ERR;
+                                    error = (sk & 0x0F) << 4;
+                                }
                             }
+                        }
+                        0xEF => {
+                            // SET FEATURES (requerido por libata ata_dev_set_xfermode)
+                            status = ATA_STATUS_DRDY | 0x10;
+                            error = 0;
+                        }
+                        0x08 => {
+                            // ATAPI DEVICE RESET
+                            self.ports[port_idx].sense_key = 0;
+                            self.ports[port_idx].sense_asc = 0;
+                            self.ports[port_idx].sense_ascq = 0;
+                            emit_atapi_sig = true;
+                            status = ATA_STATUS_DRDY | 0x10;
+                            error = 0x01;
+                        }
+                        0xEC => {
+                            // IDENTIFY DEVICE sobre ATAPI debe abortar con firma ATAPI (libata probe)
+                            emit_atapi_sig = true;
+                            status = ATA_STATUS_DRDY | ATA_STATUS_ERR;
+                            error = 0x04;
+                        }
+                        0x00 | 0xE0..=0xE3 | 0xE5 => {
+                            // NOP, Standby/Idle, CHECK POWER MODE
+                            status = ATA_STATUS_DRDY | 0x10;
+                            error = 0;
+                        }
+                        0x90 => {
+                            // EXECUTE DEVICE DIAGNOSTIC
+                            emit_atapi_sig = true;
+                            status = ATA_STATUS_DRDY | 0x10;
+                            error = 0x01;
                         }
                         _ => {
                             eprintln!("[AHCI] Puerto 1: comando ATAPI no implementado: 0x{:02X}", command);
@@ -830,28 +1004,60 @@ impl AhciController {
                 }
             }
 
+            if is_softreset_assert {
+                let port = &mut self.ports[port_idx];
+                port.tfd = ATA_STATUS_BUSY as u32;
+                port.ci &= !(1 << slot);
+                continue;
+            }
+
+            if is_softreset_deassert {
+                let port = &mut self.ports[port_idx];
+                port.sense_key = 0;
+                port.sense_asc = 0;
+                port.sense_ascq = 0;
+                port.sig = if is_atapi { PORT_SIG_ATAPI } else { PORT_SIG_ATA };
+                port.tfd = 0x150;
+                if fb_addr != 0 {
+                    let mut d2h = [0u8; 20];
+                    d2h[0] = 0x34;
+                    d2h[1] = 0x40;
+                    d2h[2] = 0x50;
+                    d2h[3] = 0x01;
+                    d2h[4] = 0x01;
+                    d2h[5] = if is_atapi { 0x14 } else { 0x00 };
+                    d2h[6] = if is_atapi { 0xEB } else { 0x00 };
+                    d2h[12] = 0x01;
+                    let _ = mem.copy_to((fb_addr + 0x40) as usize, &d2h);
+                }
+                port.ci &= !(1 << slot);
+                port.is |= PORT_IS_DHRS;
+                continue;
+            }
+
             // Actualizar PRD Byte Count (PRDBC) en la cabecera de comando
             mem.write_u32((cmd_hdr_addr + 4) as usize, bytes_transferred as u32);
 
             // Generar FIS correspondiente en el área de FIS recibidos del puerto
             if fb_addr != 0 {
                 if is_ncq {
-                    // Set Device Bits FIS (0xA1) en FB + 0x58 (8 bytes)
+                    ncq_sact_done |= 1u32 << slot;
                     let mut sdb_fis = [0u8; 8];
                     sdb_fis[0] = 0xA1; // FIS Type: Set Device Bits
-                    sdb_fis[1] = 0x40; // Bit 6 = Interrupt Bit (I)
+                    sdb_fis[1] = 0x40; // Interrupt Bit (I)
                     sdb_fis[2] = status;
                     sdb_fis[3] = error;
-                    sdb_fis[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+                    sdb_fis[4..8].copy_from_slice(&ncq_sact_done.to_le_bytes());
                     let _ = mem.copy_to((fb_addr + 0x58) as usize, &sdb_fis);
                 } else {
                     if is_pio {
                         // PIO Setup FIS (0x5F) en FB + 0x20 (20 bytes)
                         let mut psfis = [0u8; 20];
                         psfis[0] = 0x5F; // FIS Type: PIO Setup
-                        psfis[1] = 0x40; // Interrupt bit
-                        psfis[2] = status;
+                        psfis[1] = 0x40 | if !is_write { 0x20 } else { 0x00 }; // I + D (D2H)
+                        psfis[2] = ATA_STATUS_DRDY | ATA_STATUS_DRQ; // Status durante PIO DRQ
                         psfis[3] = error;
+                        psfis[15] = status; // E_Status final tras PIO
                         psfis[16] = (bytes_transferred & 0xFF) as u8;
                         psfis[17] = ((bytes_transferred >> 8) & 0xFF) as u8;
                         let _ = mem.copy_to((fb_addr + 0x20) as usize, &psfis);
@@ -859,17 +1065,26 @@ impl AhciController {
                     // Register FIS - Device to Host (0x34) en FB + 0x40 (20 bytes)
                     let mut d2h_fis = [0u8; 20];
                     d2h_fis[0] = 0x34; // FIS Type: Register D2H
-                    d2h_fis[1] = 0x40; // Bit 6 = Interrupt Bit (I)
+                    d2h_fis[1] = 0x40; // Interrupt Bit (I)
                     d2h_fis[2] = status;
                     d2h_fis[3] = error;
                     if is_atapi {
-                        // Razón de interrupción ATAPI en el registro Sector Count (d2h[12]):
-                        // Bit 0 = C/D (Command/Data: 1 = fase comando/status, 0 = fase datos)
-                        // Bit 1 = I/O (Dirección: 1 = hacia Host (lectura), 0 = desde Host (escritura))
-                        d2h_fis[4] = 0;
-                        d2h_fis[5] = 0x14; // LBA Mid (Firma mágica ATAPI byte 1)
-                        d2h_fis[6] = 0xEB; // LBA High (Firma mágica ATAPI byte 2)
-                        d2h_fis[12] = if bytes_transferred > 0 { 0x02 } else { 0x03 };
+                        if emit_atapi_sig {
+                            d2h_fis[4] = 0x01;
+                            d2h_fis[5] = 0x14;
+                            d2h_fis[6] = 0xEB;
+                            d2h_fis[12] = 0x01;
+                        } else if cfis[2] == 0xE5 {
+                            d2h_fis[5] = 0x14;
+                            d2h_fis[6] = 0xEB;
+                            d2h_fis[12] = 0xFF;
+                        } else {
+                            // Completado de comando ATAPI: Interrupt Reason = 0x03 (C/D=1, I/O=1)
+                            d2h_fis[4] = 0;
+                            d2h_fis[5] = 0x14;
+                            d2h_fis[6] = 0xEB;
+                            d2h_fis[12] = 0x03;
+                        }
                         d2h_fis[13] = 0;
                     } else {
                         d2h_fis[4] = cfis[4];
@@ -880,11 +1095,9 @@ impl AhciController {
                         d2h_fis[9] = cfis[9];
                         d2h_fis[10] = cfis[10];
                         if cfis[2] == 0xE5 {
-                            // CHECK POWER MODE: 0xFF = Unidad activa / idle
                             d2h_fis[12] = 0xFF;
                             d2h_fis[13] = 0x00;
                         } else {
-                            // En transferencias de datos completadas sin error, el conteo de sectores restantes es 0
                             d2h_fis[12] = 0;
                             d2h_fis[13] = 0;
                         }
@@ -898,6 +1111,9 @@ impl AhciController {
             port.tfd = status as u32 | ((error as u32) << 8);
             port.ci &= !(1 << slot);
             port.sact &= !(1 << slot);
+            if (status & ATA_STATUS_ERR) != 0 {
+                port.is |= PORT_IS_TFES;
+            }
             if is_ncq {
                 port.is |= PORT_IS_SDBS;
             } else if is_pio {
@@ -1022,19 +1238,40 @@ impl AhciController {
         self.flush_sectors(0);
     }
 
-    fn read_iso_sectors(&mut self, lba: u32, count: u16, dst: &mut [u8]) {
+    fn read_iso_sectors(&mut self, lba: u32, count: u32, dst: &mut [u8]) -> Result<(), (u8, u8, u8)> {
+        if !self.is_iso_inserted() {
+            return Err((0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
+        }
+        let total_sectors = (self.iso_size + (CD_SECTOR_SIZE as u64 - 1)) / CD_SECTOR_SIZE as u64;
+        if (lba as u64) >= total_sectors || (lba as u64).saturating_add(count as u64) > total_sectors {
+            return Err((0x05, 0x21, 0x00)); // ILLEGAL REQUEST / LBA OUT OF RANGE
+        }
         let offset = (lba as u64) * CD_SECTOR_SIZE as u64;
         let total = (count as usize) * CD_SECTOR_SIZE;
         let len = dst.len().min(total);
+        if len == 0 {
+            return Ok(());
+        }
         if let Some(ref f) = self.iso_file {
-            if f.read_exact_at(&mut dst[..len], offset).is_err() {
-                dst[..len].fill(0);
-            } else if self.unattended || self.aux_disk_file.is_some() {
-                crate::unattended::patch_unattended_iso_sectors(&mut dst[..len]);
+            let avail = self.iso_size.saturating_sub(offset).min(len as u64) as usize;
+            if avail > 0 && f.read_exact_at(&mut dst[..avail], offset).is_err() {
+                return Err((0x03, 0x11, 0x00)); // MEDIUM ERROR / UNRECOVERED READ
             }
+            if avail < len {
+                dst[avail..len].fill(0);
+            }
+            if self.unattended {
+                crate::unattended::patch_unattended_iso_sectors_for_os(
+                    &mut dst[..len],
+                    self.unattended_os,
+                    &self.unattended_config,
+                );
+            }
+            self.cdrom_sectors_read_total += count as u64;
         } else {
             dst[..len].fill(0);
         }
+        Ok(())
     }
 
     // ─── Generación de Datos IDENTIFY ──────────────────────────────
@@ -1093,30 +1330,29 @@ impl AhciController {
             let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
             buf[120..124].copy_from_slice(&lba28.to_le_bytes());
 
-            buf[126] = 0x07; buf[127] = 0x07;
+            buf[126] = 0x07; buf[127] = 0x00;
             buf[128] = 0x03; buf[129] = 0x00;
             buf[130] = 120; buf[132] = 120; buf[134] = 120; buf[136] = 120;
 
             buf[150] = 31; buf[151] = 0;
-            buf[152] = 0x04; buf[153] = 0x01;
+            buf[152] = 0x0E; buf[153] = 0x01; // Gen1/2/3 + NCQ
 
             buf[160] = 0xF0; buf[161] = 0x01;
             buf[162] = 0x28; buf[163] = 0x00;
-            buf[164] = 0x78; buf[165] = 0x00;
+            buf[164] = 0x68; buf[165] = 0x00; // Sin bit 4 (PACKET)
             buf[166] = 0x00; buf[167] = 0x74;
             buf[168] = 0x00; buf[169] = 0x40;
-            buf[170] = 0x78; buf[171] = 0x00;
+            buf[170] = 0x68; buf[171] = 0x00;
             buf[172] = 0x00; buf[173] = 0x34;
             buf[174] = 0x00; buf[175] = 0x40;
-            buf[176] = 0x7F; buf[177] = 0x7F;
+            buf[176] = 0x7F; buf[177] = 0x40; // UDMA6 activo
             buf[186] = 0x01; buf[187] = 0x60;
 
             buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
 
-            let sum: u8 = buf[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-            let csum = 0u8.wrapping_sub(sum);
             buf[510] = 0xA5;
-            buf[511] = csum;
+            let sum: u8 = buf[..511].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+            buf[511] = 0u8.wrapping_sub(sum);
 
             buf
         } else {
@@ -1172,24 +1408,24 @@ impl AhciController {
         let lba28 = (total_sectors.min(0x0FFF_FFFF)) as u32;
         buf[120..124].copy_from_slice(&lba28.to_le_bytes());
 
-        // Word 63: Multiword DMA modos 0, 1, 2
-        buf[126] = 0x07; buf[127] = 0x07;
+        // Word 63: Multiword DMA modos 0, 1, 2 soportados (sin selección múltiple)
+        buf[126] = 0x07; buf[127] = 0x00;
         // Word 64: Modos PIO avanzados 3 y 4
         buf[128] = 0x03; buf[129] = 0x00;
         // Words 65-68: Tiempos de ciclo mínimos (120 ns)
         buf[130] = 120; buf[132] = 120; buf[134] = 120; buf[136] = 120;
 
-        // Words 75 & 76: Específico de Serial ATA (DevAHCI.cpp:2875-2876)
-        buf[150] = 31; buf[151] = 0; // 32 slots de comando soportados
-        buf[152] = 0x04; buf[153] = 0x01; // Gen2 3.0 Gbps + NCQ soportado
+        // Words 75 & 76: Específico de Serial ATA (32 slots, Gen1/2/3 + NCQ)
+        buf[150] = 31; buf[151] = 0;
+        buf[152] = 0x0E; buf[153] = 0x01;
 
         // Word 80: Versión mayor ATA/ATAPI-4..8
         buf[160] = 0xF0; buf[161] = 0x01;
         // Word 81: Cumplimiento ATA/ATAPI-8 ACS
         buf[162] = 0x28; buf[163] = 0x00;
 
-        // Word 82: Conjunto de Comandos Soportados (Power Mgmt, Write Cache, Look-Ahead)
-        buf[164] = 0x78; buf[165] = 0x00;
+        // Word 82: Power Mgmt, Write Cache, Look-Ahead (sin bit 4 PACKET)
+        buf[164] = 0x68; buf[165] = 0x00;
 
         // Word 83: Soporte LBA48 y FLUSH CACHE (Bit 14=1, 13=FlushExt, 12=Flush, 10=LBA48 -> 0x7400)
         buf[166] = 0x00; buf[167] = 0x74;
@@ -1197,8 +1433,8 @@ impl AhciController {
         // Word 84: Bit 14 en 1
         buf[168] = 0x00; buf[169] = 0x40;
 
-        // Word 85: Comandos habilitados por defecto
-        buf[170] = 0x78; buf[171] = 0x00;
+        // Word 85: Comandos habilitados por defecto (sin bit 4 PACKET)
+        buf[170] = 0x68; buf[171] = 0x00;
 
         // Word 86: LBA48 y FLUSH CACHE habilitados (0x3400)
         buf[172] = 0x00; buf[173] = 0x34;
@@ -1206,8 +1442,8 @@ impl AhciController {
         // Word 87: Bit 14 en 1
         buf[174] = 0x00; buf[175] = 0x40;
 
-        // Word 88: Ultra DMA modos 0..6 soportados y activos
-        buf[176] = 0x7F; buf[177] = 0x7F;
+        // Word 88: Ultra DMA modos 0..6 soportados y UDMA6 activo (0x407F)
+        buf[176] = 0x7F; buf[177] = 0x40;
 
         // Word 93: Resultado de hardware reset (0x6001)
         buf[186] = 0x01; buf[187] = 0x60;
@@ -1215,11 +1451,10 @@ impl AhciController {
         // Words 100-103: Sectores Totales LBA48 (64-bit LE)
         buf[200..208].copy_from_slice(&total_sectors.to_le_bytes());
 
-        // Word 255: Checksum de Integridad ATA (DevAHCI.cpp:2878-2879)
-        let sum: u8 = buf[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-        let csum = 0u8.wrapping_sub(sum);
+        // Word 255: Checksum de Integridad ATA (incluye 0xA5 en byte 510)
         buf[510] = 0xA5;
-        buf[511] = csum;
+        let sum: u8 = buf[..511].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        buf[511] = 0u8.wrapping_sub(sum);
 
         buf
     }
@@ -1241,16 +1476,16 @@ impl AhciController {
         pkt[98] = 0x00; pkt[99] = 0x0B;
         // Word 53: Palabras 64-70 y 88 son válidas (0x0006)
         pkt[106] = 0x06; pkt[107] = 0x00;
-        // Word 63: Multiword DMA modos 0, 1, 2 soportados y activos (0x0007)
+        // Word 63: Multiword DMA modos 0, 1, 2 soportados (0x0007)
         pkt[126] = 0x07; pkt[127] = 0x00;
         // Word 64: Modos PIO avanzados 3 y 4 (0x0003)
         pkt[128] = 0x03; pkt[129] = 0x00;
         // Words 65..68: Tiempos mínimos de ciclo (120 ns)
         pkt[130] = 120; pkt[132] = 120; pkt[134] = 120; pkt[136] = 120;
 
-        // Words 75 & 76: Específico de Serial ATA (32 slots y SATA Gen2 3.0 Gbps + NCQ)
-        pkt[150] = 31; pkt[151] = 0;
-        pkt[152] = 0x04; pkt[153] = 0x01;
+        // Words 75 & 76: ATAPI sin NCQ (Word 75 = 0, Word 76 = Gen1/2/3 sin bit 8 NCQ)
+        pkt[150] = 0; pkt[151] = 0;
+        pkt[152] = 0x0E; pkt[153] = 0x00;
 
         // Word 80: Versión mayor ATA/ATAPI-4..6 (0x007E)
         pkt[160] = 0x7E; pkt[161] = 0x00;
@@ -1268,87 +1503,86 @@ impl AhciController {
         // Word 88: Ultra DMA modos 0..5 soportados y modo 5 activo (0x207F)
         pkt[176] = 0x7F; pkt[177] = 0x20;
 
-        // Words 100..103: Total LBA (64-bit)
-        let total_lba = (self.iso_size / CD_SECTOR_SIZE as u64).max(1);
-        pkt[200..208].copy_from_slice(&total_lba.to_le_bytes());
-
-        // Word 255: Checksum de integridad ATA (DevAHCI.cpp)
-        let sum: u8 = pkt[..510].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-        let csum = 0u8.wrapping_sub(sum);
+        // Word 255: Checksum de integridad ATA (incluye 0xA5 en byte 510)
         pkt[510] = 0xA5;
-        pkt[511] = csum;
+        let sum: u8 = pkt[..511].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        pkt[511] = 0u8.wrapping_sub(sum);
 
         pkt
     }
 
     // ─── Ejecución de Comandos SCSI para ATAPI CD-ROM ──────────────
 
+    #[allow(dead_code)]
     pub fn execute_scsi(&mut self, cdb: &[u8; 16]) -> Option<Vec<u8>> {
+        self.execute_scsi_port(1, cdb).ok()
+    }
+
+    pub fn execute_scsi_port(&mut self, port_idx: usize, cdb: &[u8; 16]) -> Result<Vec<u8>, (u8, u8, u8)> {
         let opcode = cdb[0];
-        let total_sectors = (self.iso_size / CD_SECTOR_SIZE as u64).max(1) as u32;
+        let has_media = self.is_iso_inserted();
+        let total_sectors = ((self.iso_size + (CD_SECTOR_SIZE as u64 - 1)) / CD_SECTOR_SIZE as u64) as u32;
         let is_dvd = self.iso_size > 700 * 1024 * 1024;
 
-        match opcode {
+        let res = match opcode {
             0x00 => {
                 // TEST UNIT READY
-                Some(Vec::new())
+                if !has_media {
+                    return Err((0x02, 0x3A, 0x00));
+                }
+                Ok(Vec::new())
             }
             0x03 => {
-                // REQUEST SENSE
+                // REQUEST SENSE: devuelve sense almacenado y luego lo limpia
                 let alloc = cdb[4] as usize;
                 let mut sense = vec![0u8; 18];
                 sense[0] = 0x70; // Current errors
+                sense[2] = self.ports[port_idx].sense_key & 0x0F;
                 sense[7] = 10;
+                sense[12] = self.ports[port_idx].sense_asc;
+                sense[13] = self.ports[port_idx].sense_ascq;
+                self.ports[port_idx].sense_key = 0;
+                self.ports[port_idx].sense_asc = 0;
+                self.ports[port_idx].sense_ascq = 0;
                 let len = alloc.min(18);
-                Some(sense[..len].to_vec())
+                return Ok(sense[..len].to_vec());
             }
             0x08 => {
                 // READ (6)
                 let lba = (((cdb[1] & 0x1F) as u32) << 16) | ((cdb[2] as u32) << 8) | (cdb[3] as u32);
-                let mut count = cdb[4] as u16;
+                let mut count = cdb[4] as u32;
                 if count == 0 { count = 256; }
                 let total_bytes = (count as usize) * CD_SECTOR_SIZE;
                 let mut buf = vec![0u8; total_bytes];
-                self.read_iso_sectors(lba, count, &mut buf);
-                Some(buf)
+                self.read_iso_sectors(lba, count, &mut buf)?;
+                Ok(buf)
             }
             0x12 => {
-                // INQUIRY (Standard & EVPD)
+                // INQUIRY (Standard & EVPD): allocation length es u16 BE en cdb[3..5]
                 let evpd = (cdb[1] & 0x01) != 0;
                 let page_code = cdb[2];
-                let alloc = if cdb[4] == 0 && cdb[3] != 0 {
-                    cdb[3] as usize
-                } else {
-                    cdb[4] as usize
-                };
+                let alloc = u16::from_be_bytes([cdb[3], cdb[4]]) as usize;
                 let resp = if evpd {
                     match page_code {
-                        0x00 => {
-                            // Supported VPD Pages
-                            vec![0x05, 0x00, 0x00, 0x03, 0x00, 0x80, 0x83]
-                        }
+                        0x00 => vec![0x05, 0x00, 0x00, 0x03, 0x00, 0x80, 0x83],
                         0x80 => {
-                            // Unit Serial Number
                             let serial = b"VB1234-5678";
                             let mut p = vec![0x05, 0x80, 0x00, serial.len() as u8];
                             p.extend_from_slice(serial);
                             p
                         }
                         0x83 => {
-                            // Device Identification
                             let mut p = vec![0x05, 0x83, 0x00, 0x14, 0x02, 0x01, 0x00, 0x10];
                             p.extend_from_slice(b"VBOX    VB123456");
                             p
                         }
-                        _ => {
-                            vec![0x05, page_code, 0x00, 0x00]
-                        }
+                        _ => return Err((0x05, 0x24, 0x00)), // INVALID FIELD IN CDB
                     }
                 } else {
                     let mut inq = vec![0u8; 96];
                     inq[0] = 0x05; // CD-ROM
                     inq[1] = 0x80; // Removable
-                    inq[2] = 0x02; // SPC-2
+                    inq[2] = 0x05; // SPC-3
                     inq[3] = 0x02;
                     inq[4] = 91;   // Additional length
                     inq[8..16].copy_from_slice(b"VBOX    ");
@@ -1357,108 +1591,152 @@ impl AhciController {
                     inq
                 };
                 let send_len = alloc.min(resp.len());
-                Some(resp[..send_len].to_vec())
+                Ok(resp[..send_len].to_vec())
             }
             0x1A => {
                 // MODE SENSE (6)
                 let alloc = cdb[4] as usize;
-                let mut ms = vec![0u8; 36];
-                ms[0] = 35;
-                ms[2] = 0x80; // Write protected
-                ms[4] = 0x2A; // Page 0x2A (CD capabilities)
-                ms[5] = 0x1E;
-                let len = alloc.min(36);
-                Some(ms[..len].to_vec())
+                let page_code = cdb[2] & 0x3F;
+                if page_code == 0x2A || page_code == 0x3F {
+                    let mut ms = vec![0u8; 36];
+                    ms[0] = 35;
+                    ms[2] = 0x80; // Write protected
+                    ms[4] = 0x2A;
+                    ms[5] = 0x1E;
+                    ms[6] = 0x3F; // CD-R/RW/Method2/DVD-ROM/DVD-R/DVD-RAM read
+                    ms[8] = 0x71;
+                    ms[10] = 0x29;
+                    ms[12] = 0x02; ms[13] = 0xC0;
+                    ms[18] = 0x02; ms[19] = 0xC0;
+                    let len = alloc.min(ms.len());
+                    Ok(ms[..len].to_vec())
+                } else {
+                    let mut ms = vec![0u8; 4];
+                    ms[0] = 3;
+                    ms[2] = 0x80;
+                    let len = alloc.min(ms.len());
+                    Ok(ms[..len].to_vec())
+                }
             }
             0x1B | 0x1E | 0x2B | 0x35 => {
                 // START/STOP UNIT, PREVENT/ALLOW, SEEK (10), SYNCHRONIZE CACHE
-                Some(Vec::new())
+                Ok(Vec::new())
             }
             0x23 => {
                 // READ FORMAT CAPACITIES
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
                 let mut cap = vec![0u8; 12];
                 cap[3] = 8; // Capacity list length
-                cap[4..8].copy_from_slice(&total_sectors.to_be_bytes());
-                cap[8] = 0x02; // Formatted media
+                cap[4..8].copy_from_slice(&total_sectors.max(1).to_be_bytes());
+                cap[8] = if has_media { 0x02 } else { 0x03 }; // Formatted vs No Media
                 cap[9..12].copy_from_slice(&[0x00, 0x08, 0x00]); // 2048 sector size
                 let len = alloc.min(12);
-                Some(cap[..len].to_vec())
+                Ok(cap[..len].to_vec())
             }
             0x25 => {
                 // READ CAPACITY (10)
+                if !has_media {
+                    return Err((0x02, 0x3A, 0x00));
+                }
                 let last_lba = total_sectors.saturating_sub(1);
                 let block_size = CD_SECTOR_SIZE as u32;
                 let mut cap = vec![0u8; 8];
                 cap[0..4].copy_from_slice(&last_lba.to_be_bytes());
                 cap[4..8].copy_from_slice(&block_size.to_be_bytes());
-                Some(cap)
+                Ok(cap)
             }
             0x28 | 0xA8 => {
                 // READ (10) / READ (12)
                 let (lba, count) = if opcode == 0x28 {
                     let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
-                    let count = u16::from_be_bytes([cdb[7], cdb[8]]);
+                    let count = u16::from_be_bytes([cdb[7], cdb[8]]) as u32;
                     (lba, count)
                 } else {
                     let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
-                    let count = (u32::from_be_bytes([cdb[6], cdb[7], cdb[8], cdb[9]]) & 0xFFFF) as u16;
+                    let count = u32::from_be_bytes([cdb[6], cdb[7], cdb[8], cdb[9]]);
                     (lba, count)
                 };
+                if count > 4096 {
+                    return Err((0x05, 0x24, 0x00));
+                }
                 let total_bytes = (count as usize) * CD_SECTOR_SIZE;
                 let mut buf = vec![0u8; total_bytes];
-                self.read_iso_sectors(lba, count, &mut buf);
-                Some(buf)
+                self.read_iso_sectors(lba, count, &mut buf)?;
+                Ok(buf)
             }
             0x43 => {
-                // READ TOC (con soporte MSF y formato multi-sesión)
+                // READ TOC (con soporte MSF acotado para ISOs > 2.2 GiB)
+                if !has_media {
+                    return Err((0x02, 0x3A, 0x00));
+                }
                 let msf = (cdb[1] & 0x02) != 0;
                 let format = cdb[2] & 0x0F;
+                let track = cdb[6];
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
                 let lba_to_msf = |lba: u32| -> [u8; 4] {
+                    let total_m = lba / (75 * 60);
+                    if total_m > 0xFF {
+                        return [0x00, 0xFF, 59, 74];
+                    }
                     let f = (lba % 75) as u8;
                     let s = ((lba / 75) % 60) as u8;
-                    let m = (lba / (75 * 60)) as u8;
+                    let m = total_m as u8;
                     [0x00, m, s, f]
                 };
 
                 let buf = match format {
                     0 => {
-                        // Standard TOC: Header (4 bytes) + Track 1 (8 bytes) + Lead-out (8 bytes) = 20 bytes
-                        let mut toc = vec![0u8; 20];
-                        let len: u16 = 18;
-                        toc[0..2].copy_from_slice(&len.to_be_bytes());
-                        toc[2] = 1; // First track
-                        toc[3] = 1; // Last track
-                        // Track 1
-                        toc[4] = 0;
-                        toc[5] = 0x14; // ADR=1, Data track
-                        toc[6] = 1;
-                        toc[7] = 0;
-                        if msf {
-                            toc[8..12].copy_from_slice(&lba_to_msf(150));
+                        if track == 0xAA {
+                            let mut toc = vec![0u8; 12];
+                            let len: u16 = 10;
+                            toc[0..2].copy_from_slice(&len.to_be_bytes());
+                            toc[2] = 1;
+                            toc[3] = 1;
+                            toc[5] = 0x14;
+                            toc[6] = 0xAA;
+                            if msf {
+                                toc[8..12].copy_from_slice(&lba_to_msf(total_sectors.saturating_add(150)));
+                            } else {
+                                toc[8..12].copy_from_slice(&total_sectors.to_be_bytes());
+                            }
+                            toc
+                        } else if track <= 1 {
+                            let mut toc = vec![0u8; 20];
+                            let len: u16 = 18;
+                            toc[0..2].copy_from_slice(&len.to_be_bytes());
+                            toc[2] = 1; // First track
+                            toc[3] = 1; // Last track
+                            // Track 1
+                            toc[4] = 0;
+                            toc[5] = 0x14; // ADR=1, Data track
+                            toc[6] = 1;
+                            toc[7] = 0;
+                            if msf {
+                                toc[8..12].copy_from_slice(&lba_to_msf(150));
+                            } else {
+                                toc[8..12].copy_from_slice(&0u32.to_be_bytes());
+                            }
+                            // Lead-out track 0xAA
+                            toc[12] = 0;
+                            toc[13] = 0x14;
+                            toc[14] = 0xAA;
+                            toc[15] = 0;
+                            if msf {
+                                toc[16..20].copy_from_slice(&lba_to_msf(total_sectors.saturating_add(150)));
+                            } else {
+                                toc[16..20].copy_from_slice(&total_sectors.to_be_bytes());
+                            }
+                            toc
                         } else {
-                            toc[8..12].copy_from_slice(&0u32.to_be_bytes());
+                            return Err((0x05, 0x24, 0x00));
                         }
-                        // Lead-out track 0xAA
-                        toc[12] = 0;
-                        toc[13] = 0x14;
-                        toc[14] = 0xAA;
-                        toc[15] = 0;
-                        if msf {
-                            toc[16..20].copy_from_slice(&lba_to_msf(total_sectors + 150));
-                        } else {
-                            toc[16..20].copy_from_slice(&total_sectors.to_be_bytes());
-                        }
-                        toc
                     }
                     1 => {
-                        // Multi-session info: Header (4 bytes) + Track info (8 bytes) = 12 bytes
                         let mut toc = vec![0u8; 12];
                         let len: u16 = 10;
                         toc[0..2].copy_from_slice(&len.to_be_bytes());
-                        toc[2] = 1; // First session
-                        toc[3] = 1; // Last session
+                        toc[2] = 1;
+                        toc[3] = 1;
                         toc[4] = 0;
                         toc[5] = 0x14;
                         toc[6] = 1;
@@ -1470,103 +1748,107 @@ impl AhciController {
                         }
                         toc
                     }
-                    _ => vec![0u8; 4],
+                    _ => return Err((0x05, 0x24, 0x00)),
                 };
                 let send_len = alloc.min(buf.len());
-                Some(buf[..send_len].to_vec())
+                Ok(buf[..send_len].to_vec())
             }
             0x46 => {
-                // GET CONFIGURATION (Soporte completo MMC Feature Descriptors)
+                // GET CONFIGURATION (filtra por RT y Starting Feature Number)
+                let rt = cdb[1] & 0x03;
+                let start_feat = u16::from_be_bytes([cdb[2], cdb[3]]);
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
-                let cur_profile: u16 = if is_dvd { 0x0010 } else { 0x0008 };
-                let mut conf = vec![0u8; 88];
-                let data_len: u32 = 84; // 88 - 4
-                conf[0..4].copy_from_slice(&data_len.to_be_bytes());
+                let cur_profile: u16 = if !has_media {
+                    0x0000
+                } else if is_dvd {
+                    0x0010
+                } else {
+                    0x0008
+                };
+
+                let features: [(u16, bool, &[u8]); 9] = [
+                    (0x0000, true, &[
+                        0x00, 0x00, 0x03, 8,
+                        0x00, 0x10, if has_media && is_dvd { 1 } else { 0 }, 0x00,
+                        0x00, 0x08, if has_media && !is_dvd { 1 } else { 0 }, 0x00,
+                    ]),
+                    (0x0001, true, &[
+                        0x00, 0x01, (2 << 2) | 0x03, 8,
+                        0x00, 0x00, 0x00, 0x02,
+                        0x01, 0x00, 0x00, 0x00,
+                    ]),
+                    (0x0002, true, &[0x00, 0x02, 0x03, 4, 0x02, 0x00, 0x00, 0x00]),
+                    (0x0003, true, &[0x00, 0x03, 0x03, 4, 0x29, 0x00, 0x00, 0x00]),
+                    (0x0010, has_media, &[
+                        0x00, 0x10, if has_media { 0x03 } else { 0x02 }, 8,
+                        0x00, 0x00, 0x08, 0x00,
+                        0x00, 0x01, 0x00, 0x00,
+                    ]),
+                    (0x001E, has_media && !is_dvd, &[
+                        0x00, 0x1E, if has_media && !is_dvd { 0x03 } else { 0x02 }, 4,
+                        0x03, 0x00, 0x00, 0x00,
+                    ]),
+                    (0x001F, has_media && is_dvd, &[
+                        0x00, 0x1F, if has_media && is_dvd { 0x03 } else { 0x02 }, 4,
+                        0x00, 0x00, 0x00, 0x00,
+                    ]),
+                    (0x0100, true, &[0x01, 0x00, 0x03, 0]),
+                    (0x0105, true, &[0x01, 0x05, 0x03, 4, 0x00, 0x00, 0x00, 0x00]),
+                ];
+
+                let mut conf = vec![0u8; 8];
                 conf[6..8].copy_from_slice(&cur_profile.to_be_bytes());
-
-                let mut off = 8;
-                // Feature 0000h: Profile List
-                conf[off..off+2].copy_from_slice(&0x0000u16.to_be_bytes());
-                conf[off+2] = 0x03; // Version 0, persistent, current
-                conf[off+3] = 8;    // 8 additional bytes
-                conf[off+4..off+6].copy_from_slice(&0x0010u16.to_be_bytes()); // DVD-ROM
-                conf[off+6] = if is_dvd { 1 } else { 0 }; // Current
-                conf[off+8..off+10].copy_from_slice(&0x0008u16.to_be_bytes()); // CD-ROM
-                conf[off+10] = if is_dvd { 0 } else { 1 }; // Current
-                off += 12;
-
-                // Feature 0001h: Core Feature
-                conf[off..off+2].copy_from_slice(&0x0001u16.to_be_bytes());
-                conf[off+2] = (2 << 2) | 0x03; // Version 2, persistent, current
-                conf[off+3] = 8;
-                conf[off+4..off+8].copy_from_slice(&2u32.to_be_bytes()); // Physical ATAPI
-                conf[off+8] = 1; // DBE
-                off += 12;
-
-                // Feature 0002h: Morphing
-                conf[off..off+2].copy_from_slice(&0x0002u16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 4;
-                conf[off+4] = 2; // ASYNCH
-                off += 8;
-
-                // Feature 0003h: Removable Medium
-                conf[off..off+2].copy_from_slice(&0x0003u16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 4;
-                conf[off+4] = 0x20; // Lockable
-                off += 8;
-
-                // Feature 0010h: Random Readable
-                conf[off..off+2].copy_from_slice(&0x0010u16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 8;
-                conf[off+4..off+8].copy_from_slice(&2048u32.to_be_bytes()); // Block size 2048
-                conf[off+8..off+10].copy_from_slice(&1u16.to_be_bytes());   // Blocking 1
-                off += 12;
-
-                // Feature 001Eh: CD Read
-                conf[off..off+2].copy_from_slice(&0x001Eu16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 4;
-                conf[off+4] = 0x03; // CD-Text, DAP
-                off += 8;
-
-                // Feature 001Fh: DVD Read
-                conf[off..off+2].copy_from_slice(&0x001Fu16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 4;
-                off += 8;
-
-                // Feature 0100h: Power Management
-                conf[off..off+2].copy_from_slice(&0x0100u16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 0;
-                off += 4;
-
-                // Feature 0105h: Timeout
-                conf[off..off+2].copy_from_slice(&0x0105u16.to_be_bytes());
-                conf[off+2] = 0x03;
-                conf[off+3] = 4;
-                off += 8;
-
-                let actual_len = off.min(conf.len());
-                let send_len = alloc.min(actual_len);
-                Some(conf[..send_len].to_vec())
+                for (feat_id, is_cur, bytes) in features {
+                    let include = match rt {
+                        0 => feat_id >= start_feat,
+                        1 => feat_id >= start_feat && is_cur,
+                        2 => feat_id == start_feat,
+                        _ => false,
+                    };
+                    if include {
+                        conf.extend_from_slice(bytes);
+                    }
+                }
+                let data_len = (conf.len() - 4) as u32;
+                conf[0..4].copy_from_slice(&data_len.to_be_bytes());
+                let send_len = alloc.min(conf.len());
+                Ok(conf[..send_len].to_vec())
             }
             0x4A => {
-                // GET EVENT STATUS NOTIFICATION
+                // GET EVENT STATUS NOTIFICATION (bit 1 de ev[5] = Media Present!)
+                if (cdb[1] & 0x01) == 0 {
+                    return Err((0x05, 0x24, 0x00));
+                }
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
-                let mut ev = vec![0u8; 8];
-                let len: u16 = 4;
-                ev[0..2].copy_from_slice(&len.to_be_bytes());
-                ev[2] = 0x84; // NEA | class 4 (Media)
-                ev[4] = 0x02; // Media present
-                let send_len = alloc.min(8);
-                Some(ev[..send_len].to_vec())
+                let req_classes = cdb[4];
+                if (req_classes & 0x10) != 0 {
+                    let mut ev = vec![0u8; 8];
+                    ev[0..2].copy_from_slice(&6u16.to_be_bytes()); // Event Descriptor Length = 6
+                    ev[2] = 0x04; // NEA=0, Notification Class = 4 (Media)
+                    ev[3] = 0x10; // Supported Event Classes = Media (bit 4)
+                    ev[4] = if self.ports[port_idx].media_changed {
+                        self.ports[port_idx].media_changed = false;
+                        if has_media { 0x02 } else { 0x03 } // NewMedia / MediaRemoval
+                    } else {
+                        0x00 // NoChg
+                    };
+                    ev[5] = if has_media { 0x02 } else { 0x00 }; // Bit 1 = Media Present
+                    let send_len = alloc.min(8);
+                    Ok(ev[..send_len].to_vec())
+                } else {
+                    let mut ev = vec![0u8; 4];
+                    ev[0..2].copy_from_slice(&2u16.to_be_bytes());
+                    ev[2] = 0x80; // NEA=1
+                    ev[3] = 0x10;
+                    let send_len = alloc.min(4);
+                    Ok(ev[..send_len].to_vec())
+                }
             }
             0x51 => {
                 // READ DISC INFORMATION
+                if !has_media {
+                    return Err((0x02, 0x3A, 0x00));
+                }
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
                 let mut info = vec![0u8; 34];
                 let len: u16 = 32;
@@ -1579,10 +1861,13 @@ impl AhciController {
                 info[7] = 0x20;
                 info[8] = if is_dvd { 0x10 } else { 0x00 };
                 let send_len = alloc.min(34);
-                Some(info[..send_len].to_vec())
+                Ok(info[..send_len].to_vec())
             }
             0x52 => {
                 // READ TRACK INFORMATION
+                if !has_media {
+                    return Err((0x02, 0x3A, 0x00));
+                }
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
                 let mut info = vec![0u8; 36];
                 let len: u16 = 34;
@@ -1594,66 +1879,66 @@ impl AhciController {
                 info[8..12].copy_from_slice(&0u32.to_be_bytes());
                 info[24..28].copy_from_slice(&total_sectors.to_be_bytes());
                 let send_len = alloc.min(36);
-                Some(info[..send_len].to_vec())
+                Ok(info[..send_len].to_vec())
             }
             0x5A => {
                 // MODE SENSE (10)
                 let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
                 let page_code = cdb[2] & 0x3F;
-                let mut ms = vec![0u8; 44];
-                let mode_len: u16 = 42;
-                ms[0..2].copy_from_slice(&mode_len.to_be_bytes());
-                ms[3] = 0x80; // Write protected
-                ms[8] = 0x2A; // Page 0x2A
-                ms[9] = 0x1E;
-                ms[16] = 0x02; ms[17] = 0xC0; // max read speed (4x)
-                ms[22] = 0x02; ms[23] = 0xC0;
-                let len = alloc.min(if page_code == 0x2A || page_code == 0x3F { 44 } else { 8 });
-                Some(ms[..len].to_vec())
+                if page_code == 0x2A || page_code == 0x3F {
+                    let mut ms = vec![0u8; 44];
+                    let mode_len: u16 = (ms.len() - 2) as u16;
+                    ms[0..2].copy_from_slice(&mode_len.to_be_bytes());
+                    ms[3] = 0x80; // Write protected
+                    ms[8] = 0x2A; // Page 0x2A
+                    ms[9] = 0x1E;
+                    ms[10] = 0x3F; // Read caps: CD-R/RW/Method2/DVD-ROM/DVD-R/DVD-RAM
+                    ms[12] = 0x71; // AudioPlay/Composite/Digital/Mode2
+                    ms[14] = 0x29; // Tray/Lock/Eject
+                    ms[16] = 0x02; ms[17] = 0xC0;
+                    ms[22] = 0x02; ms[23] = 0xC0;
+                    let len = alloc.min(ms.len());
+                    Ok(ms[..len].to_vec())
+                } else {
+                    let mut ms = vec![0u8; 8];
+                    ms[0..2].copy_from_slice(&6u16.to_be_bytes());
+                    ms[3] = 0x80;
+                    let len = alloc.min(ms.len());
+                    Ok(ms[..len].to_vec())
+                }
             }
             0xAD => {
-                // READ DVD STRUCTURE (Crucial para Windows 7 / WinPE DVD-ROM detection)
+                // READ DVD STRUCTURE
+                if !has_media {
+                    return Err((0x02, 0x3A, 0x00));
+                }
                 let format = cdb[7];
                 let alloc = u16::from_be_bytes([cdb[8], cdb[9]]) as usize;
                 match format {
                     0x00 => {
-                        // Physical format information (MMC-2 / VirtualBox vscsiLunMmcReadDvdStructure)
                         let mut buf = vec![0u8; 2048 + 4];
                         let data_len = 2048u16 + 2u16;
                         buf[0..2].copy_from_slice(&data_len.to_be_bytes());
-                        buf[2] = 0;
-                        buf[3] = 0;
                         buf[4] = 0x01; // DVD-ROM, part version 1
-                        buf[5] = 0x0F; // 120mm disc, minimum rate unspecified
+                        buf[5] = 0x0F; // 120mm disc
                         buf[6] = 0x01; // One layer, read-only
-                        buf[7] = 0x00; // Default densities
-
-                        // Starting PSN: 0x00030000 per MMC spec
+                        buf[7] = 0x00;
                         buf[8..12].copy_from_slice(&0x0003_0000u32.to_be_bytes());
-                        let end_psn = 0x0003_0000u32.saturating_add(total_sectors.saturating_sub(1));
+                        let end_psn = 0x0003_0000u32
+                            .saturating_add(total_sectors.saturating_sub(1))
+                            .min(0x00FF_FFFF);
                         buf[12..16].copy_from_slice(&end_psn.to_be_bytes());
-                        buf[16..20].copy_from_slice(&end_psn.to_be_bytes());
-
+                        buf[16..20].copy_from_slice(&0u32.to_be_bytes());
                         let send_len = alloc.min(buf.len());
-                        Some(buf[..send_len].to_vec())
+                        Ok(buf[..send_len].to_vec())
                     }
                     0x01 => {
-                        // DVD copyright information
                         let mut buf = vec![0u8; 8];
-                        let data_len = 4u16 + 2u16;
-                        buf[0..2].copy_from_slice(&data_len.to_be_bytes());
-                        buf[2] = 0;
-                        buf[3] = 0;
-                        buf[4] = 0; // No copyright data
-                        buf[5] = 0; // No region restrictions
+                        buf[0..2].copy_from_slice(&6u16.to_be_bytes());
                         let send_len = alloc.min(8);
-                        Some(buf[..send_len].to_vec())
+                        Ok(buf[..send_len].to_vec())
                     }
-                    _ => {
-                        let buf = vec![0u8; 4];
-                        let send_len = alloc.min(4);
-                        Some(buf[..send_len].to_vec())
-                    }
+                    _ => Err((0x05, 0x24, 0x00)),
                 }
             }
             0xBD => {
@@ -1662,21 +1947,29 @@ impl AhciController {
                 let mut resp = vec![0u8; 8];
                 resp[5] = 1; // 1 slot
                 let send_len = alloc.min(8);
-                Some(resp[..send_len].to_vec())
+                Ok(resp[..send_len].to_vec())
             }
             0xBE => {
                 // READ CD
                 let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
-                let count = (((cdb[6] as u32) << 16) | ((cdb[7] as u32) << 8) | (cdb[8] as u32)) as u16;
+                let count = ((cdb[6] as u32) << 16) | ((cdb[7] as u32) << 8) | (cdb[8] as u32);
+                if count > 4096 {
+                    return Err((0x05, 0x24, 0x00));
+                }
                 let total_bytes = (count as usize) * CD_SECTOR_SIZE;
                 let mut buf = vec![0u8; total_bytes];
-                self.read_iso_sectors(lba, count, &mut buf);
-                Some(buf)
+                self.read_iso_sectors(lba, count, &mut buf)?;
+                Ok(buf)
             }
-            _ => {
-                Some(Vec::new())
-            }
+            _ => Err((0x05, 0x20, 0x00)), // INVALID COMMAND OPERATION CODE
+        };
+
+        if res.is_ok() {
+            self.ports[port_idx].sense_key = 0;
+            self.ports[port_idx].sense_asc = 0;
+            self.ports[port_idx].sense_ascq = 0;
         }
+        res
     }
 }
 

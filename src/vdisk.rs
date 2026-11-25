@@ -475,6 +475,12 @@ impl VdiDisk {
         fixed: bool,
         comment: &str,
     ) -> std::io::Result<Self> {
+        if cb_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "El tamaño de disco VDI no puede ser 0",
+            ));
+        }
         let path_buf = path.as_ref().to_path_buf();
         let img_type = if fixed {
             VdiImageType::Fixed
@@ -497,7 +503,7 @@ impl VdiDisk {
             .write(true)
             .open(&path_buf)?;
 
-        let cb_total_block_data = (header.cb_block_extra + header.cb_block) as u64;
+        let cb_total_block_data = (header.cb_block_extra as u64) + (header.cb_block as u64);
         let file_len = if fixed {
             let total_file_size =
                 header.off_data as u64 + (header.c_blocks as u64) * cb_total_block_data;
@@ -547,20 +553,66 @@ impl VdiDisk {
             .or_else(|_| OpenOptions::new().read(true).open(&path_buf))?;
 
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let header = VdiHeader::from_reader(&mut file)?;
+        let mut header = VdiHeader::from_reader(&mut file)?;
+
+        if matches!(header.image_type, VdiImageType::Diff | VdiImageType::Undo) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Imágenes VDI diferenciadoras (Diff/Undo) no soportadas",
+            ));
+        }
+        if !header.cb_block.is_power_of_two() || header.cb_block < 512 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Tamaño de bloque VDI inválido: {}", header.cb_block),
+            ));
+        }
+        let table_bytes_u64 = (header.c_blocks as u64).saturating_mul(4);
+        let table_end = (header.off_blocks as u64).checked_add(table_bytes_u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Overflow en tabla paBlocks VDI")
+        })?;
+        if table_end > header.off_data as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "La tabla paBlocks VDI se solapa con el área de datos",
+            ));
+        }
 
         // Leer tabla paBlocks desde offBlocks
         let mut raw_table = vec![0u8; (header.c_blocks as usize) * 4];
         file.read_exact_at(&mut raw_table, header.off_blocks as u64)?;
 
         let mut pa_blocks = Vec::with_capacity(header.c_blocks as usize);
+        let mut seen_phys = vec![false; header.c_blocks as usize];
+        let mut max_allocated_plus_one: u32 = 0;
         for chunk in raw_table.chunks_exact(4) {
-            pa_blocks.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            let bp = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if Self::is_block_allocated(bp) {
+                let idx = bp as usize;
+                if idx >= header.c_blocks as usize {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Puntero físico VDI fuera de rango: {}", bp),
+                    ));
+                }
+                if seen_phys[idx] {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Puntero físico VDI duplicado en paBlocks: {}", bp),
+                    ));
+                }
+                seen_phys[idx] = true;
+                max_allocated_plus_one = max_allocated_plus_one.max(bp + 1);
+            }
+            pa_blocks.push(bp);
+        }
+        if max_allocated_plus_one > header.c_blocks_allocated {
+            header.c_blocks_allocated = max_allocated_plus_one;
         }
 
         let shift_offset_to_index = header.cb_block.trailing_zeros();
         let block_mask = header.cb_block - 1;
-        let cb_total_block_data = (header.cb_block_extra + header.cb_block) as u64;
+        let cb_total_block_data = (header.cb_block_extra as u64) + (header.cb_block as u64);
 
         Ok(Self {
             path: path_buf,
@@ -599,10 +651,11 @@ impl VdiDisk {
                 dst.fill(0);
                 break;
             }
+            let rem_disk = (self.header.cb_disk - offset) as usize;
             let u_block = (offset >> self.shift_offset_to_index) as usize;
             let off_in_block = (offset as u32) & self.block_mask;
             let rem_in_block = (self.header.cb_block - off_in_block) as usize;
-            let to_read = dst.len().min(rem_in_block);
+            let to_read = dst.len().min(rem_in_block).min(rem_disk);
 
             if u_block >= self.pa_blocks.len() {
                 dst[..to_read].fill(0);
@@ -615,8 +668,14 @@ impl VdiDisk {
                         + (bp as u64) * self.cb_total_block_data
                         + (self.header.cb_block_extra as u64)
                         + (off_in_block as u64);
-                    if self.file.read_exact_at(&mut dst[..to_read], phys_off).is_err() {
+                    if phys_off >= self.file_len {
                         dst[..to_read].fill(0);
+                    } else {
+                        let avail = ((self.file_len - phys_off) as usize).min(to_read);
+                        self.file.read_exact_at(&mut dst[..avail], phys_off)?;
+                        if avail < to_read {
+                            dst[avail..to_read].fill(0);
+                        }
                     }
                 }
             }
@@ -629,17 +688,23 @@ impl VdiDisk {
 
     /// Escribe bytes a partir de `offset` asignando bloques bajo demanda (`vdiWrite` + `vdiBlockAllocUpdate`).
     pub fn write_at(&mut self, mut offset: u64, mut src: &[u8]) -> std::io::Result<()> {
+        if offset.checked_add(src.len() as u64).map_or(true, |end| end > self.header.cb_disk) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Escritura fuera de los límites del disco VDI",
+            ));
+        }
         while !src.is_empty() {
-            if offset >= self.header.cb_disk {
-                break;
-            }
             let u_block = (offset >> self.shift_offset_to_index) as usize;
             let off_in_block = (offset as u32) & self.block_mask;
             let rem_in_block = (self.header.cb_block - off_in_block) as usize;
             let to_write = src.len().min(rem_in_block);
 
             if u_block >= self.pa_blocks.len() {
-                break;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Índice de bloque VDI fuera de rango",
+                ));
             }
 
             let bp = self.pa_blocks[u_block];
@@ -660,23 +725,18 @@ impl VdiDisk {
                         + (self.header.cb_block_extra as u64);
                     let block_end_off = block_base_off + (self.header.cb_block as u64);
 
-                    if to_write == self.header.cb_block as usize {
+                    if off_in_block == 0 && to_write == self.header.cb_block as usize {
                         // Escritura de bloque completo (1 MiB)
                         self.file.write_all_at(&src[..to_write], block_base_off)?;
-                        if self.file_len < block_end_off {
-                            self.file_len = block_end_off;
-                        }
                     } else {
-                        // Escritura parcial en bloque nuevo: asegurar que el bloque completo de 1 MiB
-                        // exista y tenga ceros en las zonas pre-read y post-read
-                        if self.file_len < block_end_off {
-                            self.file.set_len(block_end_off)?;
-                            self.file_len = block_end_off;
-                        }
-                        self.file.write_all_at(
-                            &src[..to_write],
-                            block_base_off + off_in_block as u64,
-                        )?;
+                        // Escritura parcial en bloque nuevo: escribir el bloque completo inicializado a ceros
+                        let mut full_block = vec![0u8; self.header.cb_block as usize];
+                        let start = off_in_block as usize;
+                        full_block[start..start + to_write].copy_from_slice(&src[..to_write]);
+                        self.file.write_all_at(&full_block, block_base_off)?;
+                    }
+                    if self.file_len < block_end_off {
+                        self.file_len = block_end_off;
                     }
 
                     self.pa_blocks[u_block] = new_phys_block;
@@ -899,7 +959,7 @@ impl VirtualDisk {
             }
         }
 
-        let sectors = (actual_size / 512) as u32;
+        let sectors = (actual_size / 512).min(u32::MAX as u64) as u32;
         Ok(DiskInfo {
             path: p,
             format: DiskFormat::Raw,
@@ -961,10 +1021,16 @@ impl VirtualDisk {
         match &mut self.backend {
             VirtualDiskBackend::Vdi(vdi) => vdi.write_at(offset, &src[..len]),
             VirtualDiskBackend::Raw { file, size, .. } => {
-                file.write_all_at(&src[..len], offset)?;
-                if offset + (len as u64) > *size {
-                    *size = offset + (len as u64);
+                if offset
+                    .checked_add(len as u64)
+                    .map_or(true, |end| end > *size)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Escritura fuera de los límites del disco RAW",
+                    ));
                 }
+                file.write_all_at(&src[..len], offset)?;
                 Ok(())
             }
         }

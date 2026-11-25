@@ -40,13 +40,89 @@ pub const VBE_DISPI_MAX_XRES: u16 = 3840;
 pub const VBE_DISPI_MAX_YRES: u16 = 2160;
 pub const VBE_DISPI_MAX_BPP: u16 = 32;
 
-#[allow(dead_code)]
-pub const VRAM_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+pub const VRAM_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 #[allow(dead_code)]
 pub const VRAM_DEFAULT_BASE_GPA: u64 = 0xE800_0000;
 
-/// (tarea 1) Tamaño de la ventana MMIO del BAR2 (registros dispi).
+/// Tamaño de la ventana MMIO del BAR2 (registros dispi, VGA y EDID).
 pub const VGA_MMIO_BAR_SIZE: u64 = 0x1000;
+
+/// Bloque EDID 1.4 de 128 bytes para `bochs-drm` / Xorg / Wayland en PCI BAR2 + 0x00..0x80.
+const fn make_edid_128() -> [u8; 128] {
+    let mut b = [0u8; 128];
+    // Header fijo EDID
+    b[0] = 0x00; b[1] = 0xFF; b[2] = 0xFF; b[3] = 0xFF;
+    b[4] = 0xFF; b[5] = 0xFF; b[6] = 0xFF; b[7] = 0x00;
+    // Manufacturer ID "TFF"
+    b[8] = 0x50; b[9] = 0xC6;
+    // Product code + serial + week + year (2026) + EDID 1.4
+    b[10] = 0x01; b[11] = 0x00;
+    b[12] = 0x01; b[16] = 0x01; b[17] = 36;
+    b[18] = 1; b[19] = 4;
+    // Basic display: digital, 53x30cm, gamma 2.2, preferred timing
+    b[20] = 0x80; b[21] = 53; b[22] = 30; b[23] = 0x78; b[24] = 0x06;
+    // Chromaticity (sRGB)
+    b[25] = 0xEE; b[26] = 0x91; b[27] = 0xA3; b[28] = 0x54; b[29] = 0x4C;
+    b[30] = 0x99; b[31] = 0x26; b[32] = 0x0F; b[33] = 0x50; b[34] = 0x54;
+    // Established timings (VGA/VESA clásicos)
+    b[35] = 0xBF; b[36] = 0xEF; b[37] = 0x00;
+    // Standard timings (hasta 8 pares)
+    let std_timings: [(u8, u8); 8] = [
+        (0x81, 0xC0), // 1280x720@60 (16:9)
+        (0x81, 0x00), // 1280x800@60 (16:10)
+        (0x81, 0x80), // 1280x1024@60 (5:4)
+        (0x95, 0x00), // 1440x900@60 (16:10)
+        (0xA9, 0xC0), // 1600x900@60 (16:9)
+        (0xD1, 0xC0), // 1920x1080@60 (16:9)
+        (0xD1, 0x00), // 1920x1200@60 (16:10)
+        (0x01, 0x01), // unused
+    ];
+    let mut i = 0;
+    while i < 8 {
+        b[38 + i * 2] = std_timings[i].0;
+        b[38 + i * 2 + 1] = std_timings[i].1;
+        i += 1;
+    }
+    // DTD 1 (54..=71): Preferred 1024x768 @ 60Hz (65 MHz pixel clock)
+    b[54] = 0x64; b[55] = 0x19; // 6500 * 10kHz
+    b[56] = 0x00; b[57] = 0x40; b[58] = 0x41; // 1024 active, 320 blank
+    b[59] = 0x00; b[60] = 0x26; b[61] = 0x30; // 768 active, 38 blank
+    b[62] = 24;   b[63] = 136;  b[64] = 0x36; b[65] = 0x00;
+    b[66] = 0x20; b[67] = 0x20; b[68] = 0x00; b[71] = 0x18;
+    // Descriptor 2 (72..=89): Monitor Range Limits
+    let range: [u8; 18] = [
+        0x00, 0x00, 0x00, 0xFD, 0x00, 50, 120, 30, 160, 60,
+        0x00, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    ];
+    let mut k = 0;
+    while k < 18 {
+        b[72 + k] = range[k];
+        k += 1;
+    }
+    // Descriptor 3 (90..=107): Monitor Name "Two Five Five"
+    let name: [u8; 18] = [
+        0x00, 0x00, 0x00, 0xFC, 0x00,
+        b'T', b'w', b'o', b' ', b'F', b'i', b'v', b'e', b' ', b'F', b'i', b'v', b'e',
+    ];
+    let mut m = 0;
+    while m < 18 {
+        b[90 + m] = name[m];
+        m += 1;
+    }
+    // Descriptor 4 (108..=125): Dummy
+    b[108 + 3] = 0x10;
+    // Checksum byte 127
+    let mut sum: u32 = 0;
+    let mut j = 0;
+    while j < 127 {
+        sum += b[j] as u32;
+        j += 1;
+    }
+    b[127] = ((256 - (sum & 0xFF)) & 0xFF) as u8;
+    b
+}
+
+pub const EDID_128: [u8; 128] = make_edid_128();
 
 // ─── Estado interno compartido de VGA / VBE ────────────────────────
 #[derive(Clone)]
@@ -66,15 +142,19 @@ pub struct VgaState {
     pub dac_read_index: u8,
     pub dac_write_index: u8,
     pub dac_sub_index: u8,
+    pub dac_mask: u8,
     pub dac_palette: [u8; 768],
+    pub palette_gen: u64,
     pub misc_output: u8,
     pub status1_toggle: u8,
     pub vram_ptr: *mut u8,
     pub vram_size: usize,
     pub fallback_vram_ptr: *mut u8,
-    // (tarea 1) Direcciones GPA asignadas por el guest vía config space PCI:
-    // BAR0 = framebuffer lineal (16 MiB), BAR2 = registros dispi MMIO (4 KiB).
-    // El LFB arranca apuntando a la VRAM que mapea main.rs en el slot 2.
+    /// 4 planos VGA de 64 KiB c/u (256 KiB total) para ventana 0xA0000..0xB7FFF.
+    pub planes: Vec<u8>,
+    pub latch: [u8; 4],
+    // Direcciones GPA asignadas por el guest vía config space PCI:
+    // BAR0 = framebuffer lineal (64 MiB), BAR2 = registros dispi MMIO (4 KiB).
     pub lfb_base: Option<u64>,
     pub mmio_base: Option<u64>,
     pub vbe_active: bool,
@@ -83,6 +163,41 @@ pub struct VgaState {
 // Safety: VgaState pointer is managed and accessed with synchronization
 unsafe impl Send for VgaState {}
 unsafe impl Sync for VgaState {}
+
+fn default_vga_dac() -> [u8; 768] {
+    const EGA16: [(u8, u8, u8); 16] = [
+        (0, 0, 0), (0, 0, 42), (0, 42, 0), (0, 42, 42),
+        (42, 0, 0), (42, 0, 42), (42, 21, 0), (42, 42, 42),
+        (21, 21, 21), (21, 21, 63), (21, 63, 21), (21, 63, 63),
+        (63, 21, 21), (63, 21, 63), (63, 63, 21), (63, 63, 63),
+    ];
+    let mut pal = [0u8; 768];
+    for (i, &(r, g, b)) in EGA16.iter().enumerate() {
+        pal[i * 3] = r;
+        pal[i * 3 + 1] = g;
+        pal[i * 3 + 2] = b;
+    }
+    // Rampa gris 16..31 y cubo 6x6x6 básico en 32..247
+    for i in 16..32 {
+        let v = (((i - 16) * 63) / 15) as u8;
+        pal[i * 3] = v;
+        pal[i * 3 + 1] = v;
+        pal[i * 3 + 2] = v;
+    }
+    for r in 0..6u8 {
+        for g in 0..6u8 {
+            for b in 0..6u8 {
+                let idx = 32 + (r as usize) * 36 + (g as usize) * 6 + (b as usize);
+                if idx < 256 {
+                    pal[idx * 3] = r * 12;
+                    pal[idx * 3 + 1] = g * 12;
+                    pal[idx * 3 + 2] = b * 12;
+                }
+            }
+        }
+    }
+    pal
+}
 
 impl VgaState {
     pub fn new(vram_ptr: *mut u8, vram_size: usize) -> Self {
@@ -96,6 +211,13 @@ impl VgaState {
         dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] = 480;
         dispi_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K as usize] = (vram_size / (64 * 1024)) as u16;
 
+        let mut attr_regs = [0u8; 256];
+        for i in 0..16 {
+            attr_regs[i] = i as u8;
+        }
+        attr_regs[0x10] = 0x0C;
+        attr_regs[0x12] = 0x0F;
+
         Self {
             dispi_index: 0,
             dispi_regs,
@@ -107,11 +229,13 @@ impl VgaState {
             grc_regs: [0u8; 256],
             attr_index: 0,
             attr_flipflop: false,
-            attr_regs: [0u8; 256],
+            attr_regs,
             dac_read_index: 0,
             dac_write_index: 0,
             dac_sub_index: 0,
-            dac_palette: [0u8; 768],
+            dac_mask: 0xFF,
+            dac_palette: default_vga_dac(),
+            palette_gen: 0,
             misc_output: 0x23, // 80x25 text mode defaults
             status1_toggle: 0,
             lfb_base: Some(VRAM_DEFAULT_BASE_GPA),
@@ -119,6 +243,8 @@ impl VgaState {
             vram_ptr,
             vram_size,
             fallback_vram_ptr: std::ptr::null_mut(),
+            planes: vec![0u8; 4 * 65536],
+            latch: [0u8; 4],
             vbe_active: false,
         }
     }
@@ -219,26 +345,44 @@ impl VgaState {
                         self.dispi_regs[idx as usize] = val;
                     }
                 }
+                VBE_DISPI_INDEX_VIDEO_MEMORY_64K => {} // Solo lectura
                 VBE_DISPI_INDEX_ENABLE => {
+                    let was_enabled =
+                        (self.dispi_regs[idx as usize] & VBE_DISPI_ENABLED) != 0;
                     self.dispi_regs[idx as usize] = val;
                     if (val & VBE_DISPI_ENABLED) != 0 {
                         self.vbe_active = true;
-                        if self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] == 0 {
-                            self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] = self.dispi_regs[VBE_DISPI_INDEX_XRES as usize];
-                        }
-                        if self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] == 0 {
-                            self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] = self.dispi_regs[VBE_DISPI_INDEX_YRES as usize];
-                        }
-                    }
-                    // Según especificación Bochs VBE: si VBE_DISPI_NOCLEARMEM (0x80)
-                    // NO está activo al habilitar VBE, la memoria de vídeo se limpia a 0
-                    // para evitar mostrar artefactos visuales de modos previos o memoria residual.
-                    if (val & VBE_DISPI_ENABLED) != 0 && (val & VBE_DISPI_NOCLEARMEM) == 0 {
-                        if !self.vram_ptr.is_null() && self.vram_size > 0 {
-                            unsafe {
-                                std::ptr::write_bytes(self.vram_ptr, 0, self.vram_size);
+                        if !was_enabled {
+                            // Bochs VBE spec: al activar VBE (0->1) se reinicia
+                            // X/Y_OFFSET y el ancho/alto virtual si no se fijó.
+                            self.dispi_regs[VBE_DISPI_INDEX_X_OFFSET as usize] = 0;
+                            self.dispi_regs[VBE_DISPI_INDEX_Y_OFFSET as usize] = 0;
+                            self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] =
+                                self.dispi_regs[VBE_DISPI_INDEX_XRES as usize];
+                            self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] =
+                                self.dispi_regs[VBE_DISPI_INDEX_YRES as usize];
+                            if (val & VBE_DISPI_NOCLEARMEM) == 0
+                                && !self.vram_ptr.is_null()
+                                && self.vram_size > 0
+                            {
+                                unsafe {
+                                    std::ptr::write_bytes(self.vram_ptr, 0, self.vram_size);
+                                }
+                            }
+                        } else {
+                            if self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] == 0 {
+                                self.dispi_regs[VBE_DISPI_INDEX_VIRT_WIDTH as usize] =
+                                    self.dispi_regs[VBE_DISPI_INDEX_XRES as usize];
+                            }
+                            if self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] == 0 {
+                                self.dispi_regs[VBE_DISPI_INDEX_VIRT_HEIGHT as usize] =
+                                    self.dispi_regs[VBE_DISPI_INDEX_YRES as usize];
                             }
                         }
+                    } else if (val & VBE_DISPI_GETCAPS) == 0 {
+                        // Al desactivar VBE explícitamente (no solo GETCAPS), permitir
+                        // volver al renderizador texto/planar VGA.
+                        self.vbe_active = false;
                     }
                     eprintln!(
                         "[VGA] VBE Enable=0x{:02X}: {}x{}@{}bpp",
@@ -305,15 +449,23 @@ impl VgaState {
                 } else {
                     let idx = self.attr_index as usize;
                     self.attr_regs[idx] = data[0];
+                    self.palette_gen = self.palette_gen.wrapping_add(1);
                 }
                 self.attr_flipflop = !self.attr_flipflop;
             }
             0x3C2 => self.misc_output = data[0],
-            0x3C4 => self.seq_index = data[0],
+            0x3C3 => {} // Video Subsystem Enable
+            0x3C4 => {
+                self.seq_index = data[0];
+                if data.len() >= 2 {
+                    self.seq_regs[self.seq_index as usize] = data[1];
+                }
+            }
             0x3C5 => {
                 let idx = self.seq_index as usize;
                 self.seq_regs[idx] = data[0];
             }
+            0x3C6 => self.dac_mask = data[0],
             0x3C7 => {
                 self.dac_read_index = data[0];
                 self.dac_sub_index = 0;
@@ -323,23 +475,36 @@ impl VgaState {
                 self.dac_sub_index = 0;
             }
             0x3C9 => {
-                let idx = (self.dac_write_index as usize) * 3 + (self.dac_sub_index as usize);
-                if idx < self.dac_palette.len() {
-                    self.dac_palette[idx] = data[0];
-                }
-                self.dac_sub_index += 1;
-                if self.dac_sub_index >= 3 {
-                    self.dac_sub_index = 0;
-                    self.dac_write_index = self.dac_write_index.wrapping_add(1);
+                for &b in data {
+                    let idx = (self.dac_write_index as usize) * 3 + (self.dac_sub_index as usize);
+                    if idx < self.dac_palette.len() {
+                        self.dac_palette[idx] = b;
+                    }
+                    self.dac_sub_index += 1;
+                    if self.dac_sub_index >= 3 {
+                        self.dac_sub_index = 0;
+                        self.dac_write_index = self.dac_write_index.wrapping_add(1);
+                        self.palette_gen = self.palette_gen.wrapping_add(1);
+                    }
                 }
             }
-            0x3CE => self.grc_index = data[0],
+            0x3CE => {
+                self.grc_index = data[0];
+                if data.len() >= 2 {
+                    self.grc_regs[self.grc_index as usize] = data[1];
+                }
+            }
             0x3CF => {
                 let idx = self.grc_index as usize;
                 self.grc_regs[idx] = data[0];
             }
-            0x3D4 => self.crtc_index = data[0],
-            0x3D5 => {
+            0x3D4 | 0x3B4 => {
+                self.crtc_index = data[0];
+                if data.len() >= 2 {
+                    self.crtc_regs[self.crtc_index as usize] = data[1];
+                }
+            }
+            0x3D5 | 0x3B5 => {
                 let idx = self.crtc_index as usize;
                 self.crtc_regs[idx] = data[0];
             }
@@ -371,26 +536,33 @@ impl VgaState {
             0x3C0 => vec![self.attr_index],
             0x3C1 => vec![self.attr_regs[self.attr_index as usize]],
             0x3C2 | 0x3CC => vec![self.misc_output],
+            0x3C3 => vec![0x01],
             0x3C4 => vec![self.seq_index],
             0x3C5 => vec![self.seq_regs[self.seq_index as usize]],
+            0x3C6 => vec![self.dac_mask],
             0x3C9 => {
-                let idx = (self.dac_read_index as usize) * 3 + (self.dac_sub_index as usize);
-                let val = if idx < self.dac_palette.len() {
-                    self.dac_palette[idx]
-                } else {
-                    0
-                };
-                self.dac_sub_index += 1;
-                if self.dac_sub_index >= 3 {
-                    self.dac_sub_index = 0;
-                    self.dac_read_index = self.dac_read_index.wrapping_add(1);
+                let mut out = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let idx = (self.dac_read_index as usize) * 3 + (self.dac_sub_index as usize);
+                    let val = if idx < self.dac_palette.len() {
+                        self.dac_palette[idx]
+                    } else {
+                        0
+                    };
+                    out.push(val);
+                    self.dac_sub_index += 1;
+                    if self.dac_sub_index >= 3 {
+                        self.dac_sub_index = 0;
+                        self.dac_read_index = self.dac_read_index.wrapping_add(1);
+                    }
                 }
-                vec![val]
+                out
             }
+            0x3CA => vec![0x00],
             0x3CE => vec![self.grc_index],
             0x3CF => vec![self.grc_regs[self.grc_index as usize]],
-            0x3D4 => vec![self.crtc_index],
-            0x3D5 => vec![self.crtc_regs[self.crtc_index as usize]],
+            0x3D4 | 0x3B4 => vec![self.crtc_index],
+            0x3D5 | 0x3B5 => vec![self.crtc_regs[self.crtc_index as usize]],
             0x3DA | 0x3BA => {
                 self.attr_flipflop = false;
                 self.status1_toggle ^= 0x09; // Toggle bit 3 (VSync) and bit 0 (display enable)
@@ -398,6 +570,134 @@ impl VgaState {
             }
             _ => vec![0x00; count],
         }
+    }
+
+    /// Escritura a la ventana VGA legacy `0xA0000..=0xB7FFF` (planos 0..3 y Chain-4).
+    pub fn mmio_vga_window_write(&mut self, addr: u64, data: &[u8]) -> bool {
+        if !(0xA0000..=0xB7FFF).contains(&addr) {
+            return false;
+        }
+        let chain4 = (self.seq_regs[0x04] & 0x08) != 0;
+        let write_mode = self.grc_regs[0x05] & 0x03;
+        let map_mask = if self.seq_regs[0x02] == 0 {
+            0x0F
+        } else {
+            self.seq_regs[0x02] & 0x0F
+        };
+        let set_reset = self.grc_regs[0x00];
+        let enable_sr = self.grc_regs[0x01];
+        let rotate = self.grc_regs[0x03] & 0x07;
+        let logic_op = (self.grc_regs[0x03] >> 3) & 0x03;
+        let bit_mask = self.grc_regs[0x08];
+
+        for (i, &raw) in data.iter().enumerate() {
+            let cur_addr = addr + i as u64;
+            if !(0xA0000..=0xB7FFF).contains(&cur_addr) {
+                break;
+            }
+            let off = (cur_addr - 0xA0000) as usize;
+            if chain4 {
+                if off < 0x10000 {
+                    let plane = off & 3;
+                    if (map_mask & (1 << plane)) != 0 {
+                        let p_off = (off >> 2) & 0xFFFF;
+                        self.planes[plane * 0x10000 + p_off] = raw;
+                    }
+                }
+                continue;
+            }
+            let p_off = off & 0xFFFF;
+            let rotated = raw.rotate_right(rotate as u32);
+            for plane in 0..4usize {
+                if (map_mask & (1 << plane)) == 0 {
+                    continue;
+                }
+                let latch = self.latch[plane];
+                let (val, mask) = match write_mode {
+                    0 => {
+                        let d = if (enable_sr & (1 << plane)) != 0 {
+                            if (set_reset & (1 << plane)) != 0 { 0xFF } else { 0x00 }
+                        } else {
+                            rotated
+                        };
+                        let alu = match logic_op {
+                            1 => d & latch,
+                            2 => d | latch,
+                            3 => d ^ latch,
+                            _ => d,
+                        };
+                        (alu, bit_mask)
+                    }
+                    1 => (latch, 0xFF),
+                    2 => {
+                        let c = if (raw & (1 << plane)) != 0 { 0xFF } else { 0x00 };
+                        let alu = match logic_op {
+                            1 => c & latch,
+                            2 => c | latch,
+                            3 => c ^ latch,
+                            _ => c,
+                        };
+                        (alu, bit_mask)
+                    }
+                    _ => {
+                        let c = if (set_reset & (1 << plane)) != 0 { 0xFF } else { 0x00 };
+                        (c, bit_mask & rotated)
+                    }
+                };
+                let existing = self.planes[plane * 0x10000 + p_off];
+                self.planes[plane * 0x10000 + p_off] = (val & mask) | (existing & !mask);
+            }
+        }
+        true
+    }
+
+    /// Lectura de la ventana VGA legacy `0xA0000..=0xB7FFF`.
+    pub fn mmio_vga_window_read(&mut self, addr: u64, size: usize) -> Option<Vec<u8>> {
+        if !(0xA0000..=0xB7FFF).contains(&addr) {
+            return None;
+        }
+        let chain4 = (self.seq_regs[0x04] & 0x08) != 0;
+        let read_mode = (self.grc_regs[0x05] >> 3) & 0x01;
+        let read_map_sel = (self.grc_regs[0x04] & 0x03) as usize;
+        let color_cmp = self.grc_regs[0x02];
+        let color_dont_care = self.grc_regs[0x07];
+
+        let mut out = Vec::with_capacity(size);
+        for i in 0..size {
+            let cur_addr = addr + i as u64;
+            if !(0xA0000..=0xB7FFF).contains(&cur_addr) {
+                out.push(0xFF);
+                continue;
+            }
+            let off = (cur_addr - 0xA0000) as usize;
+            if chain4 {
+                if off < 0x10000 {
+                    let plane = off & 3;
+                    let p_off = (off >> 2) & 0xFFFF;
+                    out.push(self.planes[plane * 0x10000 + p_off]);
+                } else {
+                    out.push(0xFF);
+                }
+                continue;
+            }
+            let p_off = off & 0xFFFF;
+            for plane in 0..4usize {
+                self.latch[plane] = self.planes[plane * 0x10000 + p_off];
+            }
+            if read_mode == 0 {
+                out.push(self.latch[read_map_sel]);
+            } else {
+                let mut res = 0xFFu8;
+                for plane in 0..4usize {
+                    if (color_dont_care & (1 << plane)) != 0 {
+                        let target = if (color_cmp & (1 << plane)) != 0 { 0xFF } else { 0x00 };
+                        res &= !(self.latch[plane] ^ target);
+                    }
+                }
+                out.push(res);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -505,32 +805,6 @@ impl VgaDevice {
                 if off >= 0x600 && off < 0x610 {
                     return true;
                 }
-                // Offset directo legacy en 0x000..0x020 (para compatibilidad de tests previos)
-                if off < 0x20 {
-                    let mut i = 0;
-                    while i < data.len() {
-                        let pos = off + i;
-                        if pos % 2 == 0 && i + 1 < data.len() {
-                            let reg = (pos / 2) as u16;
-                            let val = u16::from_le_bytes([data[i], data[i + 1]]);
-                            state.dispi_write_reg(reg, val);
-                            i += 2;
-                        } else if pos % 2 == 0 {
-                            let reg = (pos / 2) as u16;
-                            let cur = state.dispi_read_reg(reg);
-                            let val = (cur & 0xFF00) | (data[i] as u16);
-                            state.dispi_write_reg(reg, val);
-                            i += 1;
-                        } else {
-                            let reg = (pos / 2) as u16;
-                            let cur = state.dispi_read_reg(reg);
-                            let val = (cur & 0x00FF) | ((data[i] as u16) << 8);
-                            state.dispi_write_reg(reg, val);
-                            i += 1;
-                        }
-                    }
-                    return true;
-                }
                 return true;
             }
         }
@@ -572,13 +846,10 @@ impl VgaDevice {
                     let mut out = vec![0u8; size];
                     for (i, b) in out.iter_mut().enumerate() {
                         let pos = dispi_off + i;
-                        let reg = pos / 2;
+                        let reg = (pos / 2) as u16;
                         let byte = pos % 2;
-                        *b = if reg < state.dispi_regs.len() {
-                            (state.dispi_regs[reg] >> (byte * 8)) as u8
-                        } else {
-                            0xFF
-                        };
+                        let val = state.dispi_read_reg(reg);
+                        *b = (val >> (byte * 8)) as u8;
                     }
                     return Some(out);
                 }
@@ -597,18 +868,11 @@ impl VgaDevice {
                 if off >= 0x600 && off < 0x610 {
                     return Some(vec![0u8; size]);
                 }
-                // Offset directo legacy en 0x000..0x020 (para compatibilidad de tests previos)
-                if off < 0x20 {
+                // Bloque EDID 1.4 en BAR2 + 0x000..0x080
+                if off < EDID_128.len() {
                     let mut out = vec![0u8; size];
                     for (i, b) in out.iter_mut().enumerate() {
-                        let pos = off + i;
-                        let reg = pos / 2;
-                        let byte = pos % 2;
-                        *b = if reg < state.dispi_regs.len() {
-                            (state.dispi_regs[reg] >> (byte * 8)) as u8
-                        } else {
-                            0xFF
-                        };
+                        *b = EDID_128.get(off + i).copied().unwrap_or(0);
                     }
                     return Some(out);
                 }
@@ -633,7 +897,7 @@ impl IoDevice for VgaDevice {
     fn matches_port(&self, port: u16) -> bool {
         matches!(
             port,
-            0x1CE | 0x1CF | 0x3C0..=0x3CF | 0x3D4 | 0x3D5 | 0x3DA | 0x3BA
+            0x1CE | 0x1CF | 0x3B4 | 0x3B5 | 0x3BA | 0x3C0..=0x3CF | 0x3D4 | 0x3D5 | 0x3DA
         )
     }
 
@@ -751,14 +1015,14 @@ mod tests {
 
     #[test]
     fn vbe_mmio_bar_access() {
-        // (tarea 1) Acceso a los registros dispi vía BAR2 MMIO
+        // Acceso a los registros dispi vía BAR2 MMIO (0x500+) y EDID en 0x00..0x80
         let mut buf = vec![0u8; 1024];
         let (vga, state) = VgaDevice::new(buf.as_mut_ptr(), buf.len());
         vga.set_mmio_bar(0xF000_0000);
 
-        // XRES (reg 1) y ENABLE (reg 4) vía MMIO (offset = reg*2)
-        vga.mmio_write(0xF000_0002, &1024u16.to_le_bytes());
-        vga.mmio_write(0xF000_0008, &[VBE_DISPI_ENABLED as u8, 0]);
+        // XRES (reg 1) y ENABLE (reg 4) vía MMIO (0x500 + reg*2)
+        vga.mmio_write(0xF000_0502, &1024u16.to_le_bytes());
+        vga.mmio_write(0xF000_0508, &[VBE_DISPI_ENABLED as u8, 0]);
 
         {
             let st = state.lock().unwrap();
@@ -766,9 +1030,14 @@ mod tests {
             assert!(st.is_vbe_enabled());
         }
 
-        // Lectura del ID vía MMIO (offset 0x00)
-        let id = vga.mmio_read(0xF000_0000, 2).unwrap();
+        // Lectura del ID vía MMIO (offset 0x500)
+        let id = vga.mmio_read(0xF000_0500, 2).unwrap();
         assert_eq!(u16::from_le_bytes([id[0], id[1]]), VBE_DISPI_ID5);
+
+        // Lectura del bloque EDID en 0x00..0x80 con header y checksum válido
+        let edid = vga.mmio_read(0xF000_0000, 128).unwrap();
+        assert_eq!(&edid[0..8], &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert_eq!(edid.iter().map(|&b| b as u32).sum::<u32>() % 256, 0);
 
         // Fuera de la ventana MMIO → no es cosa nuestra
         assert!(vga.mmio_read(0xF100_0000, 2).is_none());
@@ -853,5 +1122,41 @@ mod tests {
         // Clearing GETCAPS restores configured resolution
         vga.dispi_write_reg(VBE_DISPI_INDEX_ENABLE, 0);
         assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_XRES), 640);
+    }
+
+    #[test]
+    fn test_vga_planar_and_edid_and_readonly_mem64k() {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut vga = VgaState::new(buf.as_mut_ptr(), buf.len());
+
+        // EDID header and valid checksum
+        assert_eq!(&EDID_128[..8], &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert_eq!(EDID_128.iter().map(|&b| b as u32).sum::<u32>() % 256, 0);
+
+        // VIDEO_MEMORY_64K must be read-only
+        let orig_mem64k = vga.dispi_read_reg(VBE_DISPI_INDEX_VIDEO_MEMORY_64K);
+        vga.dispi_write_reg(VBE_DISPI_INDEX_VIDEO_MEMORY_64K, 1234);
+        assert_eq!(vga.dispi_read_reg(VBE_DISPI_INDEX_VIDEO_MEMORY_64K), orig_mem64k);
+
+        // Enabling then disabling VBE clears vbe_active
+        vga.dispi_write_reg(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED);
+        assert!(vga.vbe_active);
+        vga.dispi_write_reg(VBE_DISPI_INDEX_ENABLE, 0);
+        assert!(!vga.vbe_active);
+
+        // Planar write mode 0 into plane 1 via 0xA0000
+        vga.seq_regs[0x04] = 0x02; // Planar (no chain4)
+        vga.seq_regs[0x02] = 0x02; // Plane 1
+        vga.grc_regs[0x05] = 0x00; // Write mode 0 / read mode 0
+        vga.grc_regs[0x08] = 0xFF; // All bits enabled
+        assert!(vga.mmio_vga_window_write(0xA0010, &[0x5A]));
+        vga.grc_regs[0x04] = 0x01; // Read plane 1
+        assert_eq!(vga.mmio_vga_window_read(0xA0010, 1), Some(vec![0x5A]));
+
+        // Chain-4 mode writes linearly and distributes across planes 0..3
+        vga.seq_regs[0x04] = 0x0E;
+        vga.seq_regs[0x02] = 0x0F;
+        assert!(vga.mmio_vga_window_write(0xA0004, &[0x12, 0x34, 0x56, 0x78]));
+        assert_eq!(vga.mmio_vga_window_read(0xA0004, 4), Some(vec![0x12, 0x34, 0x56, 0x78]));
     }
 }

@@ -202,6 +202,11 @@ pub struct VmProfile {
     pub disk_path: Option<String>,
     pub unattended: bool,
     pub use_efi: bool,
+    pub network_name: String,
+    pub mac_address: String,
+    pub ssh_host_port: u16,
+    pub ssh_user: String,
+    pub ssh_pass: String,
 }
 
 impl VmProfile {
@@ -209,24 +214,7 @@ impl VmProfile {
         let iso_norm = iso.map(|s| normalize_rel_path(&s));
         let disk_norm = disk.map(|s| normalize_rel_path(&s));
         let os_type = if let Some(ref i) = iso_norm {
-            let low = i.to_lowercase();
-            if low.contains("win11") {
-                "Windows 11 (64-bit)".to_string()
-            } else if low.contains("win10") {
-                "Windows 10 (64-bit)".to_string()
-            } else if low.contains("win7") {
-                "Windows 7 (64-bit)".to_string()
-            } else if low.contains("win") {
-                "Windows (64-bit)".to_string()
-            } else if low.contains("ubuntu") {
-                "Ubuntu (64-bit)".to_string()
-            } else if low.contains("debian") {
-                "Debian (64-bit)".to_string()
-            } else if low.contains("arch") {
-                "Arch Linux (64-bit)".to_string()
-            } else {
-                "Linux 2.6 / 3.x / 4.x / 5.x / 6.x (64-bit)".to_string()
-            }
+            detect_os_type_from_iso(i)
         } else {
             "Linux (64-bit)".to_string()
         };
@@ -239,8 +227,22 @@ impl VmProfile {
             disk_path: disk_norm,
             unattended: false,
             use_efi: false,
+            network_name: crate::network::DEFAULT_NETWORK_NAME.to_string(),
+            mac_address: crate::network::generate_mac(name),
+            ssh_host_port: 0,
+            ssh_user: "two55".to_string(),
+            ssh_pass: "two55".to_string(),
         }
     }
+}
+
+/// Sugiere el siguiente puerto TCP en localhost disponible para SSH entrante (desde 2222).
+pub fn next_free_ssh_port(profiles: &[VmProfile]) -> u16 {
+    let mut port = 2222u16;
+    while profiles.iter().any(|p| p.ssh_host_port == port) && port < 2999 {
+        port += 1;
+    }
+    port
 }
 
 /// Selección confirmada por el usuario para arrancar la VM.
@@ -252,6 +254,7 @@ pub struct LauncherSelection {
     pub iso_path: Option<PathBuf>,
     pub disk_path: Option<PathBuf>,
     pub unattended: bool,
+    pub use_efi: bool,
 }
 
 /// Resultado de la ejecución del GUI de Two Five Five (255).
@@ -263,7 +266,16 @@ pub enum GuiOutcome {
 
 /// Carga los perfiles de VM desde `vms.conf` o los inicializa automáticamente.
 pub fn load_vm_profiles(available_isos: &[String], available_disks: &[String]) -> Vec<VmProfile> {
-    if let Ok(content) = fs::read_to_string(VM_CONFIG_FILE) {
+    load_vm_profiles_from(Path::new(VM_CONFIG_FILE), available_isos, available_disks)
+}
+
+/// Carga los perfiles de VM desde una ruta arbitraria (soporta formato 8 y 13 columnas).
+pub fn load_vm_profiles_from(
+    config_path: &Path,
+    available_isos: &[String],
+    available_disks: &[String],
+) -> Vec<VmProfile> {
+    if let Ok(content) = fs::read_to_string(config_path) {
         let mut list: Vec<VmProfile> = Vec::new();
         for line in content.lines() {
             let line = line.trim();
@@ -335,6 +347,35 @@ pub fn load_vm_profiles(available_isos: &[String], available_disks: &[String]) -
                     }
                 }
 
+                let network_name = parts
+                    .get(8)
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| crate::network::DEFAULT_NETWORK_NAME.to_string());
+                let mac_address = parts
+                    .get(9)
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| crate::network::generate_mac(&name));
+                let ssh_host_port = parts
+                    .get(10)
+                    .and_then(|v| v.trim().parse::<u16>().ok())
+                    .unwrap_or(0);
+                let ssh_user = parts
+                    .get(11)
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "two55".to_string());
+                let ssh_pass = parts
+                    .get(12)
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "two55".to_string());
+
                 let is_dup = list.iter().any(|p| p.name == name);
                 if !is_dup {
                     list.push(VmProfile {
@@ -346,12 +387,16 @@ pub fn load_vm_profiles(available_isos: &[String], available_disks: &[String]) -
                         disk_path,
                         unattended,
                         use_efi,
+                        network_name,
+                        mac_address,
+                        ssh_host_port,
+                        ssh_user,
+                        ssh_pass,
                     });
                 }
             }
         }
         if !list.is_empty() {
-            let _ = save_vm_profiles(&list);
             return list;
         }
     }
@@ -374,17 +419,22 @@ pub fn load_vm_profiles(available_isos: &[String], available_disks: &[String]) -
             ));
         }
     }
-    let _ = save_vm_profiles(&profiles);
+    let _ = save_vm_profiles_to(config_path, &profiles);
     profiles
 }
 
 /// Guarda los perfiles de VM en `vms.conf`.
 pub fn save_vm_profiles(profiles: &[VmProfile]) -> std::io::Result<()> {
+    save_vm_profiles_to(Path::new(VM_CONFIG_FILE), profiles)
+}
+
+/// Guarda los perfiles de VM en una ruta arbitraria.
+pub fn save_vm_profiles_to(config_path: &Path, profiles: &[VmProfile]) -> std::io::Result<()> {
     let mut out = String::from("# Two Five Five (255) - Perfiles de Maquinas Virtuales\n");
-    out.push_str("# Formato: nombre|os_type|cpus|ram_mb|iso_path|disk_path|unattended|use_efi\n");
+    out.push_str("# Formato: nombre|os_type|cpus|ram_mb|iso_path|disk_path|unattended|use_efi|network|mac|ssh_port|ssh_user|ssh_pass\n");
     for p in profiles {
         out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}\n",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
             p.name.replace('|', "/"),
             p.os_type.replace('|', "/"),
             p.cpus,
@@ -392,10 +442,15 @@ pub fn save_vm_profiles(profiles: &[VmProfile]) -> std::io::Result<()> {
             p.iso_path.as_deref().unwrap_or(""),
             p.disk_path.as_deref().unwrap_or(""),
             if p.unattended { 1 } else { 0 },
-            if p.use_efi { 1 } else { 0 }
+            if p.use_efi { 1 } else { 0 },
+            p.network_name.replace('|', "/"),
+            p.mac_address.replace('|', "/"),
+            p.ssh_host_port,
+            p.ssh_user.replace('|', "/"),
+            p.ssh_pass.replace('|', "/")
         ));
     }
-    fs::write(VM_CONFIG_FILE, out)
+    fs::write(config_path, out)
 }
 
 /// Determina el directorio inicial predeterminado para el selector de archivos ISO.
@@ -644,9 +699,10 @@ pub fn scan_disk_files() -> Vec<String> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainViewTab {
-    Details, // Vista clásica de Detalles de la máquina (UIDetails)
-    Media,   // Administrador de Medios Virtuales (UIMediumManager)
-    Logs,    // Registros / Diagnóstico
+    Details,  // Vista clásica de Detalles de la máquina (UIDetails)
+    Media,    // Administrador de Medios Virtuales (UIMediumManager)
+    Networks, // Redes Virtuales y Port-Forwarding
+    Logs,     // Registros / Diagnóstico
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -734,6 +790,7 @@ enum ActiveField {
     WizardVmName,
     WizardDiskName,
     SettingsVmName,
+    AgentChatInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1182,6 +1239,27 @@ impl Canvas {
     }
 }
 
+impl crate::chat_ui::ChatCanvas for Canvas {
+    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        Canvas::fill_rect(self, x, y, w, h, color);
+    }
+    fn draw_border(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
+        Canvas::draw_border(self, x, y, w, h, color);
+    }
+    fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32) {
+        Canvas::draw_text(self, x, y, text, color);
+    }
+    fn draw_text_clipped(&mut self, x: usize, y: usize, max_chars: usize, text: &str, color: u32) {
+        Canvas::draw_text_clipped(self, x, y, max_chars, text, color);
+    }
+    fn register_btn(&mut self, id: &str, x: usize, y: usize, w: usize, h: usize) -> bool {
+        Canvas::register_btn(self, id, x, y, w, h)
+    }
+    fn draw_drop_shadow(&mut self, x: usize, y: usize, w: usize, h: usize, radius: usize) {
+        Canvas::draw_drop_shadow(self, x, y, w, h, radius);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Lanzamiento Externo de Máquinas Virtuales (Multi-Ventana Two Five Five)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1190,6 +1268,17 @@ impl Canvas {
 /// La ventana del Administrador GUI de Two Five Five (255) permanece abierta, responsiva y activa.
 pub fn launch_vm_external(
     p: &VmProfile,
+    running_vms: &mut HashMap<String, std::process::Child>,
+    status_msg: &mut String,
+    status_is_err: &mut bool,
+) {
+    let nets = crate::network::load_networks();
+    launch_vm_external_with_networks(p, &nets, running_vms, status_msg, status_is_err);
+}
+
+pub fn launch_vm_external_with_networks(
+    p: &VmProfile,
+    networks: &[crate::network::VirtualNetwork],
     running_vms: &mut HashMap<String, std::process::Child>,
     status_msg: &mut String,
     status_is_err: &mut bool,
@@ -1222,9 +1311,41 @@ pub fn launch_vm_external(
     }
     if let Some(ref disk) = p.disk_path {
         cmd.arg(format!("--disk={}", disk));
+    } else {
+        cmd.arg("--no-disk");
+    }
+    if !p.network_name.is_empty() {
+        cmd.arg(format!("--net={}", p.network_name));
+    }
+    if let Some(net) = networks.iter().find(|n| n.name == p.network_name) {
+        cmd.arg(format!("--net-mode={}", net.mode.as_str()));
+        cmd.arg(format!("--net-subnet={}", net.subnet));
+        if let Some(ref tap) = net.tap_if {
+            cmd.arg(format!("--tap={}", tap));
+        }
+    }
+    if !p.mac_address.is_empty() {
+        cmd.arg(format!("--mac={}", p.mac_address));
+    }
+    if p.ssh_host_port > 0 {
+        cmd.arg(format!("--hostfwd={}:22", p.ssh_host_port));
     }
     if p.unattended {
         cmd.arg("--unattended");
+        cmd.arg(format!("--unattended-user={}", p.ssh_user));
+        cmd.arg(format!("--unattended-pass={}", p.ssh_pass));
+        let clean_host: String = p
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+            .collect();
+        let clean_host = clean_host.trim_matches('-');
+        if !clean_host.is_empty() {
+            cmd.arg(format!("--unattended-host={}", clean_host));
+        }
+    }
+    if p.use_efi {
+        cmd.arg("--efi");
     }
 
     cmd.stdin(std::process::Stdio::null());
@@ -1336,6 +1457,14 @@ pub fn run_gui_launcher(
     };
 
     window.set_target_fps(60);
+    let char_queue = crate::chat_ui::SharedCharQueue::default();
+    window.set_input_callback(Box::new(char_queue.clone()));
+
+    let mut networks = crate::network::load_networks();
+    let agent_worker = crate::agent::AgentWorkerHandle::spawn();
+    let mut mini_chat = crate::chat_ui::MiniChatState::new(WIN_W, WIN_H);
+    let mut last_chat_anim = std::time::Instant::now();
+
     let mut canvas = Canvas::new(WIN_W, WIN_H);
     let mut last_mouse_btn = false;
     let mut needs_redraw = true;
@@ -1348,6 +1477,42 @@ pub fn run_gui_launcher(
     let mut last_click_time = std::time::Instant::now();
 
     while window.is_open() {
+        // Procesar peticiones de herramienta del Agente IA (síncronas) y eventos de UI sin esperar ratón
+        {
+            let mut hv_state = crate::agent::HypervisorState {
+                work_dir: Path::new("."),
+                profiles: &mut profiles,
+                networks: &mut networks,
+                available_isos: &mut available_isos,
+                available_disks: &mut available_disks,
+                running_vms: &mut running_vms,
+                selected_idx: Some(&mut sel_idx),
+                status_msg: Some(&mut status_msg),
+                status_is_err: Some(&mut status_is_err),
+            };
+            if agent_worker.poll_backend_requests(&mut hv_state) {
+                if !profiles.is_empty() {
+                    let cur_idx = sel_idx.min(profiles.len() - 1);
+                    sel_idx = cur_idx;
+                    last_selected_disk_info = profiles[sel_idx]
+                        .disk_path
+                        .as_deref()
+                        .and_then(|d| VirtualDisk::probe_info(d).ok());
+                } else {
+                    last_selected_disk_info = None;
+                }
+                needs_redraw = true;
+            }
+        }
+        for ev in agent_worker.poll_ui_events() {
+            mini_chat.apply_event(ev);
+            needs_redraw = true;
+        }
+        if mini_chat.thinking && last_chat_anim.elapsed().as_millis() >= 220 {
+            last_chat_anim = std::time::Instant::now();
+            needs_redraw = true;
+        }
+
         // Comprobar estado de máquinas virtuales externas en ejecución (no bloqueante)
         let mut exited_vms = Vec::new();
         for (vm_name, child) in running_vms.iter_mut() {
@@ -1382,10 +1547,46 @@ pub fn run_gui_launcher(
             active_slider = ActiveSlider::None;
             needs_redraw = true;
         }
+        if !mouse_down {
+            mini_chat.win.is_dragging = false;
+        }
         last_mouse_btn = mouse_down;
 
+        if let Some((_, sy)) = window.get_scroll_wheel() {
+            if sy.abs() > 0.01 && current_modal == ModalDialog::None && mini_chat.open && mini_chat.contains_point(mx, my) {
+                if sy > 0.0 {
+                    mini_chat.scroll_up(3);
+                } else {
+                    mini_chat.scroll_down(3);
+                }
+                needs_redraw = true;
+            }
+        }
+
+        let typed_chars = char_queue.drain_into();
+        if !typed_chars.is_empty() && active_field != ActiveField::None {
+            for ch in typed_chars {
+                match active_field {
+                    ActiveField::WizardVmName => new_vm_name.push(ch),
+                    ActiveField::WizardDiskName => new_disk_name.push(ch),
+                    ActiveField::SettingsVmName => {
+                        if let Some(p) = profiles.get_mut(sel_idx) {
+                            p.name.push(ch);
+                        }
+                    }
+                    ActiveField::AgentChatInput => {
+                        if mini_chat.input.chars().count() < 500 {
+                            mini_chat.input.push(ch);
+                        }
+                    }
+                    ActiveField::None => {}
+                }
+            }
+            needs_redraw = true;
+        }
+
         let keys_pressed = window.get_keys_pressed(KeyRepeat::No);
-        if mouse_moved || clicked || (mouse_down && active_slider != ActiveSlider::None) || !keys_pressed.is_empty() {
+        if mouse_moved || clicked || (mouse_down && (active_slider != ActiveSlider::None || mini_chat.win.is_dragging)) || !keys_pressed.is_empty() {
             needs_redraw = true;
         }
 
@@ -1435,6 +1636,24 @@ pub fn run_gui_launcher(
             }
         }
 
+        // Arrastre de ventana del Mini Chat cuando no hay modal abierto
+        if current_modal == ModalDialog::None && active_slider == ActiveSlider::None && mini_chat.open {
+            if mouse_down {
+                if clicked && mini_chat.is_in_drag_header(mx, my) {
+                    mini_chat.win.is_dragging = true;
+                    mini_chat.win.drag_off_x = mx.saturating_sub(mini_chat.win.x);
+                    mini_chat.win.drag_off_y = my.saturating_sub(mini_chat.win.y);
+                } else if mini_chat.win.is_dragging {
+                    let nx = mx.saturating_sub(mini_chat.win.drag_off_x);
+                    let ny = my.saturating_sub(mini_chat.win.drag_off_y);
+                    mini_chat.win.x = nx.clamp(0, WIN_W.saturating_sub(mini_chat.win.w));
+                    mini_chat.win.y = ny.clamp(26, WIN_H.saturating_sub(mini_chat.win.h + 26));
+                }
+            } else {
+                mini_chat.win.is_dragging = false;
+            }
+        }
+
         // ─── Atajos de Teclado Globales ─────────────────────────────────────────
         if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
             if current_modal == ModalDialog::SettingsDialog {
@@ -1451,6 +1670,7 @@ pub fn run_gui_launcher(
             } else if active_field != ActiveField::None {
                 active_field = ActiveField::None;
             } else {
+                agent_worker.shutdown();
                 return GuiOutcome::Cancelled;
             }
         }
@@ -1471,8 +1691,9 @@ pub fn run_gui_launcher(
                     }
                 }
             } else if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
-                launch_vm_external(
+                launch_vm_external_with_networks(
                     &profiles[sel_idx],
+                    &networks,
                     &mut running_vms,
                     &mut status_msg,
                     &mut status_is_err,
@@ -1480,42 +1701,29 @@ pub fn run_gui_launcher(
             }
         }
 
-        // ─── Entrada de Texto para Campos Activos ───────────────────────────────
+        // ─── Entrada de Teclado (Backspace / Enter) para Campos Activos ──────────
         if active_field != ActiveField::None {
+            if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+                if active_field == ActiveField::AgentChatInput {
+                    let prompt = std::mem::take(&mut mini_chat.input);
+                    mini_chat.submit_prompt(prompt, &agent_worker);
+                } else {
+                    active_field = ActiveField::None;
+                    let _ = save_vm_profiles(&profiles);
+                }
+            }
             for key in window.get_keys_pressed(KeyRepeat::Yes) {
-                let target_str = match active_field {
-                    ActiveField::WizardVmName => &mut new_vm_name,
-                    ActiveField::WizardDiskName => &mut new_disk_name,
-                    ActiveField::SettingsVmName => &mut profiles[sel_idx].name,
-                    ActiveField::None => continue,
-                };
-
-                match key {
-                    Key::Backspace => {
-                        target_str.pop();
-                    }
-                    Key::Enter | Key::Escape => {
-                        active_field = ActiveField::None;
-                        let _ = save_vm_profiles(&profiles);
-                    }
-                    Key::Space => {
-                        target_str.push(' ');
-                    }
-                    Key::Period => {
-                        target_str.push('.');
-                    }
-                    Key::Minus => {
-                        target_str.push('-');
-                    }
-                    _ => {
-                        let ch = format!("{:?}", key).to_lowercase();
-                        if ch.starts_with("key") && ch.len() == 4 {
-                            let c = ch.chars().nth(3).unwrap();
-                            target_str.push(c);
-                        } else if ch.starts_with('n') && ch.len() == 5 && ch.starts_with("num") {
-                            let c = ch.chars().nth(4).unwrap();
-                            target_str.push(c);
+                if key == Key::Backspace {
+                    match active_field {
+                        ActiveField::WizardVmName => { new_vm_name.pop(); }
+                        ActiveField::WizardDiskName => { new_disk_name.pop(); }
+                        ActiveField::SettingsVmName => {
+                            if let Some(p) = profiles.get_mut(sel_idx) {
+                                p.name.pop();
+                            }
                         }
+                        ActiveField::AgentChatInput => { mini_chat.input.pop(); }
+                        ActiveField::None => {}
                     }
                 }
             }
@@ -1576,28 +1784,38 @@ pub fn run_gui_launcher(
         let is_cur_running = running_vms.contains_key(&profiles[sel_idx].name);
         let start_label = if is_cur_running { "Mostrar" } else { "Iniciar" };
         canvas.draw_toolbar_action(&assets, "tb_start", "vm_start_32px.png", start_label, cur_tb_x, 28, 72, 50, true);
+        cur_tb_x += 76;
+
+        canvas.draw_toolbar_action(&assets, "tb_ai_chat", "global_settings_32px.png", "Agente IA", cur_tb_x, 28, 76, 50, mini_chat.open);
 
         // Selector de Vistas de Herramientas a la Derecha de la Toolbar
-        let mut r_tb_x = WIN_W.saturating_sub(270);
-        let tab_det_hov = canvas.register_btn("tab_details", r_tb_x, 36, 85, 34);
-        canvas.fill_rect(r_tb_x, 36, 85, 34, if current_view == MainViewTab::Details { COL_CARD_BG } else if tab_det_hov { 0xE2E7EE } else { 0xEBEEF3 });
-        canvas.draw_border(r_tb_x, 36, 85, 34, COL_TOOLBAR_BORDER);
-        assets.draw("machine_details_manager_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 6) as isize, 45);
-        canvas.draw_text(r_tb_x + 26, 45, "Detalles", COL_TEXT_MAIN);
-        r_tb_x += 88;
+        let mut r_tb_x = WIN_W.saturating_sub(346);
+        let tab_det_hov = canvas.register_btn("tab_details", r_tb_x, 36, 82, 34);
+        canvas.fill_rect(r_tb_x, 36, 82, 34, if current_view == MainViewTab::Details { COL_CARD_BG } else if tab_det_hov { 0xE2E7EE } else { 0xEBEEF3 });
+        canvas.draw_border(r_tb_x, 36, 82, 34, COL_TOOLBAR_BORDER);
+        assets.draw("machine_details_manager_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 5) as isize, 45);
+        canvas.draw_text(r_tb_x + 23, 45, "Detalles", COL_TEXT_MAIN);
+        r_tb_x += 85;
 
-        let tab_med_hov = canvas.register_btn("tab_media", r_tb_x, 36, 80, 34);
-        canvas.fill_rect(r_tb_x, 36, 80, 34, if current_view == MainViewTab::Media { COL_CARD_BG } else if tab_med_hov { 0xE2E7EE } else { 0xEBEEF3 });
-        canvas.draw_border(r_tb_x, 36, 80, 34, COL_TOOLBAR_BORDER);
-        assets.draw("media_manager_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 6) as isize, 45);
-        canvas.draw_text(r_tb_x + 26, 45, "Medios", COL_TEXT_MAIN);
-        r_tb_x += 83;
+        let tab_med_hov = canvas.register_btn("tab_media", r_tb_x, 36, 78, 34);
+        canvas.fill_rect(r_tb_x, 36, 78, 34, if current_view == MainViewTab::Media { COL_CARD_BG } else if tab_med_hov { 0xE2E7EE } else { 0xEBEEF3 });
+        canvas.draw_border(r_tb_x, 36, 78, 34, COL_TOOLBAR_BORDER);
+        assets.draw("media_manager_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 5) as isize, 45);
+        canvas.draw_text(r_tb_x + 23, 45, "Medios", COL_TEXT_MAIN);
+        r_tb_x += 81;
+
+        let tab_net_hov = canvas.register_btn("tab_networks", r_tb_x, 36, 76, 34);
+        canvas.fill_rect(r_tb_x, 36, 76, 34, if current_view == MainViewTab::Networks { COL_CARD_BG } else if tab_net_hov { 0xE2E7EE } else { 0xEBEEF3 });
+        canvas.draw_border(r_tb_x, 36, 76, 34, COL_TOOLBAR_BORDER);
+        assets.draw("nw_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 5) as isize, 45);
+        canvas.draw_text(r_tb_x + 23, 45, "Redes", COL_TEXT_MAIN);
+        r_tb_x += 79;
 
         let tab_log_hov = canvas.register_btn("tab_logs", r_tb_x, 36, 92, 34);
         canvas.fill_rect(r_tb_x, 36, 92, 34, if current_view == MainViewTab::Logs { COL_CARD_BG } else if tab_log_hov { 0xE2E7EE } else { 0xEBEEF3 });
         canvas.draw_border(r_tb_x, 36, 92, 34, COL_TOOLBAR_BORDER);
-        assets.draw("vm_show_logs_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 6) as isize, 45);
-        canvas.draw_text(r_tb_x + 26, 45, "Checklist", COL_TEXT_MAIN);
+        assets.draw("vm_show_logs_16px.png", &mut canvas.buf, WIN_W, WIN_H, (r_tb_x + 5) as isize, 45);
+        canvas.draw_text(r_tb_x + 23, 45, "Checklist", COL_TEXT_MAIN);
 
         // 3. Panel Izquierdo: Chooser de Máquinas Virtuales (`UIChooser`)
         const CHOOSER_W: usize = 300;
@@ -1828,7 +2046,12 @@ pub fn run_gui_launcher(
                 canvas.draw_details_card_header(&assets, "nw_16px.png", "Red", net_x, lower_y, b_w);
                 canvas.fill_rect(net_x, lower_y + 26, b_w, 40, COL_CARD_BG);
                 canvas.draw_border(net_x, lower_y + 26, b_w, 40, COL_CARD_BORDER);
-                canvas.draw_text_clipped(net_x + 10, lower_y + 36, b_w / 8, "Adaptador 1: VirtIO-Net (NAT)", COL_TEXT_MAIN);
+                let net_summary = if cur_p.ssh_host_port > 0 {
+                    format!("Red: {} | SSH :{}", cur_p.network_name, cur_p.ssh_host_port)
+                } else {
+                    format!("Red: {} ({})", cur_p.network_name, cur_p.mac_address)
+                };
+                canvas.draw_text_clipped(net_x + 10, lower_y + 36, b_w / 8, &net_summary, COL_TEXT_MAIN);
 
                 // USB
                 let usb_x = net_x + b_w + 8;
@@ -1931,6 +2154,63 @@ pub fn run_gui_launcher(
                 }
             }
 
+            MainViewTab::Networks => {
+                canvas.fill_rect(right_x, content_y + 6, right_w, content_h.saturating_sub(12), COL_CARD_BG);
+                canvas.draw_border(right_x, content_y + 6, right_w, content_h.saturating_sub(12), COL_CARD_BORDER);
+
+                assets.draw("nw_16px.png", &mut canvas.buf, WIN_W, WIN_H, (right_x + 12) as isize, (content_y + 16) as isize);
+                canvas.draw_text(right_x + 34, content_y + 16, "Gestor de Redes Virtuales y Redirecciones SSH", COL_TEXT_MAIN);
+                canvas.draw_button_gray("btn_net_new_nat", right_x + 12, content_y + 42, 130, 24, "+ Red NAT");
+                canvas.draw_button_gray("btn_net_new_host", right_x + 148, content_y + 42, 145, 24, "+ Host-Only");
+                canvas.draw_button_gray("btn_net_new_int", right_x + 299, content_y + 42, 145, 24, "+ Red Interna");
+                canvas.draw_button_gray("btn_net_add_ssh", right_x + 450, content_y + 42, 170, 24, "Asignar SSH VM");
+
+                let table_y = content_y + 74;
+                canvas.fill_rect(right_x + 10, table_y, right_w - 20, 24, COL_CARD_HEADER);
+                canvas.draw_border(right_x + 10, table_y, right_w - 20, 24, COL_CARD_BORDER);
+                canvas.draw_text(right_x + 18, table_y + 5, "Red", COL_TEXT_MAIN);
+                canvas.draw_text(right_x + 150, table_y + 5, "Modo", COL_TEXT_MAIN);
+                canvas.draw_text(right_x + 240, table_y + 5, "Subred / GW", COL_TEXT_MAIN);
+                canvas.draw_text(right_x + 440, table_y + 5, "Port-Forwards", COL_TEXT_MAIN);
+
+                let cur_vm_net = profiles.get(sel_idx).map(|p| p.network_name.as_str()).unwrap_or("");
+                let mut ny = table_y + 28;
+                for (nidx, n) in networks.iter().enumerate() {
+                    if ny + 32 > content_y + content_h - 10 {
+                        break;
+                    }
+                    let is_vm_net = n.name == cur_vm_net;
+                    let row_bg = if is_vm_net { 0xE6F0FA } else { COL_CARD_BG };
+                    canvas.fill_rect(right_x + 10, ny, right_w - 20, 28, row_bg);
+                    canvas.fill_rect(right_x + 10, ny + 27, right_w - 20, 1, 0xEEF2F6);
+                    canvas.draw_text_clipped(right_x + 16, ny + 6, 15, &n.name, COL_TEXT_MAIN);
+                    canvas.draw_text(right_x + 150, ny + 6, n.mode.as_str(), COL_LINK_BLUE);
+                    canvas.draw_text_clipped(
+                        right_x + 240,
+                        ny + 6,
+                        24,
+                        &format!("{} ({})", n.subnet, crate::network::format_ipv4(n.gateway_ip)),
+                        COL_TEXT_MUTED,
+                    );
+                    let pf_txt = if n.port_forwards.is_empty() {
+                        "-".to_string()
+                    } else {
+                        n.port_forwards.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+                    };
+                    canvas.draw_text_clipped(right_x + 440, ny + 6, 18, &pf_txt, COL_TEXT_MAIN);
+
+                    if !is_vm_net {
+                        canvas.draw_button_gray(&format!("btn_net_use_{}", nidx), right_x + right_w - 165, ny + 3, 82, 22, "Usar VM");
+                    } else {
+                        canvas.draw_text(right_x + right_w - 160, ny + 6, "[Activa]", COL_BRAND_BLUE);
+                    }
+                    if n.name != crate::network::DEFAULT_NETWORK_NAME {
+                        canvas.draw_button_gray(&format!("btn_net_del_{}", nidx), right_x + right_w - 78, ny + 3, 62, 22, "Borrar");
+                    }
+                    ny += 30;
+                }
+            }
+
             MainViewTab::Logs => {
                 // Checklist de Estado de Componentes del Hipervisor
                 canvas.fill_rect(right_x, content_y + 6, right_w, content_h.saturating_sub(12), COL_CARD_BG);
@@ -1969,6 +2249,15 @@ pub fn run_gui_launcher(
         assets.draw("status_check_16px.png", &mut canvas.buf, WIN_W, WIN_H, 8, (stat_y + 5) as isize);
         let stat_col = if status_is_err { 0xC0392B } else { COL_TEXT_MUTED };
         canvas.draw_text_clipped(30, stat_y + 5, (WIN_W - 40) / 8, &status_msg, stat_col);
+
+        // 5b. Mini Chat flotante del Agente IA (Ollama) sobre el escritorio principal
+        if current_modal == ModalDialog::None {
+            crate::chat_ui::render_mini_chat(
+                &mut canvas,
+                &mut mini_chat,
+                active_field == ActiveField::AgentChatInput,
+            );
+        }
 
         // ─── Modales y Asistentes Flotantes (Floating Windows) ──────────────────
         match current_modal {
@@ -2337,21 +2626,35 @@ pub fn run_gui_launcher(
                         canvas.draw_text(set_x + 220, my + 146, "ICH AC'97 (Realtek ALC655)", COL_TEXT_MAIN);
                     }
                     SettingsCategory::Network => {
+                        let cur_p = &profiles[sel_idx];
+                        let net_mode_lbl = networks
+                            .iter()
+                            .find(|n| n.name == cur_p.network_name)
+                            .map(|n| n.mode.label())
+                            .unwrap_or("NAT (Traduccion de Direcciones de Red)");
                         canvas.draw_text(set_x, my + 46, "Adaptadores de Red de la Maquina:", COL_TEXT_MAIN);
 
                         canvas.draw_border(set_x, my + 76, 14, 14, COL_BRAND_BLUE);
                         canvas.fill_rect(set_x + 3, my + 79, 8, 8, COL_BRAND_BLUE);
-                        canvas.draw_text(set_x + 22, my + 76, "Habilitar adaptador de red (Adaptador 1)", COL_TEXT_MAIN);
+                        canvas.draw_text(set_x + 22, my + 76, &format!("Red conectada: {}", cur_p.network_name), COL_TEXT_MAIN);
 
-                        canvas.draw_text(set_x, my + 116, "Conectado a:", COL_TEXT_MUTED);
-                        canvas.draw_text(set_x + 140, my + 116, "NAT (Traduccion de Direcciones de Red)", COL_TEXT_MAIN);
+                        canvas.draw_text(set_x, my + 116, "Modo de red:", COL_TEXT_MUTED);
+                        canvas.draw_text(set_x + 140, my + 116, net_mode_lbl, COL_TEXT_MAIN);
 
                         canvas.draw_text(set_x, my + 146, "Tipo de adaptador:", COL_TEXT_MUTED);
-                        canvas.draw_text(set_x + 140, my + 146, "Intel PRO/1000 MT Desktop (82540EM)", COL_TEXT_MAIN);
+                        canvas.draw_text(set_x + 140, my + 146, "VirtIO-Net + Intel 82540EM", COL_TEXT_MAIN);
 
                         canvas.draw_text(set_x, my + 176, "Direccion MAC:", COL_TEXT_MUTED);
-                        canvas.draw_text(set_x + 140, my + 176, "02:55:00:6C:5B:42 (Prefijo MAC Two Five Five)", COL_TEXT_MAIN);
+                        canvas.draw_text(set_x + 140, my + 176, &cur_p.mac_address, COL_TEXT_MAIN);
                         canvas.draw_button_gray("set_regen_mac", set_x + 440, my + 172, 85, 24, "Regenerar");
+
+                        let ssh_txt = if cur_p.ssh_host_port > 0 {
+                            format!("127.0.0.1:{} -> :22 ({})", cur_p.ssh_host_port, cur_p.ssh_user)
+                        } else {
+                            "Sin redireccion SSH asignada (ver pestana Redes)".to_string()
+                        };
+                        canvas.draw_text(set_x, my + 206, "Acceso SSH:", COL_TEXT_MUTED);
+                        canvas.draw_text(set_x + 140, my + 206, &ssh_txt, COL_TEXT_MAIN);
                     }
                     SettingsCategory::Usb => {
                         canvas.draw_text(set_x, my + 46, "Controlador USB y Filtros de Dispositivos:", COL_TEXT_MAIN);
@@ -2511,19 +2814,45 @@ pub fn run_gui_launcher(
 
         // ─── Despacho de Eventos de Clic ────────────────────────────────────────
         if clicked && active_slider == ActiveSlider::None {
-            // Si hay un modal flotante abierto, solo permitir interacción con elementos dentro de su marco
-            let hit = if let Some(ref fw) = floating_state {
-                if fw.contains_point(mx, my) {
-                    canvas.buttons.iter().find(|b| b.contains(mx, my)).map(|b| b.id.clone())
+            if floating_state.is_none() && mini_chat.contains_point(mx, my) {
+                if let Some(chat_btn) = canvas
+                    .buttons
+                    .iter()
+                    .rev()
+                    .find(|b| b.id.starts_with("chat_") && b.contains(mx, my))
+                    .map(|b| b.id.clone())
+                {
+                    if let Some(focus_inp) = crate::chat_ui::handle_mini_chat_click(
+                        &chat_btn,
+                        &mut mini_chat,
+                        &agent_worker,
+                    ) {
+                        active_field = if focus_inp {
+                            ActiveField::AgentChatInput
+                        } else {
+                            ActiveField::None
+                        };
+                    }
                 } else {
-                    None
+                    active_field = ActiveField::None;
                 }
             } else {
-                canvas.buttons.iter().find(|b| b.contains(mx, my)).map(|b| b.id.clone())
-            };
+                if active_field == ActiveField::AgentChatInput {
+                    active_field = ActiveField::None;
+                }
+                // Si hay un modal flotante abierto, solo permitir interacción con elementos dentro de su marco
+                let hit = if let Some(ref fw) = floating_state {
+                    if fw.contains_point(mx, my) {
+                        canvas.buttons.iter().find(|b| b.contains(mx, my)).map(|b| b.id.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    canvas.buttons.iter().find(|b| b.contains(mx, my)).map(|b| b.id.clone())
+                };
 
-            if let Some(id) = hit {
-                match id.as_str() {
+                if let Some(id) = hit {
+                    match id.as_str() {
                     // Barra de Menús Superior
                     "menu_help" => {
                         current_modal = ModalDialog::AboutDialog;
@@ -2544,12 +2873,21 @@ pub fn run_gui_launcher(
 
                     // Toolbar Acciones
                     "tb_start" => {
-                        launch_vm_external(
+                        launch_vm_external_with_networks(
                             &profiles[sel_idx],
+                            &networks,
                             &mut running_vms,
                             &mut status_msg,
                             &mut status_is_err,
                         );
+                    }
+                    "tb_ai_chat" => {
+                        mini_chat.open = !mini_chat.open;
+                        active_field = if mini_chat.open {
+                            ActiveField::AgentChatInput
+                        } else {
+                            ActiveField::None
+                        };
                     }
                     "tb_new" => {
                         new_vm_name = format!("Maquina Virtual {}", profiles.len() + 1);
@@ -2594,8 +2932,54 @@ pub fn run_gui_launcher(
                     "tab_details" => {
                         current_view = MainViewTab::Details;
                     }
+                    "tab_networks" => {
+                        current_view = MainViewTab::Networks;
+                    }
                     "tab_logs" => {
                         current_view = MainViewTab::Logs;
+                    }
+                    "btn_net_new_nat" | "btn_net_new_host" | "btn_net_new_int" => {
+                        let mode = match id.as_str() {
+                            "btn_net_new_host" => crate::network::NetworkMode::HostOnly,
+                            "btn_net_new_int" => crate::network::NetworkMode::Internal,
+                            _ => crate::network::NetworkMode::Nat,
+                        };
+                        let name = format!("{}-{}", mode.as_str(), networks.len() + 1);
+                        let subnet = crate::network::next_available_subnet(&networks);
+                        match crate::network::VirtualNetwork::from_cidr(&name, mode, &subnet, None, Vec::new()) {
+                            Ok(net) => {
+                                networks.push(net);
+                                let _ = crate::network::save_networks(&networks);
+                                status_msg = format!("Red virtual '{}' ({}) creada.", name, subnet);
+                                status_is_err = false;
+                            }
+                            Err(e) => {
+                                status_msg = e;
+                                status_is_err = true;
+                            }
+                        }
+                    }
+                    "btn_net_add_ssh" => {
+                        let port = if profiles[sel_idx].ssh_host_port > 0 {
+                            profiles[sel_idx].ssh_host_port
+                        } else {
+                            next_free_ssh_port(&profiles)
+                        };
+                        profiles[sel_idx].ssh_host_port = port;
+                        let nname = profiles[sel_idx].network_name.clone();
+                        if let Some(net) = networks.iter_mut().find(|n| n.name == nname) {
+                            let pf = crate::network::PortForward {
+                                host_port: port,
+                                guest_port: 22,
+                            };
+                            if !net.port_forwards.contains(&pf) {
+                                net.port_forwards.push(pf);
+                            }
+                            let _ = crate::network::save_networks(&networks);
+                        }
+                        let _ = save_vm_profiles(&profiles);
+                        status_msg = format!("SSH para '{}' asignado en 127.0.0.1:{} -> :22", profiles[sel_idx].name, port);
+                        status_is_err = false;
                     }
 
                     // Pestañas de Medios
@@ -2822,7 +3206,10 @@ pub fn run_gui_launcher(
                         }
                     }
                     "set_regen_mac" => {
-                        status_msg = "Nueva direccion MAC generada para Adaptador 1 (02:55:00).".to_string();
+                        let seed = format!("{}-{}", profiles[sel_idx].name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1));
+                        profiles[sel_idx].mac_address = crate::network::generate_mac(&seed);
+                        let _ = save_vm_profiles(&profiles);
+                        status_msg = format!("Nueva MAC generada: {}", profiles[sel_idx].mac_address);
                     }
                     "wiz_vm_name_box" => active_field = ActiveField::WizardVmName,
                     "vd_name_box" => active_field = ActiveField::WizardDiskName,
@@ -2927,12 +3314,39 @@ pub fn run_gui_launcher(
                                     }
 
                                     if is_double_click {
-                                        launch_vm_external(
+                                        launch_vm_external_with_networks(
                                             &profiles[sel_idx],
+                                            &networks,
                                             &mut running_vms,
                                             &mut status_msg,
                                             &mut status_is_err,
                                         );
+                                    }
+                                }
+                            }
+                        } else if let Some(stripped) = id.strip_prefix("btn_net_use_") {
+                            if let Ok(nidx) = stripped.parse::<usize>() {
+                                if let Some(net) = networks.get(nidx) {
+                                    profiles[sel_idx].network_name = net.name.clone();
+                                    let _ = save_vm_profiles(&profiles);
+                                    status_msg = format!("VM '{}' conectada a red '{}'.", profiles[sel_idx].name, net.name);
+                                    status_is_err = false;
+                                }
+                            }
+                        } else if let Some(stripped) = id.strip_prefix("btn_net_del_") {
+                            if let Ok(nidx) = stripped.parse::<usize>() {
+                                if let Some(net) = networks.get(nidx).cloned() {
+                                    if net.name != crate::network::DEFAULT_NETWORK_NAME {
+                                        networks.remove(nidx);
+                                        for p in profiles.iter_mut() {
+                                            if p.network_name == net.name {
+                                                p.network_name = crate::network::DEFAULT_NETWORK_NAME.to_string();
+                                            }
+                                        }
+                                        let _ = crate::network::save_networks(&networks);
+                                        let _ = save_vm_profiles(&profiles);
+                                        status_msg = format!("Red '{}' eliminada.", net.name);
+                                        status_is_err = false;
                                     }
                                 }
                             }
@@ -2957,6 +3371,7 @@ pub fn run_gui_launcher(
                     }
                 }
             }
+            }
         }
 
         if let Err(e) = window.update_with_buffer(&canvas.buf, WIN_W, WIN_H) {
@@ -2966,6 +3381,7 @@ pub fn run_gui_launcher(
         needs_redraw = false;
     }
 
+    agent_worker.shutdown();
     GuiOutcome::Cancelled
 }
 

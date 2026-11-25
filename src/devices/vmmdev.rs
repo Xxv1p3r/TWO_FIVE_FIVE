@@ -111,8 +111,11 @@ pub const VMMDEV_MOUSE_HOST_HAS_ABS_DEV: u32 = 1 << 6;
 // Características del host
 #[allow(dead_code)]
 pub const VMMDEV_HVF_HGCM_PHYS_PAGE_LIST: u32 = 1 << 0;
+#[allow(dead_code)]
 pub const VMMDEV_HVF_HGCM: u32 = 0x02;
+#[allow(dead_code)]
 pub const VMMDEV_HVF_HGCM_CONTIG_PAGE_LIST: u32 = 0x08;
+#[allow(dead_code)]
 pub const VMMDEV_HVF_FAST_IRQ_ACK: u32 = 1 << 31;
 pub const VMMDEV_VERSION_1_03: u32 = 0x00010003;
 
@@ -202,15 +205,18 @@ impl VmmDevState {
         self.irq_asserted = false;
     }
 
+    /// Sincroniza `ram[8]` (`V1_04.fHaveEvents`) y `irq_asserted` sin pisar con bytes de eventos.
+    fn sync_mmio_and_irq(&mut self) {
+        let active = (self.host_event_flags & self.guest_filter_mask) != 0;
+        self.ram[8] = u8::from(active);
+        self.ram[9..16].fill(0);
+        self.irq_asserted = active;
+    }
+
     /// Emite un evento del host hacia el huésped y actualiza la bandera de interrupción
     pub fn raise_event(&mut self, event: u32) {
         self.host_event_flags |= event;
-        let host_events_bytes = self.host_event_flags.to_le_bytes();
-        self.ram[8] = 1; // fHaveEvents = true
-        self.ram[8..12].copy_from_slice(&host_events_bytes);
-        if (self.host_event_flags & self.guest_filter_mask) != 0 {
-            self.irq_asserted = true;
-        }
+        self.sync_mmio_and_irq();
     }
 
     /// Actualiza la posición absoluta del cursor del ratón (0..0xFFFF)
@@ -276,10 +282,7 @@ impl VmmDevDevice {
             }
             let pending = state.host_event_flags & state.guest_filter_mask;
             state.host_event_flags &= !state.guest_filter_mask;
-            let host_events_bytes = state.host_event_flags.to_le_bytes();
-            state.ram[8..12].copy_from_slice(&host_events_bytes);
-            state.ram[8] = 0; // fHaveEvents = false
-            state.irq_asserted = false;
+            state.sync_mmio_and_irq();
             let bytes = pending.to_le_bytes();
             return bytes.to_vec();
         }
@@ -323,9 +326,12 @@ impl VmmDevDevice {
         }
         let mut state = self.state.lock().unwrap();
         let off = (addr - mmio_base) as usize;
-        if off < state.ram.len() {
-            let copy_len = data.len().min(state.ram.len() - off);
-            state.ram[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+        // Cabecera [0..16] de VMMDevMemory es de solo lectura para el huésped
+        for (i, &b) in data.iter().enumerate() {
+            let pos = off + i;
+            if pos >= 16 && pos < state.ram.len() {
+                state.ram[pos] = b;
+            }
         }
         true
     }
@@ -353,70 +359,86 @@ impl VmmDevDevice {
 
         match request_type {
             VMMDEV_REQ_GET_HOST_VERSION => {
-                // Major 7, Minor 2, Build 20, Revision 161567, Features
-                let major = 7u16;
-                let minor = 2u16;
-                let build = 20u32;
-                let revision = 161567u32;
-                let features = VMMDEV_HVF_FAST_IRQ_ACK | VMMDEV_HVF_HGCM | VMMDEV_HVF_HGCM_CONTIG_PAGE_LIST;
+                if size < 40 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else {
+                    let major = 7u16;
+                    let minor = 2u16;
+                    let build = 20u32;
+                    let revision = 161567u32;
+                    let features = 0u32; // Sin HGCM ni fast ack no anunciado
 
-                let _ = mem.write_bytes(gpa as u64 + 24, &major.to_le_bytes());
-                let _ = mem.write_bytes(gpa as u64 + 26, &minor.to_le_bytes());
-                let _ = mem.write_bytes(gpa as u64 + 28, &build.to_le_bytes());
-                let _ = mem.write_bytes(gpa as u64 + 32, &revision.to_le_bytes());
-                let _ = mem.write_bytes(gpa as u64 + 36, &features.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 24, &major.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 26, &minor.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 28, &build.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 32, &revision.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 36, &features.to_le_bytes());
+                }
             }
 
             VMMDEV_REQ_GET_HOST_TIME => {
-                let ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let _ = mem.write_bytes(gpa as u64 + 24, &ms.to_le_bytes());
+                if size < 32 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else {
+                    let ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let _ = mem.write_bytes(gpa as u64 + 24, &ms.to_le_bytes());
+                }
             }
 
             VMMDEV_REQ_GET_MOUSE_STATUS => {
-                let feat = state.mouse_features;
-                let x = state.mouse_x;
-                let y = state.mouse_y;
-                let _ = mem.write_bytes(gpa as u64 + 24, &feat.to_le_bytes());
-                let _ = mem.write_bytes(gpa as u64 + 28, &x.to_le_bytes());
-                let _ = mem.write_bytes(gpa as u64 + 32, &y.to_le_bytes());
+                if size < 36 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else {
+                    let feat = state.mouse_features;
+                    let x = state.mouse_x;
+                    let y = state.mouse_y;
+                    let _ = mem.write_bytes(gpa as u64 + 24, &feat.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 28, &x.to_le_bytes());
+                    let _ = mem.write_bytes(gpa as u64 + 32, &y.to_le_bytes());
+                }
             }
 
             VMMDEV_REQ_SET_MOUSE_STATUS => {
                 let mut buf = [0u8; 4];
-                if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
+                if size < 28 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
                     let feat = u32::from_le_bytes(buf);
                     state.mouse_features = feat | VMMDEV_MOUSE_HOST_WANTS_ABSOLUTE | VMMDEV_MOUSE_HOST_HAS_ABS_DEV;
                 }
             }
 
             VMMDEV_REQ_ACKNOWLEDGE_EVENTS => {
-                let pending = state.host_event_flags & state.guest_filter_mask;
-                state.host_event_flags &= !state.guest_filter_mask;
-                let host_events_bytes = state.host_event_flags.to_le_bytes();
-                state.ram[8..12].copy_from_slice(&host_events_bytes);
-                state.ram[8] = 0; // fHaveEvents = false
-                state.irq_asserted = false;
-                let _ = mem.write_bytes(gpa as u64 + 24, &pending.to_le_bytes());
+                if size < 28 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else {
+                    let pending = state.host_event_flags & state.guest_filter_mask;
+                    state.host_event_flags &= !state.guest_filter_mask;
+                    state.sync_mmio_and_irq();
+                    let _ = mem.write_bytes(gpa as u64 + 24, &pending.to_le_bytes());
+                }
             }
 
             VMMDEV_REQ_CTL_GUEST_FILTER_MASK => {
                 let mut buf = [0u8; 8];
-                if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
+                if size < 32 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
                     let or_mask = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let not_mask = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     state.guest_filter_mask = (state.guest_filter_mask | or_mask) & !not_mask;
-                    if (state.host_event_flags & state.guest_filter_mask) != 0 {
-                        state.irq_asserted = true;
-                    }
+                    state.sync_mmio_and_irq();
                 }
             }
 
             VMMDEV_REQ_REPORT_GUEST_INFO => {
                 let mut buf = [0u8; 8];
-                if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
+                if size < 32 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
                     state.guest_info.interface_version = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     state.guest_info.os_type = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     state.additions_active = true;
@@ -432,7 +454,9 @@ impl VmmDevDevice {
 
             VMMDEV_REQ_REPORT_GUEST_INFO2 => {
                 let mut buf = [0u8; 144];
-                if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
+                if size < 168 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
                     state.guest_info.major = u16::from_le_bytes([buf[0], buf[1]]);
                     state.guest_info.minor = u16::from_le_bytes([buf[2], buf[3]]);
                     state.guest_info.build = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -458,13 +482,19 @@ impl VmmDevDevice {
             }
 
             VMMDEV_REQ_REPORT_GUEST_CAPABILITIES => {
-                let caps = state.guest_caps;
-                let _ = mem.write_bytes(gpa as u64 + 24, &caps.to_le_bytes());
+                let mut buf = [0u8; 4];
+                if size < 28 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
+                    state.guest_caps = u32::from_le_bytes(buf);
+                }
             }
 
             VMMDEV_REQ_SET_GUEST_CAPABILITIES => {
                 let mut buf = [0u8; 8];
-                if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
+                if size < 32 {
+                    rc = VERR_INVALID_PARAMETER;
+                } else if mem.read_bytes(gpa as u64 + 24, &mut buf).is_ok() {
                     let or_mask = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     let not_mask = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     state.guest_caps = (state.guest_caps | or_mask) & !not_mask;
@@ -472,34 +502,54 @@ impl VmmDevDevice {
             }
 
             VMMDEV_REQ_GET_DISPLAY_CHANGE_REQUEST => {
-                if let Some((w, h, bpp)) = state.display_change_req.take() {
-                    let _ = mem.write_bytes(gpa as u64 + 24, &w.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 28, &h.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 32, &bpp.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 36, &VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST.to_le_bytes());
+                if size < 40 {
+                    rc = VERR_INVALID_PARAMETER;
                 } else {
-                    let zero = 0u32.to_le_bytes();
-                    let _ = mem.write_bytes(gpa as u64 + 24, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 28, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 32, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 36, &zero);
+                    let mut ack_buf = [0u8; 4];
+                    if mem.read_bytes(gpa as u64 + 36, &mut ack_buf).is_ok() {
+                        let event_ack = u32::from_le_bytes(ack_buf);
+                        if event_ack != 0 {
+                            state.host_event_flags &= !VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST;
+                            state.sync_mmio_and_irq();
+                        }
+                    }
+                    if let Some((w, h, bpp)) = state.display_change_req.take() {
+                        let _ = mem.write_bytes(gpa as u64 + 24, &w.to_le_bytes());
+                        let _ = mem.write_bytes(gpa as u64 + 28, &h.to_le_bytes());
+                        let _ = mem.write_bytes(gpa as u64 + 32, &bpp.to_le_bytes());
+                    } else {
+                        let zero = 0u32.to_le_bytes();
+                        let _ = mem.write_bytes(gpa as u64 + 24, &zero);
+                        let _ = mem.write_bytes(gpa as u64 + 28, &zero);
+                        let _ = mem.write_bytes(gpa as u64 + 32, &zero);
+                    }
                 }
             }
 
             VMMDEV_REQ_GET_DISPLAY_CHANGE_REQUEST2 => {
-                if let Some((w, h, bpp)) = state.display_change_req.take() {
-                    let _ = mem.write_bytes(gpa as u64 + 24, &w.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 28, &h.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 32, &bpp.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 36, &VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST.to_le_bytes());
-                    let _ = mem.write_bytes(gpa as u64 + 40, &0u32.to_le_bytes()); // display 0
+                if size < 44 {
+                    rc = VERR_INVALID_PARAMETER;
                 } else {
-                    let zero = 0u32.to_le_bytes();
-                    let _ = mem.write_bytes(gpa as u64 + 24, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 28, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 32, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 36, &zero);
-                    let _ = mem.write_bytes(gpa as u64 + 40, &zero);
+                    let mut ack_buf = [0u8; 4];
+                    if mem.read_bytes(gpa as u64 + 36, &mut ack_buf).is_ok() {
+                        let event_ack = u32::from_le_bytes(ack_buf);
+                        if event_ack != 0 {
+                            state.host_event_flags &= !VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST;
+                            state.sync_mmio_and_irq();
+                        }
+                    }
+                    if let Some((w, h, bpp)) = state.display_change_req.take() {
+                        let _ = mem.write_bytes(gpa as u64 + 24, &w.to_le_bytes());
+                        let _ = mem.write_bytes(gpa as u64 + 28, &h.to_le_bytes());
+                        let _ = mem.write_bytes(gpa as u64 + 32, &bpp.to_le_bytes());
+                        let _ = mem.write_bytes(gpa as u64 + 40, &0u32.to_le_bytes()); // display 0
+                    } else {
+                        let zero = 0u32.to_le_bytes();
+                        let _ = mem.write_bytes(gpa as u64 + 24, &zero);
+                        let _ = mem.write_bytes(gpa as u64 + 28, &zero);
+                        let _ = mem.write_bytes(gpa as u64 + 32, &zero);
+                        let _ = mem.write_bytes(gpa as u64 + 40, &zero);
+                    }
                 }
             }
 
@@ -588,10 +638,7 @@ mod tests {
 
         let mut feat_bytes = [0u8; 4];
         let _ = guest_mem.read_bytes(gpa as u64 + 36, &mut feat_bytes);
-        assert_eq!(
-            u32::from_le_bytes(feat_bytes),
-            VMMDEV_HVF_FAST_IRQ_ACK | VMMDEV_HVF_HGCM | VMMDEV_HVF_HGCM_CONTIG_PAGE_LIST
-        );
+        assert_eq!(u32::from_le_bytes(feat_bytes), 0);
     }
 
     #[test]
@@ -637,25 +684,17 @@ mod tests {
         state.lock().unwrap().raise_event(VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST);
         assert!(state.lock().unwrap().irq_asserted);
 
-        // Verificar layout V1_03 u32HostEvents en ram[8..12]
-        let ram_events = {
-            let s = state.lock().unwrap();
-            u32::from_le_bytes([s.ram[8], s.ram[9], s.ram[10], s.ram[11]])
-        };
-        assert_eq!(ram_events, VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST);
+        // Verificar layout V1_04 fHaveEvents en ram[8]
+        assert_eq!(state.lock().unwrap().ram[8], 1);
 
         // Leer el puerto rápido de acuse (BAR0 + 8)
         let ack_bytes = dev.read(0xD008, 4);
         let ack_val = u32::from_le_bytes([ack_bytes[0], ack_bytes[1], ack_bytes[2], ack_bytes[3]]);
         assert_eq!(ack_val, VMMDEV_EVENT_DISPLAY_CHANGE_REQUEST);
 
-        // Verificar que la IRQ se desasertó y el evento se limpió
+        // Verificar que la IRQ se desasertó y fHaveEvents volvió a 0
         assert!(!state.lock().unwrap().irq_asserted);
-        let ram_events_cleared = {
-            let s = state.lock().unwrap();
-            u32::from_le_bytes([s.ram[8], s.ram[9], s.ram[10], s.ram[11]])
-        };
-        assert_eq!(ram_events_cleared, 0);
+        assert_eq!(state.lock().unwrap().ram[8], 0);
     }
 
     #[test]

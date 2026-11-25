@@ -109,20 +109,32 @@ impl UhciState {
         let token = mem.read_u32(td_addr + 8);
         let buffer = mem.read_u32(td_addr + 12);
 
-        // Si no está activo (bit 23 == 0), ya fue procesado
+        // Si no está activo (bit 23 == 0), ya fue procesado; no volver a avanzar ni modificar
         if status & 0x0080_0000 == 0 {
-            return (link, false);
+            return (link, true);
         }
 
-        // Si el puerto 1 no está habilitado (PE == 0), no podemos comunicarnos con el dispositivo
+        let complete_with_error = |s: &mut Self, err_mask: u32| -> (u32, bool) {
+            let new_status = (status & !0x0080_07FF) | err_mask | 0x0004_0000 | 0x7FF;
+            mem.write_u32(td_addr + 4, new_status);
+            s.usb_sts |= USBSTS_ERROR;
+            if (s.usb_intr & 0x0001) != 0 {
+                s.irq_pulse = true;
+            }
+            (link, false)
+        };
+
+        // Si el puerto 1 no está habilitado (PE == 0), completar con error CRC/Timeout rápidamente
         if (self.port_status[0] & USBPORTSC_PE) == 0 {
-            return (link, true);
+            return complete_with_error(self, 0);
         }
 
         let dev_addr = ((token >> 8) & 0x7F) as u8;
-        // Si no coincide la dirección del dispositivo con la de nuestra tableta, ignorar
-        if dev_addr != self.tablet.address && (self.tablet.pending_address == 0 || dev_addr != 0) {
-            return (link, true);
+        // Si no coincide la dirección del dispositivo con la de nuestra tableta, responder CRC/Timeout
+        if dev_addr != self.tablet.address
+            && !(self.tablet.pending_address.is_some() && dev_addr == 0)
+        {
+            return complete_with_error(self, 0);
         }
 
         let pid = (token & 0xFF) as u8;
@@ -135,7 +147,9 @@ impl UhciState {
                 // SETUP PID (siempre 8 bytes)
                 let mut setup_bytes = [0u8; 8];
                 mem.copy_from(buffer as usize, &mut setup_bytes);
-                self.tablet.handle_setup(&setup_bytes);
+                if !self.tablet.handle_setup(&setup_bytes) {
+                    return complete_with_error(self, 0x0040_0000); // STALL
+                }
 
                 // TD completado: limpiar bit activo (bit 23) y escribir longitud real (8 bytes -> actlen 7)
                 status = (status & !0x0080_07FF) | 7;
@@ -149,6 +163,16 @@ impl UhciState {
                 (link, false)
             }
             0x69 => {
+                if self.tablet.ctrl_stalled && endpoint == 0 {
+                    self.tablet.ctrl_stalled = false;
+                    status = (status & !0x0080_07FF) | 0x0040_07FF; // STALL
+                    mem.write_u32(td_addr + 4, status);
+                    self.usb_sts |= USBSTS_ERROR;
+                    if (self.usb_intr & 0x0001) != 0 {
+                        self.irq_pulse = true;
+                    }
+                    return (link, false);
+                }
                 // IN PID (transferencia hacia el host)
                 let mut stack_buf = [0u8; 64];
                 let opt_len = if max_len <= stack_buf.len() {
@@ -201,18 +225,27 @@ impl UhciState {
             }
             0xE1 => {
                 // OUT PID (transferencia desde el host)
-                if max_len > 0 {
+                let ok = if max_len > 0 {
                     if max_len <= 64 {
                         let mut stack_buf = [0u8; 64];
                         mem.copy_from(buffer as usize, &mut stack_buf[..max_len]);
-                        self.tablet.handle_out(endpoint, &stack_buf[..max_len]);
+                        self.tablet.handle_out(endpoint, &stack_buf[..max_len])
                     } else {
                         let mut out_data = vec![0u8; max_len];
                         mem.copy_from(buffer as usize, &mut out_data);
-                        self.tablet.handle_out(endpoint, &out_data);
+                        self.tablet.handle_out(endpoint, &out_data)
                     }
                 } else {
-                    self.tablet.handle_out(endpoint, &[]);
+                    self.tablet.handle_out(endpoint, &[])
+                };
+                if !ok {
+                    status = (status & !0x0080_07FF) | 0x0040_07FF; // STALL
+                    mem.write_u32(td_addr + 4, status);
+                    self.usb_sts |= USBSTS_ERROR;
+                    if (self.usb_intr & 0x0001) != 0 {
+                        self.irq_pulse = true;
+                    }
+                    return (link, false);
                 }
                 let actlen_field = if max_len == 0 {
                     0x7FF
@@ -236,10 +269,11 @@ impl UhciState {
     /// Procesa recursivamente una Queue Head (QH) y sus elementos verticales/horizontales.
     /// Soporta jerarquías de QHs enlazadas verticalmente (`elem_link & 2 != 0`), usadas
     /// tanto por SeaBIOS (`wait_pipe`) como por Windows (`usbuhci.sys`).
-    fn process_qh(&mut self, mem: &GuestMemory, qh_addr: usize, depth: usize) {
-        if depth > 8 || qh_addr == 0 {
+    fn process_qh(&mut self, mem: &GuestMemory, qh_addr: usize, depth: usize, visited: &mut Vec<usize>) {
+        if depth > 8 || qh_addr == 0 || visited.contains(&qh_addr) {
             return;
         }
+        visited.push(qh_addr);
         let mut elem_link = mem.read_u32(qh_addr + 4);
 
         let mut vert_limit = 64;
@@ -262,7 +296,10 @@ impl UhciState {
                     }
                     if (child_link & 2) != 0 {
                         let next_horiz = mem.read_u32(child_addr);
-                        self.process_qh(mem, child_addr, depth + 1);
+                        if visited.contains(&child_addr) {
+                            break;
+                        }
+                        self.process_qh(mem, child_addr, depth + 1, visited);
                         child_link = next_horiz;
                     } else {
                         let (next_td, still_active) = self.process_td(mem, child_addr);
@@ -304,8 +341,9 @@ impl UhciState {
 
         let entry_addr = flbase + frame_idx * 4;
         let mut link = mem.read_u32(entry_addr);
+        let mut visited_qhs: Vec<usize> = Vec::with_capacity(16);
 
-        // Límite horizontal para evitar bucles infinitos en punteros circulares
+        // Límite horizontal + detección de ciclos FSBR
         let mut horiz_limit = 128;
         while (link & 1) == 0 && horiz_limit > 0 {
             horiz_limit -= 1;
@@ -315,9 +353,12 @@ impl UhciState {
             }
 
             if (link & 2) != 0 {
-                // Queue Head (QH)
+                // Queue Head (QH) - detectar bucle FSBR
+                if visited_qhs.contains(&target_addr) {
+                    break;
+                }
                 let horizontal_link = mem.read_u32(target_addr);
-                self.process_qh(mem, target_addr, 0);
+                self.process_qh(mem, target_addr, 0, &mut visited_qhs);
                 link = horizontal_link;
             } else {
                 // Transfer Descriptor (TD) directo en la lista de frames
@@ -386,10 +427,12 @@ impl UsbUhci {
         s.take_irq_pulse()
     }
 
-    /// Consume el pulso de interrupción y consulta el nivel de línea en una sola adquisición del lock.
+    /// Consulta el nivel de línea y consume el pulso de interrupción en una sola adquisición del lock: `(asserted, pulse)`.
     pub fn poll_irq(&self) -> (bool, bool) {
         let mut s = self.state.lock().unwrap();
-        (s.take_irq_pulse(), s.is_irq_asserted())
+        let asserted = s.is_irq_asserted();
+        let pulse = s.take_irq_pulse();
+        (asserted, pulse)
     }
 
     /// Inyecta un evento en la tableta USB.
@@ -421,7 +464,7 @@ impl IoDevice for UsbUhci {
     fn write(&mut self, port: u16, data: &[u8]) {
         if data.is_empty() { return; }
         let mut s = self.state.lock().unwrap();
-        let off = port - s.iobase;
+        let Some(off) = port.checked_sub(s.iobase) else { return; };
         let val = if data.len() >= 2 {
             u16::from_le_bytes([data[0], data[1]])
         } else {
@@ -441,6 +484,12 @@ impl IoDevice for UsbUhci {
                     s.tablet.reset();
                     s.irq_pulse = false;
                 } else {
+                    if val & 0x0004 != 0 {
+                        // USBCMD_GRESET: Global Reset
+                        s.port_status[0] = (s.port_status[0] & !USBPORTSC_PE) | USBPORTSC_PR;
+                        s.port_status[1] = (s.port_status[1] & !USBPORTSC_PE) | USBPORTSC_PR;
+                        s.tablet.reset();
+                    }
                     s.usb_cmd = val;
                     if val & USBCMD_RS != 0 {
                         s.usb_sts &= !USBSTS_HCH;
@@ -461,9 +510,13 @@ impl IoDevice for UsbUhci {
             USBINTR => { s.usb_intr = val; }
             USBFRNUM => { s.usb_frnum = val; }
             USBFLBASEADD => {
-                if data.len() >= 2 {
-                    let low = u16::from_le_bytes([data[0], data.get(1).copied().unwrap_or(0)]);
+                if data.len() >= 4 {
+                    s.usb_flbase = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                } else if data.len() >= 2 {
+                    let low = u16::from_le_bytes([data[0], data[1]]);
                     s.usb_flbase = (s.usb_flbase & 0xFFFF0000) | low as u32;
+                } else {
+                    s.usb_flbase = (s.usb_flbase & 0xFFFFFF00) | data[0] as u32;
                 }
             }
             USBFLBASEADD_HI => {
@@ -518,7 +571,13 @@ impl IoDevice for UsbUhci {
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
         let s = self.state.lock().unwrap();
-        let off = port - s.iobase;
+        let Some(off) = port.checked_sub(s.iobase) else {
+            return vec![0xFF; count];
+        };
+        if off == USBFLBASEADD {
+            let bytes = s.usb_flbase.to_le_bytes();
+            return bytes.iter().take(count).copied().collect();
+        }
         let result = match off {
             USBCMD => s.usb_cmd.to_le_bytes(),
             USBSTS => {
@@ -530,10 +589,6 @@ impl IoDevice for UsbUhci {
             }
             USBINTR => s.usb_intr.to_le_bytes(),
             USBFRNUM => s.usb_frnum.to_le_bytes(),
-            USBFLBASEADD => {
-                let bytes = s.usb_flbase.to_le_bytes();
-                [bytes[0], bytes[1]]
-            }
             USBFLBASEADD_HI => {
                 let bytes = s.usb_flbase.to_le_bytes();
                 [bytes[2], bytes[3]]

@@ -9,7 +9,9 @@ use crate::guest_mem::GuestMemory;
 use std::collections::VecDeque;
 use std::sync::mpsc;
 
+#[allow(dead_code)]
 pub const E1000_VENDOR_ID: u16 = 0x8086;
+#[allow(dead_code)]
 pub const E1000_DEVICE_ID: u16 = 0x100E; // 82540EM Gigabit Ethernet Controller
 pub const E1000_DEFAULT_MAC: [u8; 6] = [0x08, 0x00, 0x27, 0x12, 0x34, 0x56];
 
@@ -50,6 +52,7 @@ pub const REG_TIDV: usize = 0x3820;
 pub const REG_TXDCTL: usize = 0x3828;
 pub const REG_TADV: usize = 0x382C;
 pub const REG_RXCSUM: usize = 0x5000;
+#[allow(dead_code)]
 pub const REG_MTA: usize = 0x5200; // 128 dwords (0x5200..0x5400)
 pub const REG_RAL: usize = 0x5400;
 pub const REG_RAH: usize = 0x5404;
@@ -61,38 +64,59 @@ pub const REG_FWSM: usize = 0x5B54;
 pub const STATUS_FD: u32 = 1 << 0;     // Full Duplex
 pub const STATUS_LU: u32 = 1 << 1;     // Link Up
 pub const STATUS_SPEED_1000: u32 = 2 << 6; // 1000 Mb/s
+#[allow(dead_code)]
 pub const STATUS_PCI66: u32 = 1 << 9;  // 66 MHz PCI
+#[allow(dead_code)]
 pub const STATUS_BUS64: u32 = 1 << 10; // 64-bit PCI bus
 
 // Banderas de Interrupción (ICR / IMS / IMC)
 pub const ICR_TXDW: u32 = 1 << 0; // Transmit Descriptor Written Back
 pub const ICR_TXQE: u32 = 1 << 1; // Transmit Queue Empty
+#[allow(dead_code)]
 pub const ICR_LSC: u32 = 1 << 2;  // Link Status Change
+#[allow(dead_code)]
 pub const ICR_RXSEQ: u32 = 1 << 3; // Receive Sequence Error
+#[allow(dead_code)]
 pub const ICR_RXDMT0: u32 = 1 << 4; // Rx Desc Min Threshold
+#[allow(dead_code)]
 pub const ICR_RXO: u32 = 1 << 6;  // Receiver Overrun
 pub const ICR_RXT0: u32 = 1 << 7; // Receiver Timer Interrupt
+pub const ICR_INT_ASSERTED: u32 = 1 << 31;
 
 // Banderas de RCTL (0x0100)
 pub const RCTL_EN: u32 = 1 << 1;      // Receiver Enable
+#[allow(dead_code)]
 pub const RCTL_SBP: u32 = 1 << 2;     // Store Bad Packets
+#[allow(dead_code)]
 pub const RCTL_UPE: u32 = 1 << 3;     // Unicast Promiscuous
+#[allow(dead_code)]
 pub const RCTL_MPE: u32 = 1 << 4;     // Multicast Promiscuous
+#[allow(dead_code)]
 pub const RCTL_BAM: u32 = 1 << 15;    // Broadcast Accept Mode
+#[allow(dead_code)]
 pub const RCTL_BSIZE_2048: u32 = 0 << 16;
+#[allow(dead_code)]
 pub const RCTL_BSIZE_1024: u32 = 1 << 16;
+#[allow(dead_code)]
 pub const RCTL_BSIZE_512: u32 = 2 << 16;
+#[allow(dead_code)]
 pub const RCTL_BSIZE_256: u32 = 3 << 16;
+pub const RCTL_BSEX: u32 = 1 << 25;   // Buffer Size Extension
+pub const RCTL_SECRC: u32 = 1 << 26;  // Strip Ethernet CRC
 
 // Banderas de TCTL (0x0400)
 pub const TCTL_EN: u32 = 1 << 1;      // Transmit Enable
+#[allow(dead_code)]
 pub const TCTL_PSP: u32 = 1 << 3;     // Pad Short Packets
 
 // Banderas de Descriptor de Transmisión (Tx Desc)
 pub const TXD_CMD_EOP: u8 = 1 << 0;   // End of Packet
+#[allow(dead_code)]
 pub const TXD_CMD_IFCS: u8 = 1 << 1;  // Insert FCS/CRC
 pub const TXD_CMD_RS: u8 = 1 << 3;    // Report Status
 pub const TXD_STAT_DD: u8 = 1 << 0;   // Descriptor Done
+pub const TXD_POPTS_IXSM: u8 = 1 << 0;
+pub const TXD_POPTS_TXSM: u8 = 1 << 1;
 
 // Banderas de Descriptor de Recepción (Rx Desc)
 pub const RXD_STAT_DD: u8 = 1 << 0;   // Descriptor Done
@@ -251,6 +275,14 @@ pub struct E1000State {
     pub tx_packets: VecDeque<Vec<u8>>,
     pub rx_queue: VecDeque<Vec<u8>>,
 
+    // TX Context Offload state (DTYP = 0)
+    pub tx_ctx_ipcss: u8,
+    pub tx_ctx_ipcso: u8,
+    pub tx_ctx_ipcse: u16,
+    pub tx_ctx_tucss: u8,
+    pub tx_ctx_tucso: u8,
+    pub tx_ctx_tucse: u16,
+
     // Conexión con el worker de red NAT / TAP
     pub tx_sender: Option<mpsc::Sender<Vec<u8>>>,
     pub rx_receiver: Option<mpsc::Receiver<Vec<u8>>>,
@@ -277,10 +309,14 @@ impl E1000State {
             | ((mac[3] as u32) << 24);
         let rah = (mac[4] as u32) | ((mac[5] as u32) << 8) | (1 << 31); // Address Valid
 
-        // Inicializar canal de comunicación con el Worker de red
+        // Inicializar canal de comunicación con el Worker de red (subred separada 10.0.3.x)
         let (tx_sender, tx_receiver) = mpsc::channel();
         let (rx_sender, rx_receiver) = mpsc::channel();
-        crate::devices::virtio_net::spawn_net_worker(tx_receiver, rx_sender);
+        crate::devices::virtio_net::spawn_net_worker_with_config(
+            tx_receiver,
+            rx_sender,
+            crate::devices::virtio_net::NetConfig::e1000(),
+        );
 
         Self {
             mmio_base: 0,
@@ -323,6 +359,12 @@ impl E1000State {
             irq_asserted: false,
             tx_packets: VecDeque::new(),
             rx_queue: VecDeque::new(),
+            tx_ctx_ipcss: 0,
+            tx_ctx_ipcso: 0,
+            tx_ctx_ipcse: 0,
+            tx_ctx_tucss: 0,
+            tx_ctx_tucso: 0,
+            tx_ctx_tucse: 0,
             tx_sender: Some(tx_sender),
             rx_receiver: Some(rx_receiver),
         }
@@ -360,6 +402,12 @@ impl E1000State {
         self.irq_asserted = false;
         self.tx_packets.clear();
         self.rx_queue.clear();
+        self.tx_ctx_ipcss = 0;
+        self.tx_ctx_ipcso = 0;
+        self.tx_ctx_ipcse = 0;
+        self.tx_ctx_tucss = 0;
+        self.tx_ctx_tucso = 0;
+        self.tx_ctx_tucse = 0;
         self.eeprom_state = EepromState::default();
     }
 
@@ -400,7 +448,10 @@ impl E1000State {
             }
             REG_FWSM => 0,
             REG_ICR => {
-                let val = self.icr;
+                let mut val = self.icr;
+                if (val & self.ims) != 0 {
+                    val |= ICR_INT_ASSERTED;
+                }
                 self.icr = 0;
                 self.update_irq();
                 val
@@ -474,9 +525,9 @@ impl E1000State {
                 let reg = ((val >> 16) & 0x1F) as usize;
                 let data_in = (val & 0xFFFF) as u16;
                 if op == 1 {
-                    // Write PHY register
+                    // Write PHY register (BMCR bit 15 reset es autoclear)
                     if reg == 0 {
-                        self.phy_ctrl = data_in;
+                        self.phy_ctrl = data_in & !0x8000;
                     }
                     self.mdic = (val & 0x0FFF_FFFF) | (1 << 28); // Ready
                 } else if op == 2 {
@@ -489,6 +540,10 @@ impl E1000State {
             }
             REG_SWSM => self.swsm = val,
             REG_RXCSUM => self.rxcsum = val,
+            REG_ICR => {
+                self.icr &= !val;
+                self.update_irq();
+            }
             REG_ICS => {
                 self.icr |= val;
                 self.update_irq();
@@ -565,13 +620,16 @@ impl E1000State {
         }
 
         let base_gpa = ((self.tdbah as u64) << 32) | (self.tdbal as u64);
-        let mut cur_head = self.tdh as u64;
-        let target_tail = self.tdt as u64;
+        let mut cur_head = (self.tdh as u64) % num_descs;
+        let target_tail = (self.tdt as u64) % num_descs;
+        let mut max_iters = num_descs;
 
         let mut packet_data = Vec::new();
+        let mut packet_popts = 0u8;
         let mut any_written_back = false;
 
-        while cur_head != target_tail {
+        while cur_head != target_tail && max_iters > 0 {
+            max_iters -= 1;
             let desc_gpa = base_gpa + cur_head * desc_size;
             let mut desc_bytes = [0u8; 16];
             if mem.read_bytes(desc_gpa, &mut desc_bytes).is_err() {
@@ -588,18 +646,26 @@ impl E1000State {
                 let is_data_desc = (lower & (1 << 20)) != 0; // DTYP = 1 (Data)
                 if is_data_desc {
                     let len = (lower & 0x000F_FFFF) as usize;
-                    if buf_addr != 0 && len > 0 {
+                    packet_popts |= desc_bytes[13];
+                    if buf_addr != 0 && len > 0 && len <= 65536 {
                         let mut chunk = vec![0u8; len];
                         if mem.read_bytes(buf_addr, &mut chunk).is_ok() {
                             packet_data.extend_from_slice(&chunk);
                         }
                     }
+                } else {
+                    // Descriptor de Contexto TX (DTYP = 0): almacenar offsets de offload IP/TCP/UDP
+                    self.tx_ctx_ipcss = desc_bytes[0];
+                    self.tx_ctx_ipcso = desc_bytes[1];
+                    self.tx_ctx_ipcse = u16::from_le_bytes([desc_bytes[2], desc_bytes[3]]);
+                    self.tx_ctx_tucss = desc_bytes[4];
+                    self.tx_ctx_tucso = desc_bytes[5];
+                    self.tx_ctx_tucse = u16::from_le_bytes([desc_bytes[6], desc_bytes[7]]);
                 }
-                // Si es un Descriptor de Contexto (DTYP = 0), no contiene payload
             } else {
                 // Descriptor de formato Legacy
                 let len = (lower & 0xFFFF) as usize;
-                if buf_addr != 0 && len > 0 {
+                if buf_addr != 0 && len > 0 && len <= 65536 {
                     let mut chunk = vec![0u8; len];
                     if mem.read_bytes(buf_addr, &mut chunk).is_ok() {
                         packet_data.extend_from_slice(&chunk);
@@ -614,16 +680,71 @@ impl E1000State {
                 any_written_back = true;
             }
 
-            // Si es End of Packet (EOP) y hay datos acumulados, despachar la trama Ethernet completa
+            // Si es End of Packet (EOP) y hay datos acumulados, completar offload y despachar
             if (cmd & TXD_CMD_EOP) != 0 && !packet_data.is_empty() {
-                self.tx_packets.push_back(packet_data.clone());
+                if (packet_popts & TXD_POPTS_IXSM) != 0 {
+                    let start = self.tx_ctx_ipcss as usize;
+                    let csum_off = self.tx_ctx_ipcso as usize;
+                    let end = if self.tx_ctx_ipcse == 0 {
+                        packet_data.len().saturating_sub(1)
+                    } else {
+                        (self.tx_ctx_ipcse as usize).min(packet_data.len().saturating_sub(1))
+                    };
+                    if start < end && csum_off + 1 < packet_data.len() {
+                        packet_data[csum_off] = 0;
+                        packet_data[csum_off + 1] = 0;
+                        let csum = crate::devices::virtio_net::ip_checksum(&packet_data[start..=end]);
+                        packet_data[csum_off..csum_off + 2].copy_from_slice(&csum.to_be_bytes());
+                    }
+                }
+                if (packet_popts & TXD_POPTS_TXSM) != 0 {
+                    let start = self.tx_ctx_tucss as usize;
+                    let csum_off = self.tx_ctx_tucso as usize;
+                    let end = if self.tx_ctx_tucse == 0 {
+                        packet_data.len().saturating_sub(1)
+                    } else {
+                        (self.tx_ctx_tucse as usize).min(packet_data.len().saturating_sub(1))
+                    };
+                    if start < end && csum_off + 1 < packet_data.len() && packet_data.len() >= 34 {
+                        packet_data[csum_off] = 0;
+                        packet_data[csum_off + 1] = 0;
+                        let proto = packet_data[23] as u32;
+                        let l4_len = (end - start + 1) as u32;
+                        let mut sum: u32 = 0;
+                        for pair in packet_data[26..34].chunks_exact(2) {
+                            sum = sum.wrapping_add(u16::from_be_bytes([pair[0], pair[1]]) as u32);
+                        }
+                        sum = sum.wrapping_add(proto).wrapping_add(l4_len);
+                        for chunk in packet_data[start..=end].chunks(2) {
+                            let v = if chunk.len() == 2 {
+                                u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+                            } else {
+                                (chunk[0] as u32) << 8
+                            };
+                            sum = sum.wrapping_add(v);
+                        }
+                        while (sum >> 16) != 0 {
+                            sum = (sum & 0xFFFF) + (sum >> 16);
+                        }
+                        let csum = !(sum as u16);
+                        packet_data[csum_off..csum_off + 2].copy_from_slice(&csum.to_be_bytes());
+                    }
+                }
+
+                if cfg!(test) {
+                    self.tx_packets.push_back(packet_data.clone());
+                }
                 // Despachar a la red local (DHCP, ARP, ICMP) o al worker upstream
-                if let Some(reply) = crate::devices::virtio_net::process_local_frame(&packet_data) {
+                if let Some(reply) = crate::devices::virtio_net::process_local_frame_with_cfg(
+                    &packet_data,
+                    &crate::devices::virtio_net::NetConfig::e1000(),
+                ) {
                     self.receive_packet(reply, mem);
                 } else if let Some(ref tx_tx) = self.tx_sender {
                     let _ = tx_tx.send(packet_data.clone());
                 }
                 packet_data.clear();
+                packet_popts = 0;
             }
 
             cur_head = (cur_head + 1) % num_descs;
@@ -657,52 +778,84 @@ impl E1000State {
         }
 
         let base_gpa = ((self.rdbah as u64) << 32) | (self.rdbal as u64);
-        let mut cur_head = self.rdh as u64;
-        let target_tail = self.rdt as u64;
+        let mut cur_head = (self.rdh as u64) % num_descs;
+        let target_tail = (self.rdt as u64) % num_descs;
         let mut delivered = false;
 
-        let buf_size = match (self.rctl >> 16) & 0x03 {
-            0 => 2048,
-            1 => 1024,
-            2 => 512,
-            3 => 256,
-            _ => 2048,
+        let bsize_idx = (self.rctl >> 16) & 0x03;
+        let buf_size = if (self.rctl & RCTL_BSEX) != 0 {
+            match bsize_idx {
+                1 => 16384,
+                2 => 8192,
+                3 => 4096,
+                _ => 2048,
+            }
+        } else {
+            match bsize_idx {
+                0 => 2048,
+                1 => 1024,
+                2 => 512,
+                3 => 256,
+                _ => 2048,
+            }
         };
 
-        while cur_head != target_tail && !self.rx_queue.is_empty() {
-            let pkt = self.rx_queue.pop_front().unwrap();
-            let desc_gpa = base_gpa + cur_head * desc_size;
-            let mut desc_bytes = [0u8; 16];
-            if mem.read_bytes(desc_gpa, &mut desc_bytes).is_err() {
+        let mut max_iters = num_descs;
+        while cur_head != target_tail && max_iters > 0 && !self.rx_queue.is_empty() {
+            let mut pkt = self.rx_queue.pop_front().unwrap();
+            if (self.rctl & RCTL_SECRC) == 0 {
+                // Añadir 4 bytes de FCS y asegurar mínimo de 60B + 4B = 64B Ethernet
+                if pkt.len() < 60 {
+                    pkt.resize(60, 0);
+                }
+                pkt.extend_from_slice(&[0u8; 4]);
+            }
+
+            let avail_descs = if target_tail >= cur_head {
+                target_tail - cur_head
+            } else {
+                num_descs - cur_head + target_tail
+            };
+            let needed_descs = (pkt.len().div_ceil(buf_size) as u64).max(1);
+            if avail_descs < needed_descs || avail_descs > max_iters {
                 self.rx_queue.push_front(pkt);
                 break;
             }
 
-            let buf_addr = u64::from_le_bytes(desc_bytes[0..8].try_into().unwrap());
-            if buf_addr != 0 {
-                let write_len = pkt.len().min(buf_size);
-                let _ = mem.write_bytes(buf_addr, &pkt[..write_len]);
+            let mut offset = 0usize;
+            for d in 0..needed_descs {
+                max_iters -= 1;
+                let desc_gpa = base_gpa + cur_head * desc_size;
+                let mut desc_bytes = [0u8; 16];
+                if mem.read_bytes(desc_gpa, &mut desc_bytes).is_err() {
+                    break;
+                }
 
-                // Actualizar descriptor RX: length, status (DD | EOP | IXSM | IPCS | TCPCS)
-                let len_bytes = (write_len as u16).to_le_bytes();
+                let buf_addr = u64::from_le_bytes(desc_bytes[0..8].try_into().unwrap());
+                let chunk_len = (pkt.len() - offset).min(buf_size);
+                if buf_addr != 0 && chunk_len > 0 {
+                    let _ = mem.write_bytes(buf_addr, &pkt[offset..offset + chunk_len]);
+                }
+                offset += chunk_len;
+
+                let is_last = d + 1 == needed_descs;
+                let len_bytes = (chunk_len as u16).to_le_bytes();
                 desc_bytes[8] = len_bytes[0];
                 desc_bytes[9] = len_bytes[1];
                 desc_bytes[10] = 0; // Checksum
                 desc_bytes[11] = 0;
-                // Status bits:
-                // Bit 0: DD (Descriptor Done)
-                // Bit 1: EOP (End of Packet)
-                // Bit 2: IXSM (Ignore Checksum Indication)
-                // Bit 5: TCPCS (TCP Checksum Calculated)
-                // Bit 6: IPCS (IP Checksum Calculated)
-                desc_bytes[12] = RXD_STAT_DD | RXD_STAT_EOP | (1 << 2) | (1 << 5) | (1 << 6);
-                desc_bytes[13] = 0; // Errors: 0
-                desc_bytes[14] = 0; // Special: 0
+                let mut st_flags = RXD_STAT_DD | (1 << 2) | (1 << 5) | (1 << 6);
+                if is_last {
+                    st_flags |= RXD_STAT_EOP;
+                }
+                desc_bytes[12] = st_flags;
+                desc_bytes[13] = 0;
+                desc_bytes[14] = 0;
                 desc_bytes[15] = 0;
                 let _ = mem.write_bytes(desc_gpa + 8, &desc_bytes[8..16]);
-            }
 
-            cur_head = (cur_head + 1) % num_descs;
+                cur_head = (cur_head + 1) % num_descs;
+            }
             delivered = true;
         }
 
@@ -821,11 +974,15 @@ impl E1000Device {
             }
             4..=7 => {
                 let reg_off = s.io_addr as usize;
-                let mut bytes = s.read_reg(reg_off).to_le_bytes();
                 let sub = (off & 3) as usize;
-                let copy_len = data.len().min(4 - sub);
-                bytes[sub..sub + copy_len].copy_from_slice(&data[..copy_len]);
-                let val = u32::from_le_bytes(bytes);
+                let val = if sub == 0 && data.len() >= 4 {
+                    u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+                } else {
+                    let mut bytes = s.read_reg(reg_off).to_le_bytes();
+                    let copy_len = data.len().min(4 - sub);
+                    bytes[sub..sub + copy_len].copy_from_slice(&data[..copy_len]);
+                    u32::from_le_bytes(bytes)
+                };
                 s.write_reg(reg_off, val, mem);
             }
             _ => {}
@@ -981,7 +1138,7 @@ mod tests {
         rdesc[0..8].copy_from_slice(&rx_buf_gpa.to_le_bytes());
         let _ = guest_mem.write_bytes(rdesc_base, &rdesc);
 
-        state.write_reg(REG_RCTL, RCTL_EN | RCTL_BAM, None);
+        state.write_reg(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC, None);
         state.write_reg(REG_RDBAL, rdesc_base as u32, None);
         state.write_reg(REG_RDLEN, 128, None);
         state.write_reg(REG_RDH, 0, None);

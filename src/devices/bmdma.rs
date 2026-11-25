@@ -93,10 +93,13 @@ impl BmdmaController {
 
         let mut prd_ptr = (self.primary.prd_addr & !3) as usize;
         let is_write = primary_ide.dma_is_write;
-        let mut lba = primary_ide.get_lba();
+        let lba = primary_ide.get_lba();
         let total_sectors_requested = primary_ide.get_sector_count();
-        let mut sectors_processed: u16 = 0;
+        let total_bytes_requested = (total_sectors_requested as usize) * 512;
 
+        // Recolectar tabla PRD completa para soportar scatter-gather no alineado a 512 B
+        let mut prds: Vec<(usize, usize)> = Vec::new();
+        let mut prd_total_bytes = 0usize;
         for _ in 0..1024 {
             let phys_buf = mem.read_u32(prd_ptr) as usize;
             let count_and_eot = mem.read_u32(prd_ptr + 4);
@@ -105,43 +108,52 @@ impl BmdmaController {
                 byte_count = 65536; // Especificación ATA: 0 significa 64 KiB
             }
             let eot = (count_and_eot & 0x8000_0000) != 0;
-
-            let sectors = ((byte_count + 511) / 512) as u16;
-            let sectors_to_transfer = if total_sectors_requested > 0 {
-                sectors.min(total_sectors_requested.saturating_sub(sectors_processed))
-            } else {
-                sectors
-            };
-
-            if sectors_to_transfer > 0 {
-                if is_write {
-                    // RAM guest -> Disco
-                    let bytes = (sectors_to_transfer as usize) * 512;
-                    let mut tmp = vec![0u8; bytes];
-                    mem.copy_from(phys_buf, &mut tmp);
-                    primary_ide.write_sectors(lba, sectors_to_transfer, &tmp);
-                } else {
-                    // Disco -> RAM guest
-                    let data = primary_ide.read_sectors(lba, sectors_to_transfer);
-                    let to_copy = byte_count.min(data.len());
-                    mem.copy_to(phys_buf, &data[..to_copy]);
-                }
-
-                lba += sectors_to_transfer as u64;
-                sectors_processed += sectors_to_transfer;
-            }
-
+            prds.push((phys_buf, byte_count));
+            prd_total_bytes = prd_total_bytes.saturating_add(byte_count);
             prd_ptr += 8;
-            if eot || (total_sectors_requested > 0 && sectors_processed >= total_sectors_requested) {
+            if eot || (total_bytes_requested > 0 && prd_total_bytes >= total_bytes_requested) {
                 break;
+            }
+        }
+
+        let transfer_bytes = if total_bytes_requested > 0 {
+            total_bytes_requested.min(prd_total_bytes)
+        } else {
+            prd_total_bytes
+        };
+        let sectors = ((transfer_bytes + 511) / 512) as u32;
+
+        if sectors > 0 {
+            if is_write {
+                let mut gathered = vec![0u8; (sectors as usize) * 512];
+                let mut off = 0usize;
+                for (phys_buf, byte_count) in prds {
+                    if off >= transfer_bytes {
+                        break;
+                    }
+                    let take = byte_count.min(transfer_bytes - off);
+                    mem.copy_from(phys_buf, &mut gathered[off..off + take]);
+                    off += take;
+                }
+                primary_ide.write_sectors(lba, sectors, &gathered);
+            } else {
+                let data = primary_ide.read_sectors(lba, sectors);
+                let mut off = 0usize;
+                for (phys_buf, byte_count) in prds {
+                    if off >= transfer_bytes || off >= data.len() {
+                        break;
+                    }
+                    let take = byte_count.min(transfer_bytes - off).min(data.len() - off);
+                    mem.copy_to(phys_buf, &data[off..off + take]);
+                    off += take;
+                }
             }
         }
 
         primary_ide.dma_active = false;
         primary_ide.set_status(ST_DRDY);
-        primary_ide.irq_pending = true;
+        primary_ide.raise_irq();
 
-        self.primary.cmd &= !BM_CMD_START;
         self.primary.status &= !BM_STATUS_ACTIVE;
         self.primary.status |= BM_STATUS_INT;
 
@@ -154,13 +166,14 @@ impl BmdmaController {
         cdrom: &mut CdRom,
         mem: &GuestMemory,
     ) -> bool {
-        if self.secondary.cmd & BM_CMD_START == 0 || !cdrom.has_dma_data() {
+        if self.secondary.cmd & BM_CMD_START == 0 || !cdrom.is_dma_active() {
             return false;
         }
 
         let mut prd_ptr = (self.secondary.prd_addr & !3) as usize;
         let mut data_offset = cdrom.get_data_offset();
         let total_bytes = cdrom.get_data_len();
+        let mut hit_eot = false;
 
         for _ in 0..1024 {
             let phys_buf = mem.read_u32(prd_ptr) as usize;
@@ -181,19 +194,22 @@ impl BmdmaController {
             }
 
             prd_ptr += 8;
-            if eot || data_offset >= total_bytes {
+            if eot {
+                hit_eot = true;
+                break;
+            }
+            if data_offset >= total_bytes {
                 break;
             }
         }
 
         cdrom.set_data_offset(data_offset);
-        if data_offset >= total_bytes {
+        if hit_eot || data_offset >= total_bytes {
             cdrom.clear_data_buf();
-            cdrom.set_phase(AtapiPhase::Idle);
+            cdrom.set_phase(AtapiPhase::StatusIn);
             cdrom.set_dma_active(false);
             cdrom.raise_irq();
 
-            self.secondary.cmd &= !BM_CMD_START;
             self.secondary.status &= !BM_STATUS_ACTIVE;
             self.secondary.status |= BM_STATUS_INT;
             return true;
@@ -205,71 +221,64 @@ impl BmdmaController {
 
 impl IoDevice for BmdmaController {
     fn matches_port(&self, port: u16) -> bool {
-        self.iobase != 0 && port >= self.iobase && port < self.iobase + 16
+        self.iobase != 0
+            && port.checked_sub(self.iobase).is_some_and(|off| off < 16)
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        let offset = (port - self.iobase) as usize;
-        let val = data[0];
-
-        match offset {
-            0x00 => { // Primary Command
-                let old_cmd = self.primary.cmd;
-                self.primary.cmd = val;
-                if (val & BM_CMD_START) != 0 && (old_cmd & BM_CMD_START) == 0 {
-                    self.primary.status |= BM_STATUS_ACTIVE;
-                } else if (val & BM_CMD_START) == 0 {
-                    self.primary.status &= !BM_STATUS_ACTIVE;
-                }
-            }
-            0x02 => { // Primary Status (Write-1-to-Clear para INT y ERROR)
-                self.primary.status = (self.primary.status & !0x06)
-                    | (self.primary.status & !val & 0x06);
-            }
-            0x04..=0x07 => { // Primary PRD Table Base (u32 LE)
-                let byte_idx = offset - 0x04;
-                for (i, &b) in data.iter().enumerate() {
-                    let idx = byte_idx + i;
-                    if idx < 4 {
-                        let shift = idx * 8;
-                        self.primary.prd_addr =
-                            (self.primary.prd_addr & !(0xFF << shift)) | ((b as u32) << shift);
+        let Some(base_off) = port.checked_sub(self.iobase) else { return; };
+        for (i, &val) in data.iter().enumerate() {
+            let offset = (base_off as usize) + i;
+            match offset {
+                0x00 => { // Primary Command
+                    let old_cmd = self.primary.cmd;
+                    self.primary.cmd = val;
+                    if (val & BM_CMD_START) != 0 && (old_cmd & BM_CMD_START) == 0 {
+                        self.primary.status |= BM_STATUS_ACTIVE;
+                    } else if (val & BM_CMD_START) == 0 {
+                        self.primary.status &= !BM_STATUS_ACTIVE;
                     }
                 }
-            }
-            0x08 => { // Secondary Command
-                let old_cmd = self.secondary.cmd;
-                self.secondary.cmd = val;
-                if (val & BM_CMD_START) != 0 && (old_cmd & BM_CMD_START) == 0 {
-                    self.secondary.status |= BM_STATUS_ACTIVE;
-                } else if (val & BM_CMD_START) == 0 {
-                    self.secondary.status &= !BM_STATUS_ACTIVE;
+                0x02 => { // Primary Status (Write-1-to-Clear para INT y ERROR)
+                    self.primary.status = (self.primary.status & !0x06)
+                        | (self.primary.status & !val & 0x06);
                 }
-            }
-            0x0A => { // Secondary Status (Write-1-to-Clear)
-                self.secondary.status = (self.secondary.status & !0x06)
-                    | (self.secondary.status & !val & 0x06);
-            }
-            0x0C..=0x0F => { // Secondary PRD Table Base (u32 LE)
-                let byte_idx = offset - 0x0C;
-                for (i, &b) in data.iter().enumerate() {
-                    let idx = byte_idx + i;
-                    if idx < 4 {
-                        let shift = idx * 8;
-                        self.secondary.prd_addr =
-                            (self.secondary.prd_addr & !(0xFF << shift)) | ((b as u32) << shift);
+                0x04..=0x07 => { // Primary PRD Table Base (u32 LE)
+                    let shift = (offset - 0x04) * 8;
+                    self.primary.prd_addr =
+                        (self.primary.prd_addr & !(0xFF << shift)) | ((val as u32) << shift);
+                }
+                0x08 => { // Secondary Command
+                    let old_cmd = self.secondary.cmd;
+                    self.secondary.cmd = val;
+                    if (val & BM_CMD_START) != 0 && (old_cmd & BM_CMD_START) == 0 {
+                        self.secondary.status |= BM_STATUS_ACTIVE;
+                    } else if (val & BM_CMD_START) == 0 {
+                        self.secondary.status &= !BM_STATUS_ACTIVE;
                     }
                 }
+                0x0A => { // Secondary Status (Write-1-to-Clear)
+                    self.secondary.status = (self.secondary.status & !0x06)
+                        | (self.secondary.status & !val & 0x06);
+                }
+                0x0C..=0x0F => { // Secondary PRD Table Base (u32 LE)
+                    let shift = (offset - 0x0C) * 8;
+                    self.secondary.prd_addr =
+                        (self.secondary.prd_addr & !(0xFF << shift)) | ((val as u32) << shift);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
-        let offset = (port - self.iobase) as usize;
+        let Some(base_off) = port.checked_sub(self.iobase) else {
+            return vec![0xFF; count];
+        };
+        let offset = base_off as usize;
         let mut res = Vec::with_capacity(count);
 
         for i in 0..count {
@@ -376,7 +385,7 @@ mod tests {
         assert_eq!(mem.read_u8(0x2002), 0xAB);
 
         // Verify BMDMA channel state
-        assert_eq!(bmdma.secondary.cmd & BM_CMD_START, 0, "BM_CMD_START should clear on completion");
+        assert_eq!(bmdma.secondary.status & BM_STATUS_ACTIVE, 0, "BM_STATUS_ACTIVE should clear on completion");
         assert_ne!(bmdma.secondary.status & BM_STATUS_INT, 0, "Interrupt status bit should be set");
         assert!(!cd.is_dma_active());
 

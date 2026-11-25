@@ -42,16 +42,33 @@ pub fn prepare_unattended_media(
             let win_unattend = templates::generate_windows_unattend(config);
             create_temp_oemdrv_file(&[("autounattend.xml", win_unattend.as_bytes())])
         }
-        GuestOsType::DebianKali | GuestOsType::RedHatCentOS | GuestOsType::Unknown => {
+        GuestOsType::RedHatCentOS => {
+            let ks = templates::generate_kickstart(config);
+            create_temp_oemdrv_file(&[("ks.cfg", ks.as_bytes())])
+        }
+        GuestOsType::DebianKali | GuestOsType::Unknown => {
             let preseed = templates::generate_debian_preseed(config);
             create_temp_oemdrv_file(&[("preseed.cfg", preseed.as_bytes())])
         }
     }
 }
 
-/// Aplica parches al vuelo en los sectores de arranque leídos desde la ISO para activar
-/// el modo 100% desatendido (Debian, Kali, Ubuntu) sin modificar el archivo ISO en disco.
+/// Aplica parches al vuelo en los sectores de arranque leídos desde la ISO únicamente para
+/// instaladores Debian/Kali sin modificar el archivo ISO en disco.
 pub fn patch_unattended_iso_sectors(buf: &mut [u8]) {
+    patch_unattended_iso_sectors_for_os(buf, GuestOsType::DebianKali, &UnattendedConfig::default());
+}
+
+/// Versión parametrizada por SO y configuración de usuario; solo aplica parches en ISOs `DebianKali`.
+pub fn patch_unattended_iso_sectors_for_os(
+    buf: &mut [u8],
+    os_type: GuestOsType,
+    config: &UnattendedConfig,
+) {
+    if os_type != GuestOsType::DebianKali {
+        return;
+    }
+
     // 1. ISOLINUX: Reducir timeout a 1 (0.1s) para arranque automático sin esperar confirmación
     patch_slice(buf, b"timeout 0\n", b"timeout 1\n");
     patch_slice(buf, b"timeout 0\r\n", b"timeout 1\r\n");
@@ -92,25 +109,28 @@ pub fn patch_unattended_iso_sectors(buf: &mut [u8]) {
         // inyectamos las directivas preseed base autónomas de respaldo
         let tail_start = pos + 211;
         if buf.len() >= pos + 1024 && tail_start < buf.len() && buf[tail_start] == 0 {
-            let base_preseed = b"\
-d-i simple-cdd/profiles multiselect kali, offline\n\
+            let user: String = config.username.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+            let pass: String = config.password.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+            let host: String = config.hostname.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+            let base_preseed = format!(
+                "d-i simple-cdd/profiles multiselect kali, offline\n\
 d-i debian-installer/locale string en_US.UTF-8\n\
 d-i keyboard-configuration/xkb-keymap select us\n\
 d-i netcfg/choose_interface select auto\n\
-d-i netcfg/get_hostname string kali\n\
+d-i netcfg/get_hostname string {host}\n\
 d-i netcfg/get_domain string local\n\
 d-i apt-setup/use_mirror boolean false\n\
 d-i apt-setup/cdrom/set-first boolean false\n\
 d-i apt-setup/cdrom/set-next boolean false\n\
 d-i apt-setup/cdrom/set-failed boolean false\n\
 d-i passwd/root-login boolean true\n\
-d-i passwd/root-password password kali\n\
-d-i passwd/root-password-again password kali\n\
+d-i passwd/root-password password {pass}\n\
+d-i passwd/root-password-again password {pass}\n\
 d-i passwd/make-user boolean true\n\
-d-i passwd/user-fullname string kali\n\
-d-i passwd/username string kali\n\
-d-i passwd/user-password password kali\n\
-d-i passwd/user-password-again password kali\n\
+d-i passwd/user-fullname string {user}\n\
+d-i passwd/username string {user}\n\
+d-i passwd/user-password password {pass}\n\
+d-i passwd/user-password-again password {pass}\n\
 d-i passwd/user-default-groups string audio cdrom video sudo adm\n\
 d-i partman/early_command string for d in $(list-devices disk); do size=$(cat /sys/block/$(basename $d)/size 2>/dev/null || echo 0); if [ \"$size\" -gt 2097152 ]; then debconf-set partman-auto/disk \"$d\"; debconf-set grub-installer/bootdev \"$d\"; break; fi; done\n\
 d-i partman-auto/disk string /dev/sda\n\
@@ -131,9 +151,11 @@ d-i partman-md/confirm boolean true\n\
 d-i partman-md/confirm_nochanges boolean true\n\
 d-i grub-installer/only_debian boolean true\n\
 d-i grub-installer/bootdev string default\n\
-d-i finish-install/reboot_in_progress note\n";
-            let copy_len = base_preseed.len().min(buf.len() - tail_start);
-            buf[tail_start..tail_start + copy_len].copy_from_slice(&base_preseed[..copy_len]);
+d-i finish-install/reboot_in_progress note\n"
+            );
+            let bp_bytes = base_preseed.as_bytes();
+            let copy_len = bp_bytes.len().min(buf.len() - tail_start);
+            buf[tail_start..tail_start + copy_len].copy_from_slice(&bp_bytes[..copy_len]);
         }
     }
 }

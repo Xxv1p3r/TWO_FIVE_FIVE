@@ -139,6 +139,9 @@ impl IoDevice for CpuHotplugController {
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
         let mut res = vec![0u8; count];
+        if count == 0 {
+            return res;
+        }
         match port {
             CPU_HOTPLUG_BASE => {
                 // Devuelve el status del CPU actualmente seleccionado

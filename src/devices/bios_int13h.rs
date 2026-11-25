@@ -48,7 +48,8 @@ pub enum DriveType {
 #[derive(Debug, Clone)]
 pub struct DiskAddressPacket {
     pub size: u8,
-    pub num_sectors: u8,
+    pub reserved: u8,
+    pub num_sectors: u16,
     pub target_offset: u16,
     pub target_segment: u16,
     pub lba_low: u32,
@@ -63,11 +64,12 @@ impl DiskAddressPacket {
         }
         Some(Self {
             size: buf[0],
-            num_sectors: buf[1],
-            target_offset: u16::from_le_bytes([buf[2], buf[3]]),
-            target_segment: u16::from_le_bytes([buf[4], buf[5]]),
-            lba_low: u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
-            lba_high: u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]),
+            reserved: buf[1],
+            num_sectors: u16::from_le_bytes([buf[2], buf[3]]),
+            target_offset: u16::from_le_bytes([buf[4], buf[5]]),
+            target_segment: u16::from_le_bytes([buf[6], buf[7]]),
+            lba_low: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            lba_high: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
         })
     }
 
@@ -169,8 +171,12 @@ pub fn extended_read(
 
     let lba = dap.lba();
     let sector_count = dap.num_sectors as u64;
-    let byte_offset = lba * ATA_SECTOR_SIZE;
-    let byte_count = sector_count * ATA_SECTOR_SIZE;
+    let Some(byte_offset) = lba.checked_mul(ATA_SECTOR_SIZE) else {
+        return Err(0x04);
+    };
+    let Some(byte_count) = sector_count.checked_mul(ATA_SECTOR_SIZE) else {
+        return Err(0x04);
+    };
 
     let Some(off) = byte_offset.checked_add(byte_count) else {
         return Err(0x04); // sector not found
@@ -208,9 +214,10 @@ pub fn get_drive_params(
     match drive_type {
         DriveType::Disk => {
             let (cylinders, heads, sectors_per_track) = disk_chs_geometry(disk_size_bytes);
-            // CL bits 0-5 = max sector; bits 6-7 = high 2 bits of cylinder
-            let cl = (sectors_per_track & 0x3F) | ((((cylinders >> 8) & 0x03) as u8) << 6);
-            let cx = (((cylinders & 0xFF) as u16) << 8) | cl as u16;
+            let max_cyl = cylinders.saturating_sub(1);
+            // CL bits 0-5 = max sector; bits 6-7 = high 2 bits of max cylinder
+            let cl = (sectors_per_track & 0x3F) | ((((max_cyl >> 8) & 0x03) as u8) << 6);
+            let cx = (((max_cyl & 0xFF) as u16) << 8) | cl as u16;
             Int13hResult {
                 ah: 0x00,
                 cf: false,
@@ -257,7 +264,7 @@ pub fn chs_to_lba(
 ) -> u64 {
     (cylinder as u64 * heads_per_cyl as u64 + head as u64)
         * sectors_per_track as u64
-        + (sector as u64 - 1)
+        + (sector as u64).saturating_sub(1)
 }
 
 /// ─── AH=02h: Read Sectors (CHS) ─────────────────────────────────
@@ -271,9 +278,16 @@ pub fn read_sectors_chs(
     sectors_per_track: u8,
     media: &[u8],
 ) -> Result<Vec<u8>, u8> {
+    if sector == 0 || sector > sectors_per_track || head >= heads_per_cyl {
+        return Err(0x01); // invalid parameter
+    }
     let lba = chs_to_lba(cylinder, head, sector, heads_per_cyl, sectors_per_track);
-    let byte_offset = lba * ATA_SECTOR_SIZE;
-    let byte_count = count as u64 * ATA_SECTOR_SIZE;
+    let Some(byte_offset) = lba.checked_mul(ATA_SECTOR_SIZE) else {
+        return Err(0x04);
+    };
+    let Some(byte_count) = (count as u64).checked_mul(ATA_SECTOR_SIZE) else {
+        return Err(0x04);
+    };
     let Some(end) = byte_offset.checked_add(byte_count) else {
         return Err(0x04);
     };
@@ -322,20 +336,15 @@ mod tests {
     #[test]
     fn test_dap_parsing() {
         let mut buf = [0u8; 16];
-        buf[0] = 0x10;  // size = 16
-        buf[1] = 0x04;  // 4 sectors
-        buf[2] = 0x00;  // offset low
-        buf[3] = 0x7C; // offset high = 0x7C00
-        buf[4] = 0x00;  // segment low
-        buf[5] = 0x00;  // segment high = 0x0000
-        buf[6] = 0x01;  // LBA low byte 0
-        buf[7] = 0x00;  // LBA low byte 1
-        buf[8] = 0x00;  // LBA low byte 2
-        buf[9] = 0x00;  // LBA low byte 3
-        buf[10] = 0x00; // LBA high byte 0
-        buf[11] = 0x00; // LBA high byte 1
-        buf[12] = 0x00; // LBA high byte 2
-        buf[13] = 0x00; // LBA high byte 3
+        buf[0] = 0x10; // size = 16
+        buf[1] = 0x00; // reserved = 0
+        buf[2] = 0x04; // 4 sectors (u16 LE)
+        buf[3] = 0x00;
+        buf[4] = 0x00; // offset low
+        buf[5] = 0x7C; // offset high = 0x7C00
+        buf[6] = 0x00; // segment low
+        buf[7] = 0x00; // segment high = 0x0000
+        buf[8] = 0x01; // LBA low byte 0
 
         let dap = DiskAddressPacket::from_bytes(&buf).unwrap();
         assert_eq!(dap.num_sectors, 4);
@@ -359,13 +368,13 @@ mod tests {
 
     #[test]
     fn test_get_drive_params_disk() {
-        // Disco de 1 cilindro (16 cabezas × 63 sectores × 512 B)
+        // Disco de 1 cilindro (16 cabezas × 63 sectores × 512 B): max_cyl = 0
         let r = get_drive_params(DriveType::Disk, 0x80, 2, 63 * 16 * 512);
         assert!(!r.cf);
         assert_eq!(r.dl, 2); // nº de unidades
         assert_eq!(r.bx & 0xFF, 0x00); // BL = fixed disk
-        // CH=1, CL=63 | 0<<6 → CX = 0x013F; DH = 15
-        assert_eq!(r.cx, 0x013F);
+        // CH=0 (max_cyl=0), CL=63 | 0<<6 → CX = 0x003F; DH = 15
+        assert_eq!(r.cx, 0x003F);
         assert_eq!(r.dh, 15);
     }
 
@@ -387,6 +396,7 @@ mod tests {
         // DAP: LBA=1, 2 sectores (bytes 512..1536)
         let dap = DiskAddressPacket {
             size: 16,
+            reserved: 0,
             num_sectors: 2,
             target_offset: 0x7C00,
             target_segment: 0x0000,
@@ -407,6 +417,7 @@ mod tests {
         media[2048..2056].copy_from_slice(b"SECTOR-1");
         let dap = DiskAddressPacket {
             size: 16,
+            reserved: 0,
             num_sectors: 1,
             target_offset: 0,
             target_segment: 0x7C0,
@@ -423,6 +434,7 @@ mod tests {
         let media = make_media(1024);
         let dap = DiskAddressPacket {
             size: 16,
+            reserved: 0,
             num_sectors: 2, // 1024 bytes
             target_offset: 0,
             target_segment: 0,

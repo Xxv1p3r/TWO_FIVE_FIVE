@@ -1,19 +1,21 @@
-//! QEMU fw_cfg mínimo (PIO, sin DMA).
+//! QEMU fw_cfg con soporte PIO y DMA (0x510, 0x511, 0x514..0x51B).
 //!
-//! SeaBIOS compilado para QEMU sondea 0x510/0x511 buscando la firma "QEMU".
-//! Sin fw_cfg, el preinit de SeaBIOS muere con triple fault.
+//! SeaBIOS y OVMF sondean 0x510/0x511 buscando la firma "QEMU".
 //!
 //! Puertos:
 //!   0x510 (write u16 LE): selector de item
 //!   0x511 (read  u8):     byte siguiente del item seleccionado
-//!
-//! No anunci DMA (id sin bit 0x02... usamos id=0) → SeaBIOS lee por PIO.
+//!   0x514 (write BE u32): parte alta de dirección física de FWCfgDmaAccess
+//!   0x518 (write BE u32): parte baja + disparo de operación DMA
 
 use super::IoDevice;
+use crate::guest_mem::GuestMemory;
 use std::collections::HashMap;
 
 const PORT_SELECT: u16 = 0x510;
 const PORT_DATA: u16 = 0x511;
+const PORT_DMA_HIGH: u16 = 0x514;
+const PORT_DMA_LOW: u16 = 0x518;
 
 // Selectores fw_cfg estándar.
 const FW_CFG_SIGNATURE: u16 = 0x00;
@@ -25,11 +27,19 @@ const FW_CFG_FILE_DIR: u16 = 0x19;
 /// Primer selector asignable a archivos custom.
 const FILE_BASE: u16 = 0x20;
 
+const FW_CFG_DMA_CTL_ERROR: u32 = 0x01;
+const FW_CFG_DMA_CTL_READ: u32 = 0x02;
+const FW_CFG_DMA_CTL_SKIP: u32 = 0x04;
+const FW_CFG_DMA_CTL_SELECT: u32 = 0x08;
+const FW_CFG_DMA_CTL_WRITE: u32 = 0x10;
+
 pub struct FwCfg {
     /// Selector actual.
     select: u16,
     /// Offset de lectura dentro del item actual.
     offset: usize,
+    /// Dirección DMA acumulada (big-endian escrita en 0x514/0x518).
+    dma_addr: u64,
     /// Contenido por selector.
     items: HashMap<u16, Vec<u8>>,
 }
@@ -48,8 +58,8 @@ impl FwCfg {
         let mut items: HashMap<u16, Vec<u8>> = HashMap::new();
         let ram_below_4g = ram_size.min(0xE000_0000);
         items.insert(FW_CFG_SIGNATURE, b"QEMU".to_vec());
-        // id: sin DMA (SeaBIOS usará lecturas PIO byte a byte).
-        items.insert(FW_CFG_ID, vec![0x00]);
+        // Bit 0 = versión tradicional, Bit 1 = DMA disponible (0x03u32 LE)
+        items.insert(FW_CFG_ID, 3u32.to_le_bytes().to_vec());
         items.insert(
             FW_CFG_RAM_SIZE,
             ram_below_4g.to_le_bytes().to_vec(),
@@ -60,7 +70,7 @@ impl FwCfg {
         );
         items.insert(
             FW_CFG_MAX_CPUS,
-            (num_cpus as u16).to_le_bytes().to_vec(),
+            (num_cpus.max(16) as u16).to_le_bytes().to_vec(),
         );
 
         // Directorio de archivos (selector 0x19):
@@ -127,15 +137,16 @@ impl FwCfg {
         Self {
             select: 0,
             offset: 0,
+            dma_addr: 0,
             items,
         }
     }
 
-    fn current_item(&self) -> Vec<u8> {
+    fn current_item(&self) -> &[u8] {
         self.items
             .get(&self.select)
-            .cloned()
-            .unwrap_or_else(|| vec![0])
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Reset del dispositivo: vuelve al selector 0 (los items son hardware
@@ -143,6 +154,74 @@ impl FwCfg {
     pub fn reset(&mut self) {
         self.select = 0;
         self.offset = 0;
+        self.dma_addr = 0;
+    }
+
+    /// Procesa una transferencia DMA de `fw_cfg` (QEMU `FWCfgDmaAccess` en big-endian).
+    fn execute_dma(&mut self, mem: &GuestMemory) {
+        let dma_gpa = self.dma_addr as usize;
+        self.dma_addr = 0;
+
+        let mut hdr = [0u8; 16];
+        if mem.copy_from(dma_gpa, &mut hdr) != 16 {
+            return;
+        }
+        let control = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let length = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        let addr = u64::from_be_bytes([
+            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+        ]);
+
+        if (control & FW_CFG_DMA_CTL_SELECT) != 0 {
+            self.select = (control >> 16) as u16;
+            self.offset = 0;
+        }
+
+        let mut out_ctrl = 0u32;
+        if (control & FW_CFG_DMA_CTL_WRITE) != 0 {
+            out_ctrl = FW_CFG_DMA_CTL_ERROR;
+        } else if (control & FW_CFG_DMA_CTL_READ) != 0 {
+            if length > 0 {
+                let mut tmp = vec![0u8; length];
+                if let Some(item) = self.items.get(&self.select) {
+                    if self.offset < item.len() {
+                        let avail = (item.len() - self.offset).min(length);
+                        tmp[..avail].copy_from_slice(&item[self.offset..self.offset + avail]);
+                    }
+                }
+                if !mem.copy_to(addr as usize, &tmp) {
+                    out_ctrl = FW_CFG_DMA_CTL_ERROR;
+                }
+                self.offset = self.offset.saturating_add(length);
+            }
+        } else if (control & FW_CFG_DMA_CTL_SKIP) != 0 {
+            self.offset = self.offset.saturating_add(length);
+        }
+
+        mem.copy_to(dma_gpa, &out_ctrl.to_be_bytes());
+    }
+
+    pub fn write_with_mem(&mut self, port: u16, data: &[u8], mem: Option<&GuestMemory>) {
+        if port == PORT_SELECT && data.len() >= 2 {
+            self.select = u16::from_le_bytes([data[0], data[1]]);
+            self.offset = 0;
+        } else if port == PORT_DMA_HIGH && data.len() >= 4 {
+            let hi = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64;
+            self.dma_addr = (self.dma_addr & 0x0000_0000_FFFF_FFFF) | (hi << 32);
+            if data.len() >= 8 {
+                let lo = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as u64;
+                self.dma_addr = (hi << 32) | lo;
+                if let Some(m) = mem {
+                    self.execute_dma(m);
+                }
+            }
+        } else if port == PORT_DMA_LOW && data.len() >= 4 {
+            let lo = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64;
+            self.dma_addr = (self.dma_addr & 0xFFFF_FFFF_0000_0000) | lo;
+            if let Some(m) = mem {
+                self.execute_dma(m);
+            }
+        }
     }
 }
 
@@ -201,33 +280,39 @@ mod tests {
 
 impl IoDevice for FwCfg {
     fn matches_port(&self, port: u16) -> bool {
-        port == PORT_SELECT || port == PORT_DATA
+        matches!(port, PORT_SELECT | PORT_DATA | PORT_DMA_HIGH..=0x51B)
     }
 
     fn write(&mut self, port: u16, data: &[u8]) {
-        if port == PORT_SELECT && data.len() >= 2 {
-            self.select = u16::from_le_bytes([data[0], data[1]]);
-            self.offset = 0;
-        }
+        self.write_with_mem(port, data, None);
     }
 
     fn read(&mut self, port: u16, count: usize) -> Vec<u8> {
+        if port == PORT_DMA_HIGH {
+            // Firma QEMU DMA "QEMU CFG" (0x514..0x51B big-endian)
+            const DMA_SIG: [u8; 8] = *b"QEMU CFG";
+            return (0..count).map(|i| *DMA_SIG.get(i).unwrap_or(&0)).collect();
+        }
+        if port == PORT_DMA_LOW {
+            const DMA_SIG_LO: [u8; 4] = *b" CFG";
+            return (0..count).map(|i| *DMA_SIG_LO.get(i).unwrap_or(&0)).collect();
+        }
         if port != PORT_DATA {
-            return vec![0; count.min(1)];
+            return vec![0; count];
         }
         // SeaBIOS lee con IN de 1, 2 o 4 bytes: hay que servir `count` bytes
-        // y avanzar el offset por cada uno.
-        let item = self.current_item();
+        // y avanzar el offset por cada uno sin clonar el item en cada lectura.
         let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            let b = if self.offset < item.len() {
-                item[self.offset]
-            } else {
-                0
-            };
-            self.offset += 1;
-            out.push(b);
+        let mut off = self.offset;
+        {
+            let item = self.current_item();
+            for _ in 0..count {
+                let b = item.get(off).copied().unwrap_or(0);
+                off += 1;
+                out.push(b);
+            }
         }
+        self.offset = off;
         out
     }
 }

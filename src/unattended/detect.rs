@@ -39,17 +39,22 @@ impl std::fmt::Display for GuestOsType {
 fn classify_string(text: &str) -> Option<GuestOsType> {
     let lower = text.to_lowercase();
 
-    // 1. Ubuntu (revisar antes de Debian por si la ISO contiene referencias compartidas)
+    // 1. Linux Mint (puede contener referencias a Ubuntu/Casper, pero no usa Ubuntu cloud-init)
+    if lower.contains("linuxmint") || lower.contains("linux mint") {
+        return Some(GuestOsType::Unknown);
+    }
+
+    // 2. Ubuntu (revisar antes de Debian por si la ISO contiene referencias compartidas)
     if lower.contains("ubuntu") {
         return Some(GuestOsType::UbuntuCloud);
     }
 
-    // 2. Kali Linux y Debian
+    // 3. Kali Linux y Debian
     if lower.contains("kali") || lower.contains("debian") {
         return Some(GuestOsType::DebianKali);
     }
 
-    // 3. Familia Red Hat / CentOS / Fedora / Rocky / Alma
+    // 4. Familia Red Hat / CentOS / Fedora / Rocky / Alma
     if lower.contains("centos")
         || lower.contains("fedora")
         || lower.contains("redhat")
@@ -61,7 +66,7 @@ fn classify_string(text: &str) -> Option<GuestOsType> {
         return Some(GuestOsType::RedHatCentOS);
     }
 
-    // 4. Windows (etiquetas estándar de ISOs de Windows como CCCOMA_*, CPBA_*, GSP1RM*, etc.)
+    // 5. Windows (etiquetas estándar de ISOs de Windows como CCCOMA_*, CPBA_*, GSP1RM*, etc.)
     if lower.contains("windows")
         || lower.contains("win10")
         || lower.contains("win11")
@@ -79,13 +84,23 @@ fn classify_string(text: &str) -> Option<GuestOsType> {
     None
 }
 
+/// Decodifica una cadena UTF-16BE (descriptores Joliet SVD tipo 2).
+fn decode_utf16be(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
 /// Detecta el sistema operativo a partir de un búfer en memoria que contiene los primeros
 /// sectores o descriptores de la ISO.
 pub fn detect_os_from_bytes(data: &[u8]) -> GuestOsType {
     const SECTOR_SIZE: usize = 2048;
     const PVD_OFFSET: usize = 16 * SECTOR_SIZE; // 0x8000 = 32768
 
-    // Paso 1: Inspeccionar descriptores de volumen ISO 9660 desde el sector 16
+    // Paso 1: Inspeccionar descriptores de volumen ISO 9660 / Joliet desde el sector 16
     if data.len() >= PVD_OFFSET + SECTOR_SIZE {
         let mut offset = PVD_OFFSET;
         while offset + SECTOR_SIZE <= data.len() {
@@ -97,9 +112,28 @@ pub fn detect_os_from_bytes(data: &[u8]) -> GuestOsType {
                 break;
             }
 
+            // Tipo 255 (0xFF) marca el fin del conjunto de descriptores de volumen
+            if desc_type == 255 {
+                break;
+            }
+
+            let is_joliet = desc_type == 2
+                && sector.len() >= 91
+                && sector[88] == 0x25
+                && sector[89] == 0x2F
+                && matches!(sector[90], 0x40 | 0x43 | 0x45);
+
+            let decode_field = |slice: &[u8]| -> String {
+                if is_joliet {
+                    decode_utf16be(slice)
+                } else {
+                    String::from_utf8_lossy(slice).into_owned()
+                }
+            };
+
             // Volume ID: offset 40..72 (32 bytes)
             if sector.len() >= 72 {
-                let vol_id = String::from_utf8_lossy(&sector[40..72]);
+                let vol_id = decode_field(&sector[40..72]);
                 if let Some(os) = classify_string(&vol_id) {
                     return os;
                 }
@@ -107,7 +141,7 @@ pub fn detect_os_from_bytes(data: &[u8]) -> GuestOsType {
 
             // System ID: offset 8..40 (32 bytes)
             if sector.len() >= 40 {
-                let sys_id = String::from_utf8_lossy(&sector[8..40]);
+                let sys_id = decode_field(&sector[8..40]);
                 if let Some(os) = classify_string(&sys_id) {
                     return os;
                 }
@@ -115,7 +149,7 @@ pub fn detect_os_from_bytes(data: &[u8]) -> GuestOsType {
 
             // Publisher ID: offset 318..446 (128 bytes)
             if sector.len() >= 446 {
-                let pub_id = String::from_utf8_lossy(&sector[318..446]);
+                let pub_id = decode_field(&sector[318..446]);
                 if let Some(os) = classify_string(&pub_id) {
                     return os;
                 }
@@ -123,15 +157,10 @@ pub fn detect_os_from_bytes(data: &[u8]) -> GuestOsType {
 
             // Application ID: offset 574..702 (128 bytes)
             if sector.len() >= 702 {
-                let app_id = String::from_utf8_lossy(&sector[574..702]);
+                let app_id = decode_field(&sector[574..702]);
                 if let Some(os) = classify_string(&app_id) {
                     return os;
                 }
-            }
-
-            // Tipo 255 (0xFF) marca el fin del conjunto de descriptores de volumen
-            if desc_type == 255 {
-                break;
             }
 
             offset += SECTOR_SIZE;

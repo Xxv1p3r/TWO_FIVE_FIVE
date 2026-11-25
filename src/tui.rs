@@ -38,6 +38,23 @@ pub fn log(line: impl Into<String>) {
     eprintln!("{}", msg);
 }
 
+/// Estado original de termios guardado para restaurarlo ante cierres de emergencia.
+static ORIG_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+/// Restaura la terminal (cursor visible y búfer normal) si el TUI estaba activo.
+pub fn shutdown() {
+    TUI_ACTIVE.store(false, Ordering::SeqCst);
+    if let Ok(mut guard) = ORIG_TERMIOS.lock() {
+        if let Some(orig) = guard.take() {
+            unsafe {
+                print!("\x1b[?25h\x1b[?1049l");
+                let _ = std::io::stdout().flush();
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &orig);
+            }
+        }
+    }
+}
+
 /// Comprueba si el TUI está activo actualmente.
 pub fn is_active() -> bool {
     TUI_ACTIVE.load(Ordering::Relaxed)
@@ -58,7 +75,6 @@ pub enum DashboardCommand {
 
 /// Guarda y restaura el estado original del terminal (raw mode, alternate buffer).
 struct RawTerminalGuard {
-    orig_termios: libc::termios,
     active: bool,
 }
 
@@ -80,13 +96,13 @@ impl RawTerminalGuard {
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
                 return None;
             }
+            if let Ok(mut saved) = ORIG_TERMIOS.lock() {
+                *saved = Some(orig);
+            }
             // Entrar al búfer de pantalla alterno y ocultar cursor
             print!("\x1b[?1049h\x1b[?25l");
             let _ = std::io::stdout().flush();
-            Some(Self {
-                orig_termios: orig,
-                active: true,
-            })
+            Some(Self { active: true })
         }
     }
 }
@@ -94,12 +110,7 @@ impl RawTerminalGuard {
 impl Drop for RawTerminalGuard {
     fn drop(&mut self) {
         if self.active {
-            unsafe {
-                // Mostrar cursor y volver al búfer de pantalla principal
-                print!("\x1b[?25h\x1b[?1049l");
-                let _ = std::io::stdout().flush();
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig_termios);
-            }
+            shutdown();
         }
     }
 }

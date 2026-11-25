@@ -40,14 +40,18 @@ struct PitChannel {
     mode: u8,
     /// True si opera en BCD.
     bcd: bool,
-    /// Fase de lectura/escritura: byte bajo (false) o alto (true).
+    /// Fase de lectura: byte bajo (false) o alto (true).
     read_high: bool,
+    /// Fase de escritura: byte bajo (false) o alto (true).
+    write_high: bool,
     /// Modo RW: 0=latch, 1=low only, 2=high only, 3=low+high.
     rw_mode: u8,
     /// True si el canal está habilitado.
     enabled: bool,
     /// Momento del último tick.
     last_tick: Instant,
+    /// Residuo fraccional de nanosegundos * PIT_HZ módulo 1_000_000_000.
+    tick_rem: u64,
 }
 
 impl PitChannel {
@@ -59,9 +63,11 @@ impl PitChannel {
             mode: 0,
             bcd: false,
             read_high: false,
+            write_high: false,
             rw_mode: 0,
             enabled: false,
             last_tick: Instant::now(),
+            tick_rem: 0,
         }
     }
 
@@ -77,54 +83,38 @@ impl PitChannel {
         if val > 0xFFFF { 0 } else { val as u16 }
     }
 
-    /// Decrementa el contador según el tiempo REAL transcurrido.
+    /// Decrementa el contador según el tiempo REAL transcurrido conservando resto sub-tick.
     /// Retorna true si hubo underflow (IRQ generada).
     #[allow(dead_code)]
     fn tick(&mut self) -> bool {
         if !self.enabled { return false; }
         let now = Instant::now();
-        let elapsed_ns = now.duration_since(self.last_tick).as_nanos() as u64;
+        let elapsed_ns = now.duration_since(self.last_tick).as_nanos();
         self.last_tick = now;
-        // Calcular cuántos ticks del PIT (1.193182 MHz) caben en el tiempo transcurrido.
-        let ticks = ((elapsed_ns * PIT_HZ as u64) / 1_000_000_000) as u32;
+        let scaled = elapsed_ns * (PIT_HZ as u128) + (self.tick_rem as u128);
+        let ticks = (scaled / 1_000_000_000) as u32;
+        self.tick_rem = (scaled % 1_000_000_000) as u64;
         if ticks == 0 { return false; }
-
-        let reload = self.effective_reload(); // 65536 si reload==0
-        let auto_reload = matches!(self.mode, 2 | 3 | 5);
-
-        // En modo one-shot (0, 4): si counter ya es 0, no hacer nada más.
-        if !auto_reload && self.counter == 0 { return false; }
-
-        // El valor activo del counter: si counter==0 y está habilitado,
-        // significa 65536 (el caso reload=0 en hardware PIT).
-        let effective = if self.counter == 0 { reload } else { self.counter };
-        let new_val = effective.saturating_sub(ticks);
-
-        if new_val == 0 {
-            self.counter = 0;
-            if auto_reload {
-                self.counter = reload; // reload=0 → counter=0 → next tick starts from 65536
-            }
-            return true; // underflow → IRQ
-        }
-        self.counter = new_val;
-        false
+        self.advance(ticks)
     }
 
     /// Avanza el counter por un número fijo de ticks (sin Instant).
     fn advance(&mut self, ticks: u32) -> bool {
-        if !self.enabled { return false; }
+        if !self.enabled || ticks == 0 { return false; }
         let reload = self.effective_reload();
         let auto_reload = matches!(self.mode, 2 | 3 | 5);
         if !auto_reload && self.counter == 0 { return false; }
         let effective = if self.counter == 0 { reload } else { self.counter };
-        let new_val = effective.saturating_sub(ticks);
-        if new_val == 0 {
-            self.counter = 0;
-            if auto_reload { self.counter = reload; }
+        if ticks >= effective {
+            if auto_reload {
+                let rem = (ticks - effective) % reload;
+                self.counter = if rem == 0 { reload } else { reload - rem };
+            } else {
+                self.counter = 0;
+            }
             return true;
         }
-        self.counter = new_val;
+        self.counter = effective - ticks;
         false
     }
 
@@ -136,9 +126,11 @@ impl PitChannel {
         self.mode = 0;
         self.bcd = false;
         self.read_high = false;
+        self.write_high = false;
         self.rw_mode = 0;
         self.enabled = false;
         self.last_tick = Instant::now();
+        self.tick_rem = 0;
     }
 }
 
@@ -224,8 +216,12 @@ pub struct LegacyInterrupts {
     /// IRQ12 pendiente de inyección al kernel PIC (consumida por el bucle VMM).
     irq12_pending: bool,
 
-    // Puerto B (0x61): speaker + gate PIT ch2
+    /// Puerto de salida del 8042 (bit 1 = A20).
+    out_port: u8,
+    /// Puerto B (0x61): speaker + gate PIT ch2.
     port_b: u8,
+    /// Comando del teclado esperando 1 argumento (0xF0, 0xED, 0xF3).
+    kb_expect_arg: Option<u8>,
 
     // Diagnostic: track if IRQ1 needs injection into kernel PIC
     irq1_pending: bool,
@@ -259,7 +255,7 @@ impl LegacyInterrupts {
             pit: [PitChannel::new(), PitChannel::new(), PitChannel::new()],
 
             ps2_out_buf: std::collections::VecDeque::new(),
-            ps2_cmd_byte: 0x01,
+            ps2_cmd_byte: 0x45,
             ps2_expect: Ps2Expect::None,
             kb_irq_enabled: true,
             aux_irq_enabled: false,
@@ -270,7 +266,9 @@ impl LegacyInterrupts {
             mouse_last_packet: [0x08, 0, 0],
             mouse_expect_arg: false,
             irq12_pending: false,
+            out_port: 0x02,
             port_b: 0,
+            kb_expect_arg: None,
 
             irq1_pending: false,
             reset_requested: false,
@@ -365,6 +363,14 @@ impl LegacyInterrupts {
     #[allow(dead_code)]
     pub fn ps2_has_data(&self) -> bool {
         !self.ps2_out_buf.is_empty()
+    }
+
+    /// Encola un byte de respuesta interna del controlador 8042 (sin IRQ1).
+    fn push_ctrl_buf(&mut self, val: u8) {
+        if self.ps2_out_buf.len() >= 16 {
+            self.ps2_out_buf.pop_front();
+        }
+        self.ps2_out_buf.push_back(val);
     }
 
     /// Encola un byte en el output buffer y marca IRQ1 como pendiente
@@ -500,13 +506,12 @@ impl LegacyInterrupts {
     /// Útil para cuando el guest está stuck sin exits y queremos
     /// simular tiempo real transcurrido.
     pub fn pit_advance_ticks(&mut self, ticks: u32) -> bool {
-        let mut irq = false;
-        for ch in &mut self.pit {
-            if ch.advance(ticks) {
-                irq = true;
-            }
+        let irq0 = self.pit[0].advance(ticks);
+        self.pit[1].advance(ticks);
+        if (self.port_b & 0x01) != 0 {
+            self.pit[2].advance(ticks);
         }
-        irq
+        irq0
     }
 
     fn pic_read(&mut self, port: u16) -> u8 {
@@ -627,27 +632,30 @@ impl LegacyInterrupts {
 
         match self.pit[ch].rw_mode {
             3 => {
-                if self.pit[ch].read_high {
+                if self.pit[ch].write_high {
                     self.pit[ch].reload = (self.pit[ch].reload & 0x00FF) | ((val as u32) << 8);
                     self.pit[ch].counter = self.pit[ch].effective_reload();
                     self.pit[ch].enabled = true;
                     self.pit[ch].last_tick = Instant::now();
+                    self.pit[ch].tick_rem = 0;
                 } else {
                     self.pit[ch].reload = (self.pit[ch].reload & 0xFF00) | val as u32;
                 }
-                self.pit[ch].read_high = !self.pit[ch].read_high;
+                self.pit[ch].write_high = !self.pit[ch].write_high;
             }
             1 => {
                 self.pit[ch].reload = val as u32;
                 self.pit[ch].counter = self.pit[ch].effective_reload();
                 self.pit[ch].enabled = true;
                 self.pit[ch].last_tick = Instant::now();
+                self.pit[ch].tick_rem = 0;
             }
             2 => {
                 self.pit[ch].reload = (val as u32) << 8;
                 self.pit[ch].counter = self.pit[ch].effective_reload();
                 self.pit[ch].enabled = true;
                 self.pit[ch].last_tick = Instant::now();
+                self.pit[ch].tick_rem = 0;
             }
             _ => {} // rw_mode == 0: latch command
         }
@@ -688,6 +696,7 @@ impl LegacyInterrupts {
         self.pit[ch].mode = mode;
         self.pit[ch].rw_mode = rw;
         self.pit[ch].read_high = false;
+        self.pit[ch].write_high = false;
         self.pit[ch].latched_counter = None;
     }
 
@@ -699,6 +708,12 @@ impl LegacyInterrupts {
                 // Prioridad: teclado (IRQ1), luego respuestas a comandos de ratón (IRQ12), luego movimiento auxiliar (IRQ12).
                 if let Some(val) = self.ps2_out_buf.pop_front() {
                     self.irq1_pending = self.kb_irq_enabled && !self.ps2_out_buf.is_empty();
+                    if self.ps2_out_buf.is_empty()
+                        && self.aux_irq_enabled
+                        && (!self.ps2_aux_cmd_buf.is_empty() || !self.ps2_aux_buf.is_empty())
+                    {
+                        self.irq12_pending = true;
+                    }
                     return val;
                 }
                 if let Some(val) = self.ps2_aux_cmd_buf.pop_front() {
@@ -747,7 +762,10 @@ impl LegacyInterrupts {
                     self.ps2_expect = Ps2Expect::None;
                 }
                 Ps2Expect::OutPort => {
-                    // El bit1 (A20) lo gestiona el A20Gate por el puerto 0x92.
+                    self.out_port = val;
+                    if (val & 0x01) == 0 {
+                        self.reset_requested = true;
+                    }
                     self.ps2_expect = Ps2Expect::None;
                 }
                 Ps2Expect::KbOutBuf => {
@@ -767,6 +785,13 @@ impl LegacyInterrupts {
                     self.mouse_command(val);
                 }
                 Ps2Expect::None => {
+                    if let Some(cmd) = self.kb_expect_arg.take() {
+                        self.push_out_buf(0xFA);
+                        if cmd == 0xF0 && val == 0x00 {
+                            self.push_out_buf(0x02); // Scancode set 2 (traducido si XLAT)
+                        }
+                        return;
+                    }
                     match val {
                         0xFF => {
                             // Reset: ACK (0xFA) + self-test OK (0xAA)
@@ -778,6 +803,13 @@ impl LegacyInterrupts {
                             self.push_out_buf(0xFA);
                             self.push_out_buf(0xAB);
                             self.push_out_buf(0x83);
+                        }
+                        0xF0 | 0xED | 0xF3 => {
+                            self.push_out_buf(0xFA);
+                            self.kb_expect_arg = Some(val);
+                        }
+                        0xEE => {
+                            self.push_out_buf(0xEE);
                         }
                         _ => {
                             self.push_out_buf(0xFA);
@@ -799,13 +831,13 @@ impl LegacyInterrupts {
             0xD2 => self.ps2_expect = Ps2Expect::KbOutBuf, // write kb output buf
             0xD3 => self.ps2_expect = Ps2Expect::AuxOut,   // write aux output buf
             0xD4 => self.ps2_expect = Ps2Expect::AuxDev,   // write aux device
-            // Comandos con respuesta inmediata en el output buffer:
-            0x20 => self.push_out_buf(self.ps2_cmd_byte),  // read command byte
-            0xAA => self.push_out_buf(0x55), // self-test OK
-            0xAB => self.push_out_buf(0x00), // test primer puerto OK
-            0xA9 => self.push_out_buf(0x00), // test segundo puerto OK
-            0xD0 => self.push_out_buf(0x00), // read output port
-            0xC0 | 0xC1 | 0xC2 | 0xE0 => self.push_out_buf(0x00), // read input/info
+            // Comandos con respuesta inmediata en el output buffer (sin IRQ1):
+            0x20 => self.push_ctrl_buf(self.ps2_cmd_byte),  // read command byte
+            0xAA => self.push_ctrl_buf(0x55), // self-test OK
+            0xAB => self.push_ctrl_buf(0x00), // test primer puerto OK
+            0xA9 => self.push_ctrl_buf(0x00), // test segundo puerto OK
+            0xD0 => self.push_ctrl_buf(self.out_port), // read output port
+            0xC0 | 0xC1 | 0xC2 | 0xE0 => self.push_ctrl_buf(0x00), // read input/info
             // Enable/disable de puertos:
             0xAE => {
                 self.ps2_cmd_byte &= !0x10; // enable keyboard interface
@@ -841,6 +873,19 @@ impl LegacyInterrupts {
     /// Protocolo estándar de 3 botones: ACK (0xFA) a cada comando y argumento,
     /// y paquetes de 3 bytes [flags+botones, dx, dy] con el reporte habilitado (0xF4).
     fn mouse_command(&mut self, val: u8) {
+        if val == 0xFF {
+            // Reset aborta cualquier espera previa y limpia paquetes de movimiento parciales
+            self.ps2_aux_buf.clear();
+            self.push_aux_cmd(0xFA);
+            self.push_aux_cmd(0xAA);
+            self.push_aux_cmd(0x00);
+            self.mouse_reporting = false;
+            self.mouse_buttons = 0;
+            self.mouse_last_packet = [0x08, 0, 0];
+            self.mouse_expect_arg = false;
+            self.ps2_expect = Ps2Expect::None;
+            return;
+        }
         // Argumento pendiente de 0xF3 (sample rate) / 0xE8 (resolución):
         // En hardware PS/2 real (y requerido por i8042prt.sys en Windows),
         // el ratón responde con ACK (0xFA) también al byte de parámetro.
@@ -851,17 +896,6 @@ impl LegacyInterrupts {
             return;
         }
         match val {
-            0xFF => {
-                // Reset: ACK + self-test OK (0xAA) + device ID (0x00).
-                self.push_aux_cmd(0xFA);
-                self.push_aux_cmd(0xAA);
-                self.push_aux_cmd(0x00);
-                self.mouse_reporting = false;
-                self.mouse_buttons = 0;
-                self.mouse_last_packet = [0x08, 0, 0];
-                self.mouse_expect_arg = false;
-                self.ps2_expect = Ps2Expect::None;
-            }
             0xF2 => {
                 // Get device ID: ratón estándar (ID 0).
                 self.push_aux_cmd(0xFA);
@@ -887,7 +921,8 @@ impl LegacyInterrupts {
                 self.ps2_expect = Ps2Expect::None;
             }
             0xF5 | 0xF6 => {
-                // Disable data reporting / set defaults.
+                // Disable data reporting / set defaults: limpiar movimiento residual
+                self.ps2_aux_buf.clear();
                 self.push_aux_cmd(0xFA);
                 self.mouse_reporting = false;
                 self.ps2_expect = Ps2Expect::None;

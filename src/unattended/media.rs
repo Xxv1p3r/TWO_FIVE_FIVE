@@ -79,6 +79,75 @@ pub fn parse_8_3_name(raw: &[u8; 11]) -> String {
     }
 }
 
+const ATTR_LONG_NAME: u8 = 0x0F;
+
+fn needs_lfn(clean_name: &str) -> bool {
+    let clean = clean_name.trim_start_matches('/').trim();
+    match clean.rfind('.') {
+        Some(pos) => {
+            let base = &clean[..pos];
+            let ext = &clean[pos + 1..];
+            base.len() > 8 || ext.len() > 3 || base.contains('.') || clean.contains(' ')
+        }
+        None => clean.len() > 8 || clean.contains(' '),
+    }
+}
+
+fn lfn_checksum(sfn: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in sfn {
+        sum = sum.rotate_right(1).wrapping_add(b);
+    }
+    sum
+}
+
+fn write_lfn_entries(
+    img: &mut [u8],
+    root_dir_start: usize,
+    dir_entry_index: &mut usize,
+    root_entries: usize,
+    long_name: &str,
+    checksum: u8,
+) -> Result<(), String> {
+    let clean = long_name.trim_start_matches('/').trim();
+    let utf16: Vec<u16> = clean.encode_utf16().collect();
+    let num_entries = utf16.len().div_ceil(13).max(1);
+    if *dir_entry_index + num_entries >= root_entries {
+        return Err("Demasiadas entradas LFN para el directorio raíz FAT16".to_string());
+    }
+
+    for seq in (1..=num_entries).rev() {
+        let base_idx = (seq - 1) * 13;
+        let mut chars = [0xFFFFu16; 13];
+        for i in 0..13 {
+            let pos = base_idx + i;
+            if pos < utf16.len() {
+                chars[i] = utf16[pos];
+            } else if pos == utf16.len() {
+                chars[i] = 0x0000;
+            }
+        }
+        let off = root_dir_start + (*dir_entry_index * 32);
+        let entry = &mut img[off..off + 32];
+        entry[0x00] = (seq as u8) | if seq == num_entries { 0x40 } else { 0x00 };
+        for i in 0..5 {
+            entry[0x01 + i * 2..0x03 + i * 2].copy_from_slice(&chars[i].to_le_bytes());
+        }
+        entry[0x0B] = ATTR_LONG_NAME;
+        entry[0x0C] = 0x00;
+        entry[0x0D] = checksum;
+        for i in 0..6 {
+            entry[0x0E + i * 2..0x10 + i * 2].copy_from_slice(&chars[5 + i].to_le_bytes());
+        }
+        entry[0x1A..0x1C].copy_from_slice(&0u16.to_le_bytes());
+        for i in 0..2 {
+            entry[0x1C + i * 2..0x1E + i * 2].copy_from_slice(&chars[11 + i].to_le_bytes());
+        }
+        *dir_entry_index += 1;
+    }
+    Ok(())
+}
+
 /// Genera una imagen FAT16 estándar en memoria.
 ///
 /// Por defecto produce un disco de 4 MB (8,192 sectores de 512 bytes), que se adapta
@@ -103,36 +172,42 @@ pub fn build_fat16_image(volume_label: &str, files: &[(&str, &[u8])]) -> Result<
         }
     }
 
-    // Para FAT16, el número de clústeres debe ser al menos 4085 y menor que 65525.
-    // Usamos 8095 clústeres como tamaño base (~4 MB = 8192 sectores).
+    // Para FAT16, el número de clústeres debe estar entre 4085 y 65524.
     let target_clusters = std::cmp::max(total_clusters_needed + 100, 8095);
     if target_clusters >= 65520 {
         return Err("El contenido es demasiado grande para un sistema FAT16 estándar".to_string());
     }
 
-    // Calcular sectores por FAT necesarios para albergar target_clusters entradas de 2 bytes
-    let fat_entries_needed = target_clusters + 2;
-    let fat_bytes_needed = fat_entries_needed * 2;
-    let sectors_per_fat = ((fat_bytes_needed + (bytes_per_sector as usize) - 1)
-        / (bytes_per_sector as usize)) as u16;
-
-    let overhead_sectors = (reserved_sectors as u32)
-        + (num_fats as u32) * (sectors_per_fat as u32)
+    // Calcular primero total_sectors y después recalcular sectors_per_fat para los clústeres reales
+    let est_fat_sectors = ((target_clusters + 2) * 2).div_ceil(bytes_per_sector as usize) as u16;
+    let est_overhead = (reserved_sectors as u32)
+        + (num_fats as u32) * (est_fat_sectors as u32)
         + (root_dir_sectors as u32);
-    let total_data_sectors = target_clusters as u32 * (sectors_per_cluster as u32);
-    let mut total_sectors = overhead_sectors + total_data_sectors;
+    let mut total_sectors = est_overhead + target_clusters as u32 * (sectors_per_cluster as u32);
 
     // Alinear tamaño total a múltiplos de 64 sectores para compatibilidad con geometrías LBA
     if total_sectors % 64 != 0 {
         total_sectors += 64 - (total_sectors % 64);
     }
-    // Asegurar tamaño mínimo de 8192 sectores (4 MB)
     if total_sectors < 8192 {
         total_sectors = 8192;
     }
 
+    // Fijar sectors_per_fat exacto según la capacidad final de clústeres
+    let max_possible_clusters = total_sectors
+        .saturating_sub(reserved_sectors as u32 + root_dir_sectors as u32)
+        / (sectors_per_cluster as u32);
+    let sectors_per_fat = ((max_possible_clusters as usize + 2) * 2)
+        .div_ceil(bytes_per_sector as usize) as u16;
+    let overhead_sectors = (reserved_sectors as u32)
+        + (num_fats as u32) * (sectors_per_fat as u32)
+        + (root_dir_sectors as u32);
+
     let actual_data_sectors = total_sectors - overhead_sectors;
     let actual_clusters = (actual_data_sectors / (sectors_per_cluster as u32)) as usize;
+    if !(4085..65525).contains(&actual_clusters) {
+        return Err(format!("Conteo de clústeres FAT16 inválido: {}", actual_clusters));
+    }
 
     let total_image_bytes = (total_sectors as usize) * (bytes_per_sector as usize);
     let mut img = vec![0u8; total_image_bytes];
@@ -237,6 +312,21 @@ pub fn build_fat16_image(volume_label: &str, files: &[(&str, &[u8])]) -> Result<
         }
 
         let name_8_3 = format_8_3_name(filename)?;
+        let use_lfn = needs_lfn(filename);
+        if use_lfn {
+            let sum = lfn_checksum(&name_8_3);
+            write_lfn_entries(
+                &mut img,
+                root_dir_start,
+                &mut dir_entry_index,
+                root_entries as usize,
+                filename,
+                sum,
+            )?;
+            if dir_entry_index >= root_entries as usize {
+                return Err("Demasiados archivos para la tabla del directorio raíz".to_string());
+            }
+        }
         let entry_offset = root_dir_start + (dir_entry_index * 32);
 
         let file_size = data.len();
@@ -277,27 +367,30 @@ pub fn build_fat16_image(volume_label: &str, files: &[(&str, &[u8])]) -> Result<
 
         let _ = clusters_allocated;
 
-        let has_lower_base = filename
-            .split('.')
-            .next()
-            .map_or(false, |b| b.chars().any(|c| c.is_ascii_lowercase()));
-        let has_lower_ext = filename
-            .split('.')
-            .nth(1)
-            .map_or(false, |e| e.chars().any(|c| c.is_ascii_lowercase()));
         let mut nt_flags = 0u8;
-        if has_lower_base {
-            nt_flags |= 0x08; // Base en minúsculas
-        }
-        if has_lower_ext {
-            nt_flags |= 0x10; // Extensión en minúsculas
+        if !use_lfn {
+            let clean = filename.trim_start_matches('/').trim();
+            let has_lower_base = clean
+                .split('.')
+                .next()
+                .map_or(false, |b| b.chars().any(|c| c.is_ascii_lowercase()));
+            let has_lower_ext = clean
+                .split('.')
+                .nth(1)
+                .map_or(false, |e| e.chars().any(|c| c.is_ascii_lowercase()));
+            if has_lower_base {
+                nt_flags |= 0x08; // Base en minúsculas
+            }
+            if has_lower_ext {
+                nt_flags |= 0x10; // Extensión en minúsculas
+            }
         }
 
-        // Llenar entrada de directorio primaria (con nt_flags para soportar nombres en minúsculas en Linux)
+        // Llenar entrada de directorio 8.3 (única, sin duplicar SFN)
         let dir_entry = &mut img[entry_offset..entry_offset + 32];
         dir_entry[0x00..0x0B].copy_from_slice(&name_8_3);
         dir_entry[0x0B] = ATTR_ARCHIVE;
-        dir_entry[0x0C] = nt_flags; // Reserved Windows NT (0x18 si es minúscula)
+        dir_entry[0x0C] = nt_flags;
         dir_entry[0x0D] = 0x00; // Creation time ms
         dir_entry[0x0E..0x10].copy_from_slice(&dos_time.to_le_bytes());
         dir_entry[0x10..0x12].copy_from_slice(&dos_date.to_le_bytes());
@@ -309,27 +402,6 @@ pub fn build_fat16_image(volume_label: &str, files: &[(&str, &[u8])]) -> Result<
         dir_entry[0x1C..0x20].copy_from_slice(&(file_size as u32).to_le_bytes());
 
         dir_entry_index += 1;
-
-        // Si el archivo original contenía minúsculas, crear también una entrada duplicada estrictamente
-        // mayúscula (nt_flags = 0x00) apuntando al mismo clúster para máxima compatibilidad con DOS/instaladores
-        if nt_flags != 0 && dir_entry_index < root_entries as usize {
-            let dup_offset = root_dir_start + (dir_entry_index * 32);
-            let dup_entry = &mut img[dup_offset..dup_offset + 32];
-            dup_entry[0x00..0x0B].copy_from_slice(&name_8_3);
-            dup_entry[0x0B] = ATTR_ARCHIVE;
-            dup_entry[0x0C] = 0x00; // Strict uppercase
-            dup_entry[0x0D] = 0x00;
-            dup_entry[0x0E..0x10].copy_from_slice(&dos_time.to_le_bytes());
-            dup_entry[0x10..0x12].copy_from_slice(&dos_date.to_le_bytes());
-            dup_entry[0x12..0x14].copy_from_slice(&dos_date.to_le_bytes());
-            dup_entry[0x14..0x16].copy_from_slice(&0u16.to_le_bytes());
-            dup_entry[0x16..0x18].copy_from_slice(&dos_time.to_le_bytes());
-            dup_entry[0x18..0x1A].copy_from_slice(&dos_date.to_le_bytes());
-            dup_entry[0x1A..0x1C].copy_from_slice(&first_cluster.to_le_bytes());
-            dup_entry[0x1C..0x20].copy_from_slice(&(file_size as u32).to_le_bytes());
-
-            dir_entry_index += 1;
-        }
     }
 
     // ==========================================
@@ -507,10 +579,8 @@ pub fn build_fat12_image(volume_label: &str, files: &[(&str, &[u8])]) -> Result<
 
 /// Envuelve una imagen FAT16 dentro de un disco con tabla de particiones MBR estándar.
 ///
-/// Crea un Sector 0 (MBR) con una partición activa (0x80) de tipo 0x06 (FAT16)
-/// que apunta a LBA 64. Además, implementa un esquema Dual-BPB donde tanto el disco entero
-/// (LBA 0, superfloppy) como la partición (LBA 64) comparten de manera idéntica
-/// la misma tabla FAT y el mismo directorio raíz.
+/// Crea un Sector 0 (MBR limpio sin BPB) con una partición activa (0x80) de tipo 0x06 (FAT16)
+/// que apunta a `start_lba` (p. ej. LBA 64), donde reside el VBR/BPB de la partición.
 pub fn wrap_mbr_partition(fat16_part: &[u8], start_lba: u32, _volume_label: &str) -> Vec<u8> {
     let part_sectors = (fat16_part.len() / 512) as u32;
     let total_sectors = start_lba + part_sectors;
@@ -520,31 +590,13 @@ pub fn wrap_mbr_partition(fat16_part: &[u8], start_lba: u32, _volume_label: &str
     let part_start_byte = (start_lba as usize) * 512;
     disk_img[part_start_byte..part_start_byte + fat16_part.len()].copy_from_slice(fat16_part);
 
-    // Ajustar hidden_sectors en el BPB de la partición 1 (offset 0x1C)
-    disk_img[part_start_byte + 0x1C..part_start_byte + 0x20].copy_from_slice(&start_lba.to_le_bytes());
+    // Ajustar hidden_sectors en el VBR de la partición 1 (offset 0x1C)
+    disk_img[part_start_byte + 0x1C..part_start_byte + 0x20]
+        .copy_from_slice(&start_lba.to_le_bytes());
 
-    // 2. Configurar Sector 0: Dual BPB + Tabla MBR
-    // Copiar el BPB base de la partición al Sector 0 (hasta antes de la tabla de particiones MBR en 0x1BE)
-    disk_img[0x00..0x1BE].copy_from_slice(&fat16_part[0x00..0x1BE]);
-
-    // En Sector 0:
-    // - hidden_sectors = 0
-    disk_img[0x1C..0x20].copy_from_slice(&0u32.to_le_bytes());
-    // - reserved_sectors = (start_lba as u16) + part_reserved_sectors (normalmente 64 + 1 = 65)
-    let part_reserved = u16::from_le_bytes([fat16_part[0x0E], fat16_part[0x0F]]);
-    let disk_reserved = (start_lba as u16) + part_reserved;
-    disk_img[0x0E..0x10].copy_from_slice(&disk_reserved.to_le_bytes());
-
-    // - total_sectors del disco entero
-    if total_sectors < 65536 {
-        disk_img[0x13..0x15].copy_from_slice(&(total_sectors as u16).to_le_bytes());
-        disk_img[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
-    } else {
-        disk_img[0x13..0x15].copy_from_slice(&0u16.to_le_bytes());
-        disk_img[0x20..0x24].copy_from_slice(&total_sectors.to_le_bytes());
-    }
-
-    // 3. Escribir entrada de Partición 1 en la tabla MBR (offset 0x1BE..0x1CE)
+    // 2. Sector 0: MBR estándar limpio (sin BPB para evitar colisión superfloppy vs partición)
+    // Escribir firma de disco y entrada de Partición 1 en la tabla MBR (offset 0x1BE..0x1CE)
+    disk_img[0x1B8..0x1BC].copy_from_slice(&0x25500800u32.to_le_bytes());
     let mbr_entry = &mut disk_img[0x1BE..0x1CE];
     mbr_entry[0x00] = 0x80; // Estado: Activa / Booteable
     mbr_entry[0x01] = 0x01; // CHS Start Head (1)
@@ -554,7 +606,7 @@ pub fn wrap_mbr_partition(fat16_part: &[u8], start_lba: u32, _volume_label: &str
     mbr_entry[0x05] = 0xFE; // CHS End Head
     mbr_entry[0x06] = 0xFF; // CHS End Sector
     mbr_entry[0x07] = 0xFF; // CHS End Cylinder
-    mbr_entry[0x08..0x0C].copy_from_slice(&start_lba.to_le_bytes()); // LBA inicial (64)
+    mbr_entry[0x08..0x0C].copy_from_slice(&start_lba.to_le_bytes()); // LBA inicial
     mbr_entry[0x0C..0x10].copy_from_slice(&part_sectors.to_le_bytes()); // Número de sectores
 
     // Firma de arranque en Sector 0 (0x55, 0xAA)
@@ -630,7 +682,19 @@ pub fn create_temp_oemdrv_file(files: &[(&str, &[u8])]) -> Result<PathBuf, Strin
 // Funciones de inspección y lectura de imágenes FAT (para tests y validación)
 // =========================================================================
 
-/// Lee y devuelve la etiqueta de volumen registrada en el BPB y en el Root Directory.
+/// Devuelve la vista del volumen FAT (desplazando al inicio de la Partición 1 si es disco MBR).
+fn fat_volume_slice(image: &[u8]) -> &[u8] {
+    if image.len() >= 512 && &image[0x03..0x0B] != b"MSWIN4.1" && image[0x1C2] != 0 {
+        let start_lba = u32::from_le_bytes([image[0x1C6], image[0x1C7], image[0x1C8], image[0x1C9]]) as usize;
+        let byte_off = start_lba.saturating_mul(512);
+        if byte_off > 0 && byte_off + 512 <= image.len() {
+            return &image[byte_off..];
+        }
+    }
+    image
+}
+
+/// Lee y devuelve la etiqueta de volumen registrada en el BPB de la partición o imagen FAT.
 pub fn read_volume_label(image: &[u8]) -> Result<String, String> {
     if image.len() < 512 {
         return Err("Imagen demasiado pequeña para tener sector de arranque".to_string());
@@ -639,8 +703,9 @@ pub fn read_volume_label(image: &[u8]) -> Result<String, String> {
         return Err("Firma de arranque inválida (no es 0x55 0xAA)".to_string());
     }
 
+    let vol = fat_volume_slice(image);
     // Leer etiqueta del BPB (offset 0x2B, 11 bytes)
-    let bpb_label = std::str::from_utf8(&image[0x2B..0x36])
+    let bpb_label = std::str::from_utf8(&vol[0x2B..0x36])
         .map_err(|e| format!("Etiqueta BPB no es UTF-8 válido: {}", e))?
         .trim_end()
         .to_string();
@@ -650,6 +715,7 @@ pub fn read_volume_label(image: &[u8]) -> Result<String, String> {
 
 /// Extrae la lista de archivos presentes en el directorio raíz de la imagen FAT con sus tamaños.
 pub fn list_files(image: &[u8]) -> Result<Vec<(String, usize)>, String> {
+    let image = fat_volume_slice(image);
     if image.len() < 512 {
         return Err("Imagen demasiado corta".to_string());
     }
@@ -705,6 +771,7 @@ pub fn list_files(image: &[u8]) -> Result<Vec<(String, usize)>, String> {
 
 /// Lee el contenido exacto de un archivo recorriendo el Root Directory y la tabla FAT.
 pub fn read_file_content(image: &[u8], filename: &str) -> Result<Vec<u8>, String> {
+    let image = fat_volume_slice(image);
     if image.len() < 512 {
         return Err("Imagen demasiado corta".to_string());
     }
@@ -890,34 +957,36 @@ mod tests {
     fn test_volume_label_bpb_and_root_entry_oemdrv() {
         let img = build_oemdrv_image(&[]).expect("build oemdrv");
 
-        // BPB Volume label
-        assert_eq!(&img[0x2B..0x36], b"OEMDRV     ");
+        // BPB Volume label en la partición (MBR start LBA = 64 -> 64*512 = 32768)
+        let part = fat_volume_slice(&img);
+        assert_eq!(&part[0x2B..0x36], b"OEMDRV     ");
         assert_eq!(read_volume_label(&img).unwrap(), "OEMDRV");
 
         // Root directory entry 0 (Volume label entry)
-        let reserved = u16::from_le_bytes([img[0x0E], img[0x0F]]) as usize;
-        let sectors_per_fat = u16::from_le_bytes([img[0x16], img[0x17]]) as usize;
-        let num_fats = img[0x10] as usize;
+        let reserved = u16::from_le_bytes([part[0x0E], part[0x0F]]) as usize;
+        let sectors_per_fat = u16::from_le_bytes([part[0x16], part[0x17]]) as usize;
+        let num_fats = part[0x10] as usize;
         let root_dir_start = (reserved + num_fats * sectors_per_fat) * 512;
-        assert_eq!(&img[root_dir_start..root_dir_start + 11], b"OEMDRV     ");
-        assert_eq!(img[root_dir_start + 0x0B], ATTR_VOLUME_ID);
+        assert_eq!(&part[root_dir_start..root_dir_start + 11], b"OEMDRV     ");
+        assert_eq!(part[root_dir_start + 0x0B], ATTR_VOLUME_ID);
     }
 
     #[test]
     fn test_volume_label_bpb_and_root_entry_cidata() {
         let img = build_cidata_image("test-user-data", "test-meta-data").expect("build cidata");
 
-        // BPB Volume label
-        assert_eq!(&img[0x2B..0x36], b"cidata     ");
+        // BPB Volume label en la partición
+        let part = fat_volume_slice(&img);
+        assert_eq!(&part[0x2B..0x36], b"cidata     ");
         assert_eq!(read_volume_label(&img).unwrap(), "cidata");
 
         // Root directory entry 0
-        let reserved = u16::from_le_bytes([img[0x0E], img[0x0F]]) as usize;
-        let sectors_per_fat = u16::from_le_bytes([img[0x16], img[0x17]]) as usize;
-        let num_fats = img[0x10] as usize;
+        let reserved = u16::from_le_bytes([part[0x0E], part[0x0F]]) as usize;
+        let sectors_per_fat = u16::from_le_bytes([part[0x16], part[0x17]]) as usize;
+        let num_fats = part[0x10] as usize;
         let root_dir_start = (reserved + num_fats * sectors_per_fat) * 512;
-        assert_eq!(&img[root_dir_start..root_dir_start + 11], b"cidata     ");
-        assert_eq!(img[root_dir_start + 0x0B], ATTR_VOLUME_ID);
+        assert_eq!(&part[root_dir_start..root_dir_start + 11], b"cidata     ");
+        assert_eq!(part[root_dir_start + 0x0B], ATTR_VOLUME_ID);
     }
 
     #[test]
@@ -1149,16 +1218,17 @@ d-i passwd/username string two55\n";
     }
 
     #[test]
-    fn test_wrap_mbr_partition_and_dual_bpb() {
+    fn test_wrap_mbr_partition_clean() {
         let content = b"d-i test/data string hello\n";
         let files: &[(&str, &[u8])] = &[("preseed.cfg", content)];
 
         let disk = build_fat_image("OEMDRV", files).expect("build partitioned oemdrv");
         assert!(disk.len() >= (64 + 8192) * 512);
 
-        // 1. Validar Sector 0: MBR
+        // 1. Validar Sector 0: MBR limpio sin BPB
         assert_eq!(disk[0x1FE], 0x55);
         assert_eq!(disk[0x1FF], 0xAA);
+        assert_ne!(&disk[0x03..0x0B], b"MSWIN4.1");
         // Partición 1 en 0x1BE
         assert_eq!(disk[0x1BE], 0x80); // Bootable
         assert_eq!(disk[0x1C2], 0x06); // FAT16
@@ -1167,14 +1237,7 @@ d-i passwd/username string two55\n";
         let part_sec = u32::from_le_bytes([disk[0x1CA], disk[0x1CB], disk[0x1CC], disk[0x1CD]]);
         assert!(part_sec >= 8192);
 
-        // 2. Validar Sector 0: Dual BPB
-        assert_eq!(&disk[0x03..0x0B], b"MSWIN4.1");
-        assert_eq!(&disk[0x2B..0x36], b"OEMDRV     ");
-        assert_eq!(&disk[0x36..0x3E], b"FAT16   ");
-        let disk_reserved = u16::from_le_bytes([disk[0x0E], disk[0x0F]]);
-        assert_eq!(disk_reserved, 65); // 64 + 1
-
-        // 3. Validar Sector 64: BPB de Partición 1
+        // 2. Validar Sector 64: VBR/BPB de Partición 1
         let p_offset = 64 * 512;
         assert_eq!(disk[p_offset + 0x1FE], 0x55);
         assert_eq!(disk[p_offset + 0x1FF], 0xAA);
@@ -1190,8 +1253,8 @@ d-i passwd/username string two55\n";
         ]);
         assert_eq!(hidden_sec, 64);
 
-        // 4. Leer archivos desde la imagen particionada
-        let read = read_file_content(&disk, "preseed.cfg").expect("read from dual disk");
+        // 3. Leer archivos desde la imagen particionada
+        let read = read_file_content(&disk, "preseed.cfg").expect("read from partitioned disk");
         assert_eq!(read, content);
     }
 
@@ -1201,14 +1264,30 @@ d-i passwd/username string two55\n";
         let files: &[(&str, &[u8])] = &[("preseed.cfg", content)];
 
         let raw = build_fat16_image("OEMDRV", files).expect("build raw fat16");
-        // El directorio raíz empieza en (1 + 2 * 32) * 512 = 65 * 512 = 33280
-        let root_dir_start = (1 + 2 * 32) * 512;
+        let reserved = u16::from_le_bytes([raw[0x0E], raw[0x0F]]) as usize;
+        let sectors_per_fat = u16::from_le_bytes([raw[0x16], raw[0x17]]) as usize;
+        let root_dir_start = (reserved + 2 * sectors_per_fat) * 512;
         let e1 = root_dir_start + 32; // Entrada 1 (preseed.cfg)
         assert_eq!(&raw[e1..e1 + 11], b"PRESEED CFG");
         assert_eq!(raw[e1 + 0x0C], 0x18); // NT Flags: minúsculas
 
-        let e2 = root_dir_start + 64; // Entrada 2 (PRESEED.CFG duplicada)
-        assert_eq!(&raw[e2..e2 + 11], b"PRESEED CFG");
-        assert_eq!(raw[e2 + 0x0C], 0x00); // Strict uppercase
+        // No debe haber entrada duplicada 8.3
+        let e2 = root_dir_start + 64;
+        assert_eq!(raw[e2], 0x00);
+    }
+
+    #[test]
+    fn test_vfat_lfn_entries_emitted_for_long_names() {
+        let xml = b"<unattend/>";
+        let raw = build_fat16_image("OEMDRV", &[("autounattend.xml", xml)]).expect("build lfn fat16");
+        let reserved = u16::from_le_bytes([raw[0x0E], raw[0x0F]]) as usize;
+        let sectors_per_fat = u16::from_le_bytes([raw[0x16], raw[0x17]]) as usize;
+        let root_dir_start = (reserved + 2 * sectors_per_fat) * 512;
+        // "autounattend.xml" tiene 16 caracteres -> 2 entradas LFN antes del SFN
+        assert_eq!(raw[root_dir_start + 32], 0x42); // sequence 2 | LAST_LONG_ENTRY
+        assert_eq!(raw[root_dir_start + 32 + 0x0B], ATTR_LONG_NAME);
+        assert_eq!(raw[root_dir_start + 64], 0x01); // sequence 1
+        assert_eq!(raw[root_dir_start + 64 + 0x0B], ATTR_LONG_NAME);
+        assert_eq!(&raw[root_dir_start + 96..root_dir_start + 96 + 11], b"AUTOUNATXML");
     }
 }
