@@ -35,21 +35,32 @@ check_kvm() {
 
     if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
         warn "Sin permisos R/W en /dev/kvm para el usuario actual."
-        warn "Para evitarlo: sudo usermod -aG kvm \$USER (y vuelve a login)"
+        warn "Ejecuta: sudo usermod -aG kvm \$USER && newgrp kvm"
     fi
 
-    info "KVM disponible: $(ls -la /dev/kvm 2>/dev/null | awk '{print $1, $3, $4}')"
+    info "KVM disponible: $(ls -la /dev/kvm 2>/dev/null | awk '{print $1, $3, $4}' || echo '/dev/kvm')"
 }
 
 # ─── Check binary ─────────────────────────────────────────────────
 check_binary() {
-    if [ ! -f "$BINARY" ]; then
+    if [ ! -x "$BINARY" ]; then
         warn "Binario no encontrado. Compilando..."
-        cd "$SCRIPT_DIR"
-        cargo build --release || error "Compilación falló"
-        cd - > /dev/null
+        if ! command -v cargo >/dev/null 2>&1; then
+            if [ -f "$HOME/.cargo/env" ]; then
+                # shellcheck disable=SC1091
+                . "$HOME/.cargo/env"
+            elif [ -d "$HOME/.cargo/bin" ]; then
+                export PATH="$HOME/.cargo/bin:$PATH"
+            fi
+        fi
+        if ! command -v cargo >/dev/null 2>&1; then
+            error "Rust/Cargo no esta instalado o no esta en PATH.\n  Instala Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        fi
+        if ! (cd "$SCRIPT_DIR" && cargo build --release); then
+            error "Compilacion fallo. En Debian/Ubuntu instala dependencias:\n  sudo apt install build-essential pkg-config libx11-dev libxkbcommon-dev libwayland-dev"
+        fi
     fi
-    info "Binario: $BINARY ($(du -h "$BINARY" | cut -f1))"
+    info "Binario: $BINARY ($(du -h "$BINARY" 2>/dev/null | cut -f1 || echo '?'))"
 }
 
 # ─── Find BIOS ────────────────────────────────────────────────────
@@ -112,7 +123,7 @@ find_iso() {
             fi
         done
         local match
-        match=$(find "$SCRIPT_DIR" "." -maxdepth 1 -iname "*$target*.iso" 2>/dev/null | head -n 1)
+        match=$(find "$SCRIPT_DIR" "." -maxdepth 1 -iname "*$target*.iso" -print -quit 2>/dev/null || true)
         if [ -n "$match" ] && [ -f "$match" ]; then
             echo "$match"
             return
@@ -136,7 +147,7 @@ find_iso() {
     done
 
     local any_iso
-    any_iso=$(find "$SCRIPT_DIR" -maxdepth 1 -name "*.iso" 2>/dev/null | head -n 1)
+    any_iso=$(find "$SCRIPT_DIR" -maxdepth 1 -name "*.iso" -print -quit 2>/dev/null || true)
     if [ -n "$any_iso" ]; then
         echo "$any_iso"
         return
@@ -175,8 +186,19 @@ info "  Two Five Five (255) — Hipervisor Tipo-2"
 info "═══════════════════════════════════════════════"
 echo ""
 
-check_kvm
+NEEDS_KVM=1
+for arg in "$@"; do
+    if [ "$arg" = "--create-vdi" ] || [ "$arg" = "--compact-vdi" ] || [ "$arg" = "--disk-info" ] || \
+       [ "$arg" = "--agent-status" ] || [[ "$arg" == --agent-prompt* ]]; then
+        NEEDS_KVM=0
+        break
+    fi
+done
+
 check_binary
+if [ "$NEEDS_KVM" -eq 1 ]; then
+    check_kvm
+fi
 
 FLAGS=()
 BIOS=""
